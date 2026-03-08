@@ -1,0 +1,32 @@
+services:
+  lab-notes:
+    build: .
+    container_name: lab-notes
+    restart: unless-stopped
+    ports:
+      - "3003:3003"
+    volumes:
+      # Database persistence — this is the ONLY directory that needs to survive rebuilds
+      - lab-data:/data
+      # SSH key for 3090 enrichment (read-only)
+      - ~/.ssh/boltz_key:/root/.ssh/boltz_key:ro
+    environment:
+      - PC_IP=192.168.1.144
+      - PC_USER=max
+      - PC_MAC=d8:43:ae:91:2f:9b
+      - TODO_API_URL=http://todo:3000
+      - OPENCLONING_URL=https://cloning.maxemanuelrichardson.beer
+    # If your 3090 or todo app are on the host network, uncomment:
+    # network_mode: host
+
+  opencloning:
+    image: manulera/opencloning:latest
+    container_name: opencloning
+    ports:
+      - "8001:8000"
+    environment:
+      - ALLOWED_ORIGINS=https://lab-notes.maxemanuelrichardson.beer,https://cloning.maxemanuelrichardson.beer
+    restart: unless-stopped
+
+volumes:
+  lab-data:

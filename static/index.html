@@ -1,0 +1,2303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,300;1,400&family=JetBrains+Mono:wght@300;400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f7f5f2;--surface:#ffffff;--surface2:#f0ede8;
+  --border:#e2ddd6;--border2:#cec8be;
+  --text:#2c2a27;--muted:#7a7368;--dim:#b0a89e;
+  --accent:#3d6b4f;--accent2:#2d5039;
+  --amber:#a0622a;--red:#b84040;--blue:#2a5080;
+  --tag-bg:#e8f0ec;--tag-color:#3d6b4f;
+  --mono:'JetBrains Mono',monospace;
+  --serif:'Crimson Pro',Georgia,serif;
+  --sans:'Inter',sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;min-height:100vh}
+
+/* Layout */
+.layout{display:flex;min-height:100vh}
+.sidebar{width:220px;min-width:220px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:hidden;transition:width .2s,min-width .2s}
+.sidebar.collapsed{width:0;min-width:0;border-right:none}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+
+/* Sidebar */
+.sidebar-logo{padding:20px 18px 14px;border-bottom:1px solid var(--border)}
+.sidebar-logo h1{font-family:var(--serif);font-size:20px;font-weight:600;color:var(--text);letter-spacing:-.3px}
+.sidebar-logo p{font-size:11px;color:var(--muted);margin-top:2px;font-family:var(--mono)}
+.sidebar-scroll{flex:1;overflow-y:auto;padding:10px 0}
+.nav-section{padding:6px 18px 4px;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);font-family:var(--mono)}
+.nav-item{display:flex;align-items:center;gap:8px;padding:7px 18px;cursor:pointer;font-size:13px;color:var(--muted);transition:background .1s,color .1s;border-left:2px solid transparent}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{color:var(--accent);border-left-color:var(--accent);background:var(--tag-bg)}
+.nav-item .count{margin-left:auto;font-size:10px;font-family:var(--mono);background:var(--surface2);padding:1px 6px;border-radius:10px;color:var(--dim)}
+.nav-divider{height:1px;background:var(--border);margin:8px 18px}
+.group-nav{display:flex;align-items:center;gap:6px;padding:5px 18px 5px 28px;cursor:pointer;font-size:12px;color:var(--muted);transition:background .1s,color .1s;border-left:2px solid transparent}
+.group-nav:hover{background:var(--surface2);color:var(--text)}
+.group-nav.active{color:var(--accent);border-left-color:var(--accent)}
+.group-nav .count{margin-left:auto;font-size:10px;font-family:var(--mono);color:var(--dim)}
+
+/* Header */
+header{display:flex;align-items:center;gap:10px;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:50}
+.toggle-sb{background:transparent;border:1px solid var(--border2);color:var(--muted);font-size:12px;padding:4px 9px;cursor:pointer;border-radius:4px;transition:all .15s}
+.toggle-sb:hover{border-color:var(--accent);color:var(--accent)}
+.page-title{font-family:var(--serif);font-size:18px;font-weight:600;color:var(--text)}
+.header-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.btn{padding:6px 14px;background:transparent;border:1px solid var(--border2);color:var(--muted);font-family:var(--sans);font-size:12px;cursor:pointer;border-radius:4px;transition:all .15s;white-space:nowrap}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn.primary:hover{background:var(--accent2)}
+
+/* Content */
+.content{flex:1;padding:24px;overflow-y:auto;max-width:5000px}
+
+/* Stats row */
+.stats-row{display:flex;gap:12px;margin-bottom:24px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 18px;flex:1}
+.stat-num{font-size:26px;font-weight:600;font-family:var(--serif);color:var(--text);line-height:1}
+.stat-label{font-size:11px;color:var(--muted);margin-top:3px;letter-spacing:.5px;text-transform:uppercase;font-family:var(--mono)}
+
+/* Section labels */
+.section-label{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:12px;display:flex;align-items:center;gap:8px;font-family:var(--mono)}
+.section-label::after{content:'';flex:1;height:1px;background:var(--border)}
+
+/* Entry cards */
+.entries{display:flex;flex-direction:column;gap:10px}
+.entry-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s,box-shadow .15s;cursor:pointer}
+.entry-card:hover{border-color:var(--border2);box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.entry-card.open{border-color:var(--accent)}
+.entry-header{display:flex;align-items:flex-start;gap:12px;padding:14px 16px}
+.entry-date{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap;margin-top:2px;min-width:80px}
+.entry-main{flex:1;min-width:0}
+.entry-title{font-family:var(--serif);font-size:16px;font-weight:600;color:var(--text);line-height:1.3;margin-bottom:3px}
+.entry-group{font-size:11px;color:var(--accent);font-family:var(--mono)}
+.entry-summary{font-size:13px;color:var(--muted);margin-top:4px;line-height:1.5;font-style:italic}
+.entry-actions{display:flex;gap:6px;opacity:0;transition:opacity .15s;flex-shrink:0}
+.entry-card:hover .entry-actions{opacity:1}
+.entry-body{display:none;border-top:1px solid var(--border);padding:16px}
+.entry-card.open .entry-body{display:block}
+
+/* Notebook book/page layout */
+.nb-books{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.nb-book{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;cursor:pointer;transition:all .15s;position:relative;overflow:hidden}
+.nb-book:hover{border-color:var(--accent);box-shadow:0 4px 16px rgba(0,0,0,.08)}
+.nb-book::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent);border-radius:8px 0 0 8px}
+.nb-book-title{font-family:var(--serif);font-size:20px;font-weight:600;color:var(--text);margin-bottom:6px;padding-left:8px}
+.nb-book-meta{font-family:var(--mono);font-size:11px;color:var(--muted);padding-left:8px}
+.nb-book-dates{font-size:12px;color:var(--dim);margin-top:8px;padding-left:8px}
+.nb-layout{display:flex;gap:0;min-height:calc(100vh - 140px)}
+.nb-page-list{width:220px;min-width:220px;border-right:1px solid var(--border);overflow-y:auto;background:var(--surface)}
+.nb-page-list-hdr{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.nb-page-list-hdr button{background:transparent;border:1px solid var(--border2);color:var(--muted);font-size:12px;padding:4px 10px;cursor:pointer;border-radius:4px;transition:all .15s}
+.nb-page-list-hdr button:hover{border-color:var(--accent);color:var(--accent)}
+.nb-page-list-title{font-family:var(--serif);font-size:14px;font-weight:600;flex:1}
+.nb-page-item{padding:10px 16px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .1s;border-left:3px solid transparent}
+.nb-page-item:hover{background:var(--surface2)}
+.nb-page-item.active{background:var(--tag-bg);border-left-color:var(--accent)}
+.nb-page-date{font-family:var(--mono);font-size:11px;color:var(--accent);margin-bottom:2px}
+.nb-page-titles{font-size:12px;color:var(--muted);line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.nb-page-count{font-size:10px;color:var(--dim);font-family:var(--mono);margin-top:2px}
+.nb-editor{flex:1;overflow-y:auto;padding:24px 32px}
+.nb-editor-date{font-family:var(--serif);font-size:22px;font-weight:600;color:var(--text);margin-bottom:4px}
+.nb-editor-weekday{font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:20px}
+.nb-entry{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px 20px;margin-bottom:16px}
+.nb-entry-title{font-family:var(--serif);font-size:17px;font-weight:600;color:var(--text);margin-bottom:4px;display:flex;align-items:center;gap:8px}
+.nb-entry-sub{font-family:var(--mono);font-size:11px;color:var(--accent);margin-bottom:12px}
+.nb-entry textarea{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:14px;padding:12px 14px;border-radius:4px;outline:none;resize:vertical;line-height:1.7;transition:border-color .15s;min-height:120px}
+.nb-entry textarea:focus{border-color:var(--accent)}
+.nb-entry textarea.big{min-height:200px}
+.nb-field-label{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono);margin-bottom:5px;margin-top:14px}
+.nb-entry-actions{display:flex;gap:8px;margin-top:14px;align-items:center}
+.nb-empty-page{text-align:center;padding:60px 20px;color:var(--muted);font-style:italic;font-size:15px}
+/* Dashboard */
+.dash-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+.dash-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px 18px}
+.dash-card-title{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);font-family:var(--mono);margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.dash-card-title::after{content:'';flex:1;height:1px;background:var(--border)}
+.dash-reminder{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px}
+.dash-reminder:last-child{border-bottom:none}
+.dash-reminder-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:6px}
+.dash-reminder-dot.overdue{background:var(--red)}
+.dash-reminder-dot.today{background:var(--accent)}
+.dash-reminder-dot.future{background:var(--dim)}
+.dash-entry-mini{padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer;transition:color .1s}
+.dash-entry-mini:hover{color:var(--accent)}
+.dash-entry-mini:last-child{border-bottom:none}
+.dash-entry-mini-title{font-size:13px;font-weight:500}
+.dash-entry-mini-meta{font-size:11px;color:var(--dim);font-family:var(--mono)}
+.dash-wf-item{display:flex;gap:8px;padding:4px 0;font-size:13px}
+.dash-wf-time{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:40px}
+.nb-delete-btn{background:transparent;border:1px solid var(--border2);color:var(--dim);font-family:var(--mono);font-size:10px;padding:3px 8px;cursor:pointer;border-radius:4px;transition:all .15s;letter-spacing:1px;text-transform:uppercase;margin-left:auto}
+.nb-delete-btn:hover{border-color:var(--red);color:var(--red)}
+/* Dilution calc */
+.dil-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:20px 24px;margin-bottom:16px}
+.dil-card h3{font-family:var(--serif);font-size:17px;font-weight:600;margin-bottom:14px;color:var(--text)}
+.dil-row{display:flex;gap:12px;align-items:flex-end;margin-bottom:12px;flex-wrap:wrap}
+.dil-field{display:flex;flex-direction:column;gap:4px}
+.dil-field label{font-size:11px;letter-spacing:1px;color:var(--muted);font-family:var(--mono)}
+.dil-field input,.dil-field select{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:14px;padding:8px 10px;border-radius:4px;outline:none;width:120px;transition:border-color .15s}
+.dil-field input:focus{border-color:var(--accent)}
+.dil-result{font-family:var(--mono);font-size:16px;color:var(--accent);font-weight:600;padding:8px 0}
+.dil-formula{font-family:var(--mono);font-size:12px;color:var(--muted);padding:4px 0}
+.dil-seq-table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;margin-top:12px}
+.dil-seq-table th{text-align:left;font-size:10px;letter-spacing:1px;color:var(--muted);padding:6px 8px;border-bottom:2px solid var(--border)}
+.dil-seq-table td{padding:6px 8px;border-bottom:1px solid var(--border)}
+.dil-seq-table tr:hover{background:var(--surface2)}
+.dil-seq-table input{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:13px;padding:4px 6px;border-radius:3px;outline:none;width:80px}
+.dil-seq-table input:focus{border-color:var(--accent)}
+
+/* Entry form fields */
+.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.field{display:flex;flex-direction:column;gap:5px}
+.field.full{grid-column:1/-1}
+.field label{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono)}
+.field textarea,.field input[type=text]{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:13px;padding:8px 10px;border-radius:4px;outline:none;resize:vertical;transition:border-color .15s}
+.field textarea{min-height:80px;line-height:1.6}
+.field textarea:focus,.field input:focus{border-color:var(--accent)}
+.save-row{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}
+
+/* Protocol cards */
+.protocol-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s}
+.protocol-card:hover{border-color:var(--border2)}
+.protocol-card.open{border-color:var(--accent)}
+.protocol-header{display:flex;align-items:flex-start;gap:10px;padding:14px 16px;cursor:pointer}
+.protocol-title{font-family:var(--serif);font-size:16px;font-weight:600;color:var(--text);flex:1}
+.protocol-url{font-size:11px;color:var(--blue);font-family:var(--mono);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.protocol-body{display:none;border-top:1px solid var(--border);padding:16px}
+.protocol-card.open .protocol-body{display:block}
+.steps-text{font-size:13px;line-height:1.8;color:var(--text);white-space:pre-wrap;font-family:var(--serif)}
+.protocol-notes{background:var(--tag-bg);border:1px solid var(--border);border-radius:4px;padding:10px 12px;font-size:13px;color:var(--text);line-height:1.6;margin-top:12px;font-style:italic}
+
+/* Tags */
+.tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.tag{font-size:11px;padding:2px 8px;background:var(--tag-bg);color:var(--tag-color);border:1px solid #c5dace;border-radius:10px;font-family:var(--mono)}
+.tag-del{background:none;border:none;color:var(--dim);cursor:pointer;font-size:12px;padding:0;margin-left:3px;line-height:1}
+.tag-del:hover{color:var(--red)}
+
+/* Add form */
+.add-form{background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:18px;margin-bottom:16px;display:none}
+.add-form.visible{display:block}
+.add-form h3{font-family:var(--serif);font-size:16px;margin-bottom:14px;color:var(--text)}
+
+/* URL paste input */
+.url-bar{display:flex;gap:8px;margin-bottom:20px}
+.url-bar input{flex:1;background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--mono);font-size:13px;padding:9px 12px;border-radius:4px;outline:none;transition:border-color .15s}
+.url-bar input:focus{border-color:var(--accent)}
+.url-bar input::placeholder{color:var(--dim)}
+
+/* Project summaries */
+.summary-card{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:16px;margin-bottom:10px}
+.summary-group{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--accent);margin-bottom:6px}
+.summary-text{font-size:14px;line-height:1.7;color:var(--text);font-family:var(--serif)}
+.next-steps{margin-top:10px;display:flex;flex-direction:column;gap:4px}
+.next-step{display:flex;align-items:flex-start;gap:6px;font-size:13px;color:var(--muted)}
+.next-step::before{content:'→';color:var(--accent);flex-shrink:0;font-family:var(--mono)}
+.summary-updated{font-size:11px;color:var(--dim);font-family:var(--mono);margin-top:8px}
+
+/* Empty */
+.empty{text-align:center;padding:56px 20px;color:var(--muted)}
+.empty big{display:block;font-family:var(--serif);font-size:48px;color:var(--border2);margin-bottom:8px}
+
+/* Toast */
+#toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:var(--bg);padding:9px 16px;font-size:13px;border-radius:4px;opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}
+#toast.show{opacity:1;transform:translateY(0)}
+#toast.err{background:var(--red)}
+
+/* Loading spinner */
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.timeline{display:flex;flex-direction:column;gap:0;position:relative}
+.timeline::before{content:'';position:absolute;left:68px;top:0;bottom:0;width:1px;background:var(--border)}
+.timeline-entry{display:flex;gap:16px;padding:8px 0;position:relative}
+.timeline-time{font-family:var(--mono);font-size:11px;color:var(--muted);width:50px;flex-shrink:0;padding-top:6px;text-align:right}
+.timeline-dot{width:10px;height:10px;border-radius:50%;background:var(--border2);border:2px solid var(--bg);flex-shrink:0;margin-top:8px;z-index:1}
+.timeline-dot.task{background:var(--accent);box-shadow:0 0 0 3px rgba(61,107,79,.15)}
+.timeline-dot.note{background:var(--amber)}
+.timeline-body{flex:1;min-width:0}
+.timeline-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 14px;transition:border-color .15s}
+.timeline-card:hover{border-color:var(--border2)}
+.timeline-card.task-card{border-left:3px solid var(--accent)}
+.timeline-card.note-card{border-left:3px solid var(--amber)}
+.timeline-card-group{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:.5px;margin-bottom:3px}
+.timeline-card-text{font-size:14px;color:var(--text);line-height:1.4}
+.timeline-card-text textarea{width:100%;background:transparent;border:none;border-bottom:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:14px;outline:none;resize:none;padding:2px 0;line-height:1.5;caret-color:var(--accent)}
+.timeline-actions{display:flex;gap:5px;margin-top:6px;opacity:0;transition:opacity .15s}
+.timeline-entry:hover .timeline-actions{opacity:1}
+.add-inline{display:flex;gap:8px;padding:8px 0 8px 82px}
+.add-inline input{flex:1;background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--sans);font-size:13px;padding:7px 10px;border-radius:4px;outline:none;transition:border-color .15s}
+.add-inline input:focus{border-color:var(--accent)}
+.add-inline button{padding:7px 14px;background:var(--accent);color:#fff;border:none;border-radius:4px;font-size:13px;cursor:pointer;transition:background .15s;white-space:nowrap}
+.add-inline button:hover{background:var(--accent2)}
+.day-nav{display:flex;align-items:center;gap:10px;margin-bottom:20px}
+.day-nav button{padding:5px 12px;background:transparent;border:1px solid var(--border2);color:var(--muted);font-size:12px;border-radius:4px;cursor:pointer;transition:all .15s}
+.day-nav button:hover{border-color:var(--accent);color:var(--accent)}
+.day-nav .day-label{font-family:var(--serif);font-size:16px;font-weight:600;flex:1;text-align:center}
+.day-summary{background:var(--tag-bg);border:1px solid #c5dace;border-radius:6px;padding:14px 16px;margin-bottom:16px;font-family:var(--serif);font-size:14px;line-height:1.7;color:var(--text);font-style:italic}
+.scratch-area{display:flex;flex-direction:column;gap:14px}
+.scratch-big{width:100%;min-height:120px;background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--sans);font-size:14px;padding:14px;border-radius:6px;outline:none;resize:vertical;line-height:1.7;transition:border-color .15s}
+.scratch-big:focus{border-color:var(--accent)}
+.scratch-quick{display:flex;gap:8px}
+.scratch-quick input{flex:1;background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--sans);font-size:13px;padding:9px 12px;border-radius:4px;outline:none;transition:border-color .15s}
+.scratch-quick input:focus{border-color:var(--accent)}
+.scratch-quick button{padding:9px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;transition:background .15s;white-space:nowrap}
+.scratch-quick button:hover{background:var(--accent2)}
+.drop-zone{border:2px dashed var(--border2);border-radius:6px;padding:28px;text-align:center;color:var(--muted);font-size:13px;cursor:pointer;transition:all .15s;background:var(--surface)}
+.drop-zone:hover,.drop-zone.dragover{border-color:var(--accent);background:var(--tag-bg);color:var(--accent)}
+.drop-zone input[type=file]{display:none}
+.scratch-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.scratch-item{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 14px;display:flex;gap:10px;align-items:flex-start}
+.scratch-item.has-image{border-left:3px solid var(--blue)}
+.scratch-item-content{flex:1;font-size:13px;color:var(--text);line-height:1.5}
+.scratch-item-time{font-family:var(--mono);font-size:11px;color:var(--dim);white-space:nowrap;flex-shrink:0}
+.scratch-thumb{width:60px;height:60px;object-fit:cover;border-radius:4px;border:1px solid var(--border);flex-shrink:0;cursor:pointer}
+.reminder-item{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 16px;display:flex;align-items:flex-start;gap:12px;transition:border-color .15s}
+.reminder-item.done-reminder{opacity:.45}
+.reminder-check{width:18px;height:18px;min-width:18px;border:2px solid var(--border2);border-radius:50%;cursor:pointer;margin-top:1px;transition:all .15s;display:flex;align-items:center;justify-content:center}
+.reminder-check:hover{border-color:var(--accent)}
+.reminder-item.done-reminder .reminder-check{background:var(--accent);border-color:var(--accent);color:#fff}
+.reminder-text{flex:1;font-size:14px;color:var(--text);line-height:1.4}
+.reminder-due{font-family:var(--mono);font-size:11px;margin-top:3px}
+.reminder-due.overdue{color:var(--red)}
+.reminder-due.today{color:var(--accent)}
+.reminder-due.future{color:var(--muted)}
+/* Timeline */
+.tl-project{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-bottom:14px}
+.tl-project-hdr{display:flex;align-items:center;gap:10px;padding:12px 16px;cursor:pointer;transition:background .1s;user-select:none}
+.tl-project-hdr:hover{background:var(--surface2)}
+.tl-project-name{font-family:var(--serif);font-size:16px;font-weight:600;flex:1}
+.tl-project-meta{font-size:11px;color:var(--dim);font-family:var(--mono)}
+.tl-chain-wrap{overflow-x:auto;border-top:1px solid var(--border);padding:16px}
+.tl-chain-wrap svg{display:block}
+.tl-day-node{cursor:pointer}
+.tl-day-rect{fill:var(--surface2);stroke:var(--border);stroke-width:1;rx:4;ry:4;transition:stroke .15s}
+.tl-day-node:hover .tl-day-rect{stroke:var(--accent)}
+.tl-day-node.expanded .tl-day-rect{stroke:var(--accent);stroke-width:1.5}
+.tl-edge{stroke:var(--border2);stroke-width:1.5;fill:none}
+.tl-expanded{border-top:1px solid var(--border);padding:14px 16px}
+.tl-expanded-date{font-family:var(--mono);font-size:11px;color:var(--accent);margin-bottom:8px}
+.tl-expanded-entry{padding:8px 0;border-bottom:1px solid var(--border)}
+.tl-expanded-entry:last-child{border-bottom:none}
+.tl-expanded-title{font-weight:500;font-size:14px;margin-bottom:3px}
+.tl-expanded-notes{font-size:13px;color:var(--muted);line-height:1.6;white-space:pre-wrap;max-height:200px;overflow-y:auto}
+/* Predictions */
+.pred-card{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:14px 16px;margin-bottom:10px;transition:border-color .15s}
+.pred-card:hover{border-color:var(--border2)}
+.pred-group{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--accent);margin-bottom:4px}
+.pred-text{font-size:15px;font-weight:500;color:var(--text);margin-bottom:6px;line-height:1.4}
+.pred-reasoning{font-size:13px;color:var(--muted);font-style:italic;line-height:1.5;margin-bottom:10px}
+.pred-actions{display:flex;gap:8px;align-items:center}
+.pred-edit-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:14px;padding:6px 10px;border-radius:4px;outline:none;width:100%;margin-bottom:8px}
+.pred-edit-input:focus{border-color:var(--accent)}
+/* Import */
+.import-dropzone{border:2px dashed var(--border2);border-radius:8px;padding:48px 24px;text-align:center;color:var(--muted);cursor:pointer;transition:all .15s;background:var(--surface);margin-bottom:20px}
+.import-dropzone:hover,.import-dropzone.dragover{border-color:var(--accent);background:var(--tag-bg);color:var(--accent)}
+.import-dropzone input[type=file]{display:none}
+.import-dropzone big{display:block;font-size:36px;margin-bottom:8px}
+.import-table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:16px}
+.import-table th{text-align:left;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono);padding:8px 10px;border-bottom:2px solid var(--border);white-space:nowrap}
+.import-table td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+.import-table tr:hover{background:var(--surface2)}
+.import-table tr.skip-row{opacity:.4}
+.import-title-cell{max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.import-preview{font-size:12px;color:var(--muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.import-type-sel,.import-group-inp{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:12px;padding:4px 6px;border-radius:4px;outline:none;width:100%}
+.import-type-sel:focus,.import-group-inp:focus{border-color:var(--accent)}
+.import-date-inp{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:4px 6px;border-radius:4px;outline:none;width:110px}
+.import-date-inp:focus{border-color:var(--accent)}
+.import-actions{display:flex;gap:10px;align-items:center}
+.import-count{font-size:13px;color:var(--muted);flex:1}
+.import-count b{color:var(--text)}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- Sidebar -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-logo">
+    <h1>Lab Notes</h1>
+    <p>notebook + protocols</p>
+  </div>
+  <div class="sidebar-scroll">
+    <div class="nav-section">Views</div>
+    <div class="nav-item active" id="nav-notebook" onclick="setView('notebook')">
+      <span>&#128221;</span><span>Notebook</span><span class="count" id="cnt-entries">0</span>
+    </div>
+    <div class="nav-item" id="nav-protocols" onclick="setView('protocols')">
+      <span>&#128196;</span><span>Protocols</span><span class="count" id="cnt-protocols">0</span>
+    </div>
+    <div class="nav-item" id="nav-summaries" onclick="setView('summaries')">
+      <span>&#128202;</span><span>Summaries</span>
+    </div>
+    <div class="nav-item" id="nav-workflow" onclick="setView('workflow')">
+      <span>&#128336;</span><span>Daily Workflow</span>
+    </div>
+    <div class="nav-item" id="nav-import_data" onclick="setView('import_data')">
+      <span>&#128736;</span><span>DNA manager</span><span class="count" id="cnt-project-flow">0</span>
+    </div>
+    <div class="nav-item" id="nav-scratch" onclick="setView('scratch')">
+      <span>&#9881;</span><span>Scratch Pad</span><span class="count" id="cnt-scratch">0</span>
+    </div>
+    <div class="nav-item" id="nav-reminders" onclick="setView('reminders')">
+      <span>&#128276;</span><span>Reminders</span><span class="count" id="cnt-reminders">0</span>
+    </div>
+    <div class="nav-divider"></div>
+    <div class="nav-section">Tools</div>
+    <div class="nav-item" id="nav-timeline" onclick="setView('timeline')">
+      <span>&#9683;</span><span>Timeline</span>
+    </div>
+    <div class="nav-item" id="nav-predictions" onclick="setView('predictions')">
+      <span>&#9733;</span><span>Predictions</span><span class="count" id="cnt-predictions">0</span>
+    </div>
+	<div class="nav-item" id="nav-cloning" onclick="setView('cloning')">
+	  <span>&#129516;</span><span>Cloning</span>
+	</div>
+    <div class="nav-item" id="nav-dilution" onclick="setView('dilution')">
+      <span>&#9874;</span><span>Dilution Calc</span>
+    </div>
+    <div class="nav-item" id="nav-tm_calc" onclick="setView('tm_calc')">
+      <span>&#127777;</span><span>Tm Calculator</span>
+    </div>
+    <div class="nav-item" id="nav-import" onclick="setView('import')">
+      <span>&#128229;</span><span>Import</span>
+    </div>
+    <div class="nav-divider"></div>
+    <!-- Dynamic nav items from features go here -->
+    <div id="dynamic-nav"></div>
+    <div class="nav-divider"></div>
+    <div class="nav-section">Projects</div>
+    <div id="group-nav"></div>
+  </div>
+</aside>
+
+<!-- Main -->
+<div class="main">
+  <header>
+    <button class="toggle-sb" onclick="toggleSidebar()">&#9776;</button>
+    <div class="page-title" id="page-title">Notebook</div>
+    <div class="header-right">
+      <button id="enrich-btn" title="Wake 3090 — fill entries, summarise, process scratch pad, update summaries" style="background:transparent;border:1px solid var(--border2);color:var(--muted);font-family:var(--mono);font-size:11px;padding:5px 12px;cursor:pointer;border-radius:4px;transition:all .15s;display:flex;align-items:center;gap:5px" onclick="triggerEnrichment()">
+        <span id="enrich-icon" style="display:inline-block">&#9881;</span><span id="enrich-label">Enrich</span>
+      </button>
+      <button class="btn primary" id="add-btn" onclick="showAddForm()">+ New entry</button>
+    </div>
+  </header>
+  <div class="content" id="content">
+    <div class="empty"><big>&#128221;</big>Loading...</div>
+  </div>
+</div>
+</div>
+<div id="toast"></div>
+
+<script>
+// ── core.js ──
+/*
+ * core.js — App shell, API helper, view registry, shared helpers.
+ *
+ * Feature JS files call registerView('name', renderFn) to plug in.
+ * registerNav('name', {label, icon, section, countId}) to add sidebar items.
+ */
+
+// ── View registry ────────────────────────────────────────────────────────────
+const _views = {};        // name -> async function(el)
+const _navItems = [];     // {name, label, icon, section, countId}
+
+function registerView(name, renderFn) {
+  _views[name] = renderFn;
+}
+
+function registerNav(name, opts) {
+  _navItems.push({ name, ...opts });
+}
+
+// ── Global state ─────────────────────────────────────────────────────────────
+let S = {
+  view: 'notebook',
+  filterGroup: '',
+  entries: [],
+  protocols: [],
+  summaries: [],
+  stats: {},
+  sidebarOpen: true,
+  nbBook: null,
+  nbPage: null,
+};
+
+// ── API helper ───────────────────────────────────────────────────────────────
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+async function boot() {
+  buildSidebarNav();
+  await load();
+  setInterval(load, 30000);
+}
+
+function buildSidebarNav() {
+  // Build dynamic nav items from registered features
+  const container = document.getElementById('dynamic-nav');
+  if (!container) return;
+
+  let currentSection = '';
+  for (const item of _navItems) {
+    if (item.section && item.section !== currentSection) {
+      currentSection = item.section;
+      container.innerHTML += `<div class="nav-divider"></div><div class="nav-section">${esc(item.section)}</div>`;
+    }
+    const countHtml = item.countId ? `<span class="count" id="${item.countId}">0</span>` : '';
+    container.innerHTML += `<div class="nav-item" id="nav-${item.name}" onclick="setView('${item.name}')">
+      <span>${item.icon}</span><span>${esc(item.label)}</span>${countHtml}
+    </div>`;
+  }
+}
+
+async function load() {
+  try {
+    const st = await api('GET', '/api/stats');
+    S.stats = st;
+    const ce = document.getElementById('cnt-entries');
+    if (ce) ce.textContent = st.entries || 0;
+    const cp = document.getElementById('cnt-protocols');
+    if (cp) cp.textContent = st.protocols || 0;
+
+    // Build group nav
+    const gnav = document.getElementById('group-nav');
+    if (gnav) {
+      gnav.innerHTML = (st.groups || []).map(function (g) {
+        return '<div class="group-nav ' + (S.filterGroup === g ? 'active' : '') + '" data-group="' + esc(g) + '"><span>' + esc(g) + '</span></div>';
+      }).join('');
+      gnav.querySelectorAll('.group-nav').forEach(function (el) {
+        el.addEventListener('click', function () { setGroup(this.dataset.group); });
+      });
+    }
+
+    // Scratch and reminder counts
+    try {
+      const sc = await api('GET', '/api/scratch');
+      const cntS = document.getElementById('cnt-scratch');
+      if (cntS) cntS.textContent = sc.entries?.length || 0;
+      const rc = await api('GET', '/api/reminders');
+      const cntR = document.getElementById('cnt-reminders');
+      if (cntR) cntR.textContent = rc.reminders?.length || 0;
+      try {
+        const pc = await api('GET', '/api/predictions');
+        const cntP = document.getElementById('cnt-predictions');
+        if (cntP) cntP.textContent = pc.predictions?.length || 0;
+      } catch {}
+    } catch {}
+
+    // Don't re-render if user is typing
+    const active = document.activeElement;
+    const typing = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT');
+    if (!typing) await loadView();
+  } catch (e) { console.error(e); }
+}
+
+function setView(v) {
+  S.view = v;
+  S.filterGroup = '';
+  if (v === 'notebook') { S.nbBook = null; S.nbPage = null; }
+
+  document.querySelectorAll('.nav-item').forEach(el => {
+    const id = el.id.replace('nav-', '');
+    el.classList.toggle('active', id === v);
+  });
+
+  const titles = {
+    notebook: 'Notebook', protocols: 'Protocol Library', summaries: 'Project Summaries',
+    workflow: 'Daily Workflow', scratch: 'Scratch Pad', reminders: 'Reminders',
+    'import': 'Import from OneNote', timeline: 'Project Timelines',
+    predictions: 'Predicted Tasks', dilution: 'Dilution Calculator',
+    DNAmanager: 'DNAmanager',
+  };
+  document.getElementById('page-title').textContent = titles[v] || v;
+
+  const btn = document.getElementById('add-btn');
+  if (v === 'notebook')       { btn.textContent = '+ New entry'; btn.style.display = ''; }
+  else if (v === 'protocols') { btn.textContent = '+ Add protocol'; btn.style.display = ''; }
+  else if (v === 'reminders') { btn.textContent = '+ Reminder'; btn.style.display = ''; }
+  else                        { btn.style.display = 'none'; }
+
+  loadView();
+}
+
+function setGroup(g) {
+  S.filterGroup = g; S.view = 'notebook'; S.nbBook = g; S.nbPage = null;
+  document.querySelectorAll('.group-nav').forEach(el => el.classList.toggle('active', el.textContent.trim() === g));
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  document.getElementById('nav-notebook').classList.add('active');
+  document.getElementById('page-title').textContent = 'Notebook — ' + g;
+  document.getElementById('add-btn').textContent = '+ New entry';
+  document.getElementById('add-btn').style.display = '';
+  loadView();
+}
+
+async function loadView() {
+  const el = document.getElementById('content');
+  if ((S.view === 'notebook' && S.nbBook) || S.view === 'cloning') {
+    el.style.maxWidth = 'none'; el.style.padding = '0';
+  } else {
+    el.style.maxWidth = ''; el.style.padding = '';
+  }
+
+  const renderer = _views[S.view];
+  if (renderer) {
+    await renderer(el);
+  } else {
+    el.innerHTML = '<div class="empty"><big>⚠️</big>View "' + esc(S.view) + '" not loaded.</div>';
+  }
+}
+
+// ── Shared form: showAddForm delegates to feature ────────────────────────────
+function showAddForm() {
+  if (S.view === 'reminders' && typeof showAddReminder === 'function') {
+    showAddReminder();
+  } else if (typeof _showAddForm === 'function') {
+    _showAddForm();
+  }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function toggleSidebar() {
+  S.sidebarOpen = !S.sidebarOpen;
+  document.getElementById('sidebar').classList.toggle('collapsed', !S.sidebarOpen);
+}
+
+function formatDate(d) {
+  const dt = new Date(d + 'T00:00:00');
+  return dt.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+}
+
+function relTime(iso) {
+  const diff = Date.now() - new Date(iso + 'Z').getTime(), m = Math.floor(diff / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+
+function esc(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+let tt;
+function toast(msg, err = false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show' + (err ? ' err' : '');
+  clearTimeout(tt);
+  tt = setTimeout(() => el.className = '', 3000);
+}
+
+
+// ── notebook.js ──
+// ── NOTEBOOK ──────────────────────────────────────────────────────────────────
+async function renderNotebook(el){
+  if(S.nbBook){
+    await renderNotebookBook(el);
+    return;
+  }
+
+  // Dashboard + books landing
+  var todayData=null;
+  try{todayData=await api('GET','/api/today');}catch{}
+
+  var data=await api('GET','/api/entries?limit=500');
+  S.entries=data.entries||[];
+
+  var html='';
+  var todayStr=new Date().toISOString().slice(0,10);
+
+  // Dashboard cards
+  if(todayData){
+    var reminders=todayData.reminders||[];
+    var todayEntries=todayData.entries_today||[];
+    var workflow=todayData.workflow||[];
+    var recent=todayData.recent_entries||[];
+
+    html+='<div style="font-family:var(--serif);font-size:22px;font-weight:600;margin-bottom:4px">'+formatDate(todayStr)+'</div>';
+    html+='<div style="font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:18px">'+
+      todayEntries.length+' entries today &middot; '+
+      reminders.length+' reminder'+(reminders.length!==1?'s':'')+' &middot; '+
+      (todayData.scratch_pending||0)+' scratch pending'+
+      (todayData.predictions_pending?' &middot; <span style="color:var(--accent)">'+todayData.predictions_pending+' predictions</span>':'')+
+    '</div>';
+
+    html+='<div class="dash-grid">';
+
+    // Reminders card
+    html+='<div class="dash-card">';
+    html+='<div class="dash-card-title">Reminders</div>';
+    if(reminders.length){
+      reminders.slice(0,6).forEach(function(r){
+        var cls='future';
+        if(r.due_date){
+          if(r.due_date<todayStr) cls='overdue';
+          else if(r.due_date===todayStr) cls='today';
+        }
+        html+='<div class="dash-reminder">'+
+          '<span class="dash-reminder-dot '+cls+'"></span>'+
+          '<div style="flex:1"><div>'+esc(r.text)+'</div>'+
+          (r.due_date?'<div style="font-size:11px;color:var(--'+(cls==='overdue'?'red':cls==='today'?'accent':'muted')+');font-family:var(--mono)">'+esc(r.due_date)+'</div>':'')+
+          '</div></div>';
+      });
+      if(reminders.length>6) html+='<div style="font-size:12px;color:var(--dim);padding:4px 0">+'+(reminders.length-6)+' more</div>';
+    } else {
+      html+='<div style="color:var(--dim);font-size:13px;font-style:italic;padding:8px 0">No active reminders</div>';
+    }
+    html+='</div>';
+
+    // Today's work card
+    html+='<div class="dash-card">';
+    html+='<div class="dash-card-title">Today</div>';
+    if(todayEntries.length){
+      todayEntries.slice(0,5).forEach(function(e){
+        html+='<div class="dash-entry-mini" data-group="'+esc(e.group_name)+'" data-date="'+esc(e.date)+'">'+
+          '<div class="dash-entry-mini-title">'+esc(e.title)+'</div>'+
+          '<div class="dash-entry-mini-meta">'+esc(e.group_name)+'</div>'+
+        '</div>';
+      });
+    } else if(workflow.length){
+      workflow.slice(0,5).forEach(function(w){
+        html+='<div class="dash-wf-item"><span class="dash-wf-time">'+esc(w.time)+'</span><span>'+esc(w.content)+'</span></div>';
+      });
+    } else {
+      html+='<div style="color:var(--dim);font-size:13px;font-style:italic;padding:8px 0">Nothing logged today yet</div>';
+    }
+    html+='</div>';
+
+    // Recent entries card
+    html+='<div class="dash-card" style="grid-column:1/-1">';
+    html+='<div class="dash-card-title">Recent (7 days)</div>';
+    if(recent.length){
+      var byDateR={};
+      recent.forEach(function(e){byDateR[e.date]=byDateR[e.date]||[];byDateR[e.date].push(e);});
+      Object.entries(byDateR).forEach(function(pair){
+        var dt=pair[0],entries=pair[1];
+        html+='<div style="display:flex;gap:10px;padding:4px 0;border-bottom:1px solid var(--border)">';
+        html+='<span style="font-family:var(--mono);font-size:11px;color:var(--muted);min-width:70px">'+esc(dt)+'</span>';
+        html+='<span style="font-size:13px">'+entries.map(function(e){return esc(e.title);}).join(', ')+'</span>';
+        html+='</div>';
+      });
+    } else {
+      html+='<div style="color:var(--dim);font-size:13px;font-style:italic;padding:8px 0">No recent entries</div>';
+    }
+    html+='</div>';
+
+    html+='</div>';
+  }
+
+  // Books section
+  html+='<div class="section-label" style="margin-top:8px">Project books</div>';
+
+  if(!S.entries.length){
+    html+='<div class="empty"><big>&#128221;</big>No entries yet — import from OneNote, or add manually.</div>';
+    el.innerHTML=html;return;
+  }
+
+  var projects={};
+  S.entries.forEach(function(e){
+    var g=e.group_name||'Ungrouped';
+    if(!projects[g]) projects[g]={name:g,entries:[],dates:new Set()};
+    projects[g].entries.push(e);
+    projects[g].dates.add(e.date);
+  });
+
+  html+='<div class="nb-books">';
+  Object.values(projects).sort(function(a,b){return b.entries.length-a.entries.length;}).forEach(function(proj){
+    var dates=Array.from(proj.dates).sort();
+    var firstDate=dates[0]||'';
+    var lastDate=dates[dates.length-1]||'';
+    html+='<div class="nb-book" data-group="'+esc(proj.name)+'">'+
+      '<div class="nb-book-title">'+esc(proj.name)+'</div>'+
+      '<div class="nb-book-meta">'+proj.entries.length+' entries &middot; '+dates.length+' days</div>'+
+      '<div class="nb-book-dates">'+
+        (firstDate?esc(firstDate)+' &#8594; '+esc(lastDate):'')+
+      '</div>'+
+    '</div>';
+  });
+  html+='</div>';
+  el.innerHTML=html;
+
+  setTimeout(function(){
+    el.querySelectorAll('.nb-book').forEach(function(book){
+      book.addEventListener('click',function(){
+        var g=this.dataset.group;
+        S.nbBook=g;S.nbPage=null;S.filterGroup=g;
+        document.getElementById('page-title').textContent='Notebook — '+g;
+        loadView();
+      });
+    });
+    el.querySelectorAll('.dash-entry-mini').forEach(function(item){
+      item.addEventListener('click',function(){
+        var g=this.dataset.group;
+        if(g){S.nbBook=g;S.nbPage=this.dataset.date;S.filterGroup=g;
+          document.getElementById('page-title').textContent='Notebook — '+g;loadView();}
+      });
+    });
+  },0);
+}
+
+async function renderNotebookBook(el){
+  var data=await api('GET','/api/entries?group='+encodeURIComponent(S.nbBook)+'&limit=500');
+  var entries=data.entries||[];
+
+  var byDate={};
+  entries.forEach(function(e){byDate[e.date]=byDate[e.date]||[];byDate[e.date].push(e);});
+  var dates=Object.keys(byDate).sort().reverse();
+  if(!S.nbPage&&dates.length) S.nbPage=dates[0];
+
+  var html='<div class="nb-layout">';
+
+  // Page list sidebar
+  html+='<div class="nb-page-list">';
+  html+='<div class="nb-page-list-hdr">'+
+    '<button id="nb-back-btn">&#8592;</button>'+
+    '<span class="nb-page-list-title">'+esc(S.nbBook)+'</span>'+
+    '<button class="nb-delete-btn" id="nb-del-book-btn">DELETE</button>'+
+  '</div>';
+
+  dates.forEach(function(date){
+    var dayEntries=byDate[date];
+    var active=S.nbPage===date;
+    var titles=dayEntries.map(function(e){return e.title;}).join(', ');
+    html+='<div class="nb-page-item'+(active?' active':'')+'" data-date="'+esc(date)+'">'+
+      '<div class="nb-page-date">'+esc(date)+'</div>'+
+      '<div class="nb-page-titles">'+esc(titles)+'</div>'+
+      '<div class="nb-page-count">'+dayEntries.length+' entr'+(dayEntries.length===1?'y':'ies')+'</div>'+
+    '</div>';
+  });
+
+  if(!dates.length){
+    html+='<div style="padding:20px 16px;color:var(--muted);font-size:13px;font-style:italic">No entries yet</div>';
+  }
+  html+='</div>';
+
+  // Editor pane
+  html+='<div class="nb-editor">';
+  if(S.nbPage&&byDate[S.nbPage]){
+    var pageEntries=byDate[S.nbPage];
+    var dt=new Date(S.nbPage+'T00:00:00');
+    html+='<div class="nb-editor-date">'+dt.toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})+'</div>';
+    html+='<div class="nb-editor-weekday">'+dt.toLocaleDateString('en-GB',{weekday:'long'})+' &middot; '+pageEntries.length+' entr'+(pageEntries.length===1?'y':'ies')+'</div>';
+
+    pageEntries.forEach(function(e){
+      html+='<div class="nb-entry" id="nbe-'+e.id+'">'+
+        '<div style="display:flex;gap:8px;align-items:center;margin-bottom:4px;flex-wrap:wrap">'+
+          '<input type="text" id="nt-'+e.id+'" value="'+esc(e.title)+'" style="flex:1;min-width:200px;font-family:var(--serif);font-size:17px;font-weight:600;background:transparent;border:none;border-bottom:1px solid transparent;color:var(--text);padding:2px 0;outline:none" onfocus="this.style.borderBottomColor=\'var(--accent)\'" onblur="this.style.borderBottomColor=\'transparent\'"/>'+
+          '<input type="date" id="nd-'+e.id+'" value="'+esc(e.date)+'" style="background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:11px;padding:4px 6px;border-radius:3px;outline:none;width:130px"/>'+
+        '</div>'+
+        '<div style="display:flex;gap:6px;align-items:center;margin-bottom:12px">'+
+          '<input type="text" id="ng-'+e.id+'" value="'+esc(e.group_name)+'" placeholder="group" style="background:var(--surface2);border:1px solid var(--border);color:var(--accent);font-family:var(--mono);font-size:11px;padding:3px 6px;border-radius:3px;outline:none;width:100px"/>'+
+          '<span style="color:var(--dim)">/</span>'+
+          '<input type="text" id="ns-'+e.id+'" value="'+esc(e.subgroup)+'" placeholder="subgroup" style="background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:11px;padding:3px 6px;border-radius:3px;outline:none;width:100px"/>'+
+          (e.summary?'<span style="font-size:11px;color:var(--dim);font-style:italic;margin-left:auto;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(e.summary)+'</span>':'')+
+        '</div>'+
+        '<div class="nb-field-label">Notes</div>'+
+        '<textarea class="big" id="en-'+e.id+'" placeholder="What was done, observations, details...">'+esc(e.notes)+'</textarea>'+
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">'+
+          '<div>'+
+            '<div class="nb-field-label">Results</div>'+
+            '<textarea id="er-'+e.id+'" placeholder="Outcomes, data, measurements...">'+esc(e.results)+'</textarea>'+
+          '</div>'+
+          '<div>'+
+            '<div class="nb-field-label">Yields / Purity</div>'+
+            '<textarea id="ey-'+e.id+'" placeholder="e.g. 2.4 mg/mL, >95% pure...">'+esc(e.yields)+'</textarea>'+
+          '</div>'+
+        '</div>'+
+        '<div class="nb-field-label">Issues / Troubleshooting</div>'+
+        '<textarea id="ei-'+e.id+'" placeholder="What went wrong? What to try next...">'+esc(e.issues)+'</textarea>'+
+        '<div class="nb-field-label">Images</div>'+
+        '<div id="nb-imgs-'+e.id+'" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px"></div>'+
+        '<div style="margin-bottom:8px">'+
+          '<label class="btn" style="cursor:pointer;display:inline-block">'+
+            '+ Add image <input type="file" accept="image/*" style="display:none" data-entry="'+e.id+'" id="nb-img-inp-'+e.id+'"/>'+
+          '</label>'+
+        '</div>'+
+        '<div class="nb-entry-actions">'+
+          '<button class="btn primary" onclick="saveEntryFull('+e.id+')">Save all</button>'+
+          '<button class="btn" onclick="summariseEntry('+e.id+')">&#128161; Summarise</button>'+
+          '<button class="btn" onclick="deleteEntry('+e.id+')" style="color:var(--red);margin-left:auto">Delete entry</button>'+
+        '</div>'+
+      '</div>';
+    });
+  } else {
+    html+='<div class="nb-empty-page">Select a day from the page list, or create a new entry.</div>';
+  }
+  html+='</div>';
+  html+='</div>';
+
+  el.innerHTML=html;
+
+  // Bind page list clicks and header buttons
+  setTimeout(function(){
+    var backBtn=document.getElementById('nb-back-btn');
+    if(backBtn) backBtn.addEventListener('click',function(){
+      S.nbBook=null;S.nbPage=null;S.filterGroup='';
+      document.getElementById('page-title').textContent='Notebook';
+      loadView();
+    });
+    var delBtn=document.getElementById('nb-del-book-btn');
+    if(delBtn) delBtn.addEventListener('click',function(){
+      var bookName=S.nbBook;
+      if(!confirm('Delete the entire "'+bookName+'" book?\nThis will remove ALL entries in this project.'))return;
+      if(!confirm('Are you sure? This cannot be undone.\n\nType confirms deletion of all entries in "'+bookName+'".'))return;
+      api('DELETE','/api/entries/group/'+encodeURIComponent(bookName)).then(function(r){
+        toast('Deleted "'+bookName+'" — '+r.count+' entries removed');
+        S.nbBook=null;S.nbPage=null;S.filterGroup='';
+        document.getElementById('page-title').textContent='Notebook';
+        load();
+      }).catch(function(e){toast('Failed: '+e.message,true);});
+    });
+    el.querySelectorAll('.nb-page-item').forEach(function(item){
+      item.addEventListener('click',function(){
+        S.nbPage=this.dataset.date;
+        renderNotebookBook(el);
+      });
+    });
+    // Load images for visible entries
+    if(S.nbPage&&byDate[S.nbPage]){
+      byDate[S.nbPage].forEach(function(e){
+        loadEntryImages(e.id);
+        var inp=document.getElementById('nb-img-inp-'+e.id);
+        if(inp) inp.addEventListener('change',function(ev){
+          if(ev.target.files[0]) uploadEntryImage(e.id,ev.target.files[0]);
+        });
+      });
+    }
+  },0);
+}
+
+async function loadEntryImages(entryId){
+  try{
+    var data=await api('GET','/api/entries/'+entryId+'/images');
+    var container=document.getElementById('nb-imgs-'+entryId);
+    if(!container)return;
+    var imgs=data.images||[];
+    if(!imgs.length){container.innerHTML='<span style="font-size:12px;color:var(--dim);font-style:italic">No images</span>';return;}
+    container.innerHTML=imgs.map(function(img){
+      return '<div style="position:relative;display:inline-block">'+
+        '<img src="/api/entry-images/'+img.id+'/raw" style="max-width:200px;max-height:150px;border-radius:4px;border:1px solid var(--border);cursor:pointer" onclick="window.open(this.src)"/>'+
+        '<button onclick="deleteEntryImage('+img.id+','+entryId+')" style="position:absolute;top:2px;right:2px;background:rgba(0,0,0,.6);color:#fff;border:none;border-radius:50%;width:18px;height:18px;cursor:pointer;font-size:11px;line-height:18px;text-align:center">&times;</button>'+
+      '</div>';
+    }).join('');
+  }catch{}
+}
+
+async function uploadEntryImage(entryId,file){
+  var fd=new FormData();fd.append('file',file);
+  try{
+    await fetch('/api/entries/'+entryId+'/images',{method:'POST',body:fd});
+    toast('Image uploaded');
+    loadEntryImages(entryId);
+  }catch(e){toast('Upload failed',true);}
+}
+
+async function deleteEntryImage(imageId,entryId){
+  if(!confirm('Delete this image?'))return;
+  await api('DELETE','/api/entry-images/'+imageId);
+  loadEntryImages(entryId);
+}
+
+function toggleEntry(id){
+  var card=document.getElementById('ec-'+id);
+  if(card) card.classList.toggle('open');
+}
+
+async function saveEntry(id){
+  var notes=document.getElementById('en-'+id)?.value||'';
+  var results=document.getElementById('er-'+id)?.value||'';
+  var yields=document.getElementById('ey-'+id)?.value||'';
+  var issues=document.getElementById('ei-'+id)?.value||'';
+  await api('PUT','/api/entries/'+id,{notes,results,yields,issues});
+  toast('Saved');
+}
+
+async function saveEntryFull(id){
+  var title=document.getElementById('nt-'+id)?.value||'';
+  var date=document.getElementById('nd-'+id)?.value||'';
+  var group=document.getElementById('ng-'+id)?.value||'';
+  var sub=document.getElementById('ns-'+id)?.value||'';
+  var notes=document.getElementById('en-'+id)?.value||'';
+  var results=document.getElementById('er-'+id)?.value||'';
+  var yields=document.getElementById('ey-'+id)?.value||'';
+  var issues=document.getElementById('ei-'+id)?.value||'';
+  await api('PUT','/api/entries/'+id,{title,date,group_name:group,subgroup:sub,notes,results,yields,issues});
+  // If date or group changed, refresh the page list
+  toast('Saved');
+  await loadView();
+}
+
+async function summariseEntry(id){
+  toast('Summarising...');
+  var r=await api('POST','/api/entries/'+id+'/summarise');
+  toast('Summary added');
+  await loadView();
+}
+
+async function deleteEntry(id){
+  if(!confirm('Delete this entry? This cannot be undone.'))return;
+  await api('DELETE','/api/entries/'+id);
+  toast('Entry deleted');
+  await load();
+  // If we're in a book, refresh book view
+  if(S.nbBook) await renderNotebookBook(document.getElementById('content'));
+}
+registerView('notebook', renderNotebook);
+
+
+// ── protocols.js ──
+// ── PROTOCOLS ─────────────────────────────────────────────────────────────────
+async function renderProtocols(el){
+  const data=await api('GET','/api/protocols');
+  S.protocols=data.protocols||[];
+  let html='<div class="url-bar">'+
+    '<input type="text" id="proto-url" placeholder="Paste a protocol URL (e.g. Thermo miniprep page)..." spellcheck="false"/>'+
+    '<input type="text" id="proto-title" placeholder="Protocol name" style="width:200px" spellcheck="false"/>'+
+    '<button class="btn primary" onclick="addProtocolFromUrl()">Fetch + Save</button>'+
+    '</div>';
+  if(!S.protocols.length){
+    html+='<div class="empty"><big>&#128196;</big>No protocols yet — paste a URL above to add one.</div>';
+  } else {
+    html+='<div class="entries">'+S.protocols.map(protocolCardHTML).join('')+'</div>';
+  }
+  el.innerHTML=html;
+}
+
+function protocolCardHTML(p){
+  const tags=JSON.parse(p.tags||'[]');
+  return '<div class="protocol-card" id="pc-'+p.id+'" onclick="toggleProtocol('+p.id+')">'+
+    '<div class="protocol-header">'+
+      '<div style="flex:1">'+
+        '<div class="protocol-title">'+esc(p.title)+'</div>'+
+        (p.url?'<div class="protocol-url">'+esc(p.url)+'</div>':'')+
+        (tags.length?'<div class="tags">'+tags.map(t=>'<span class="tag">'+esc(t)+'</span>').join('')+'</div>':'')+
+      '</div>'+
+      '<div class="entry-actions">'+
+        '<button class="btn" onclick="event.stopPropagation();reExtract('+p.id+')" title="Re-extract steps">&#8635;</button>'+
+        (p.url?'<a class="btn" href="'+esc(p.url)+'" target="_blank" onclick="event.stopPropagation()">&#8599;</a>':'')+
+        '<button class="btn" onclick="event.stopPropagation();deleteProtocol('+p.id+')" style="color:var(--red)">&#215;</button>'+
+      '</div>'+
+    '</div>'+
+    '<div class="protocol-body" id="pb-'+p.id+'">'+
+      (p.steps?'<div class="steps-text">'+esc(p.steps)+'</div>':
+        '<div style="color:var(--muted);font-size:13px;font-style:italic">No steps extracted yet. Click &#8635; to extract.</div>')+
+      '<div class="field" style="margin-top:12px">'+
+        '<label>Your notes / modifications</label>'+
+        '<textarea id="pn-'+p.id+'" placeholder="Your modifications, tips, observations...">'+esc(p.notes)+'</textarea>'+
+      '</div>'+
+      '<div class="save-row">'+
+        '<button class="btn primary" onclick="event.stopPropagation();saveProtocol('+p.id+')">Save notes</button>'+
+      '</div>'+
+    '</div>'+
+  '</div>';
+}
+
+function toggleProtocol(id){document.getElementById('pc-'+id)?.classList.toggle('open');}
+
+async function addProtocolFromUrl(){
+  const url=document.getElementById('proto-url')?.value.trim();
+  const title=document.getElementById('proto-title')?.value.trim();
+  if(!url){toast('Paste a URL first',true);return;}
+  if(!title){toast('Add a title',true);return;}
+  const btn=document.querySelector('#content .btn.primary');
+  btn.textContent='Fetching...';btn.disabled=true;
+  try{
+    await api('POST','/api/protocols',{title,url,tags:[]});
+    document.getElementById('proto-url').value='';
+    document.getElementById('proto-title').value='';
+    await load();toast('Protocol saved');
+  }catch(e){toast('Failed: '+e.message,true);}
+  finally{btn.textContent='Fetch + Save';btn.disabled=false;}
+}
+
+async function reExtract(id){
+  toast('Re-extracting steps...');
+  await api('POST','/api/protocols/'+id+'/re-extract');
+  await loadView();toast('Steps updated');
+}
+
+async function saveProtocol(id){
+  const notes=document.getElementById('pn-'+id)?.value||'';
+  await api('PUT','/api/protocols/'+id,{notes});
+  toast('Saved');
+}
+
+async function deleteProtocol(id){
+  if(!confirm('Delete this protocol?'))return;
+  await api('DELETE','/api/protocols/'+id);
+  await load();toast('Deleted');
+}
+registerView('protocols', renderProtocols);
+
+
+// ── summaries.js ──
+// ── SUMMARIES ─────────────────────────────────────────────────────────────────
+async function renderSummaries(el){
+  const data=await api('GET','/api/summaries');
+  S.summaries=data.summaries||[];
+  if(!S.summaries.length){
+    el.innerHTML='<div class="empty"><big>&#128202;</big>No summaries yet — these are generated by the 3090 during nightly enrichment, or trigger enrichment manually from the todo app.</div>';
+    return;
+  }
+  el.innerHTML=S.summaries.map(s=>{
+    const steps=JSON.parse(s.next_steps||'[]');
+    return '<div class="summary-card">'+
+      '<div class="summary-group">'+esc(s.group_name)+'</div>'+
+      '<div class="summary-text">'+esc(s.summary)+'</div>'+
+      (steps.length?'<div class="next-steps">'+steps.map(step=>'<div class="next-step">'+esc(step)+'</div>').join('')+'</div>':'')+
+      '<div class="summary-updated">Updated '+relTime(s.updated)+'</div>'+
+    '</div>';
+  }).join('');
+}
+registerView('summaries', renderSummaries);
+
+
+// ── addform.js ──
+// ── ADD FORM ──────────────────────────────────────────────────────────────────
+function _showAddForm(){
+  if(S.view==='reminders'){showAddReminder();return;}
+  if(S.view==='protocols'){addProtocolFromUrl();return;}
+  // Show inline add at top of content
+  const el=document.getElementById('content');
+  const existing=document.getElementById('inline-add');
+  if(existing){existing.remove();return;}
+  const form=document.createElement('div');
+  form.id='inline-add';form.className='add-form visible';
+  form.innerHTML='<h3>New notebook entry</h3>'+
+    '<div class="field-grid">'+
+      '<div class="field full"><label>Title / Task</label><input type="text" id="na-title" placeholder="What did you do?" spellcheck="false"/></div>'+
+      '<div class="field"><label>Project group</label><input type="text" id="na-group" placeholder="e.g. NorV" value="'+esc(S.nbBook||S.filterGroup)+'" spellcheck="false"/></div>'+
+      '<div class="field"><label>Subgroup</label><input type="text" id="na-sub" placeholder="e.g. Experiments" spellcheck="false"/></div>'+
+      '<div class="field full"><label>Notes</label><textarea id="na-notes" placeholder="What happened, observations..."></textarea></div>'+
+      '<div class="field"><label>Results</label><textarea id="na-results" placeholder="Outcomes, data..." style="min-height:60px"></textarea></div>'+
+      '<div class="field"><label>Yields / Purity</label><textarea id="na-yields" placeholder="e.g. 2.4 mg/mL" style="min-height:60px"></textarea></div>'+
+      '<div class="field full"><label>Issues</label><textarea id="na-issues" placeholder="What went wrong..." style="min-height:60px"></textarea></div>'+
+    '</div>'+
+    '<div class="save-row">'+
+      '<button class="btn" onclick="closeAddForm()">Cancel</button>'+
+      '<button class="btn primary" onclick="submitNewEntry()">Save entry</button>'+
+    '</div>';
+  el.insertBefore(form, el.firstChild);
+  document.getElementById('na-title')?.focus();
+}
+
+function closeAddForm(){document.getElementById('inline-add')?.remove();}
+async function submitNewEntry(){
+  const title=document.getElementById('na-title')?.value.trim();
+  if(!title){toast('Add a title',true);return;}
+  await api('POST','/api/entries',{
+    title,
+    group_name:document.getElementById('na-group')?.value.trim()||'',
+    subgroup:document.getElementById('na-sub')?.value.trim()||'',
+    notes:document.getElementById('na-notes')?.value||'',
+    results:document.getElementById('na-results')?.value||'',
+    yields:document.getElementById('na-yields')?.value||'',
+    issues:document.getElementById('na-issues')?.value||'',
+  });
+  document.getElementById('inline-add')?.remove();
+  await load();toast('Entry saved');
+}
+
+
+
+// ── workflow.js ──
+// ── DAILY WORKFLOW ───────────────────────────────────────────────────────────
+let _workflowDate = new Date().toISOString().slice(0,10);
+
+async function renderWorkflow(el){
+  const data = await api('GET','/api/workflow/'+_workflowDate);
+  const entries = data.entries || [];
+  const today = new Date().toISOString().slice(0,10);
+
+  let html = '<div class="day-nav">'+
+    '<button onclick="shiftDay(-1)">&#8592; Prev</button>'+
+    '<div class="day-label">'+formatDate(_workflowDate)+'</div>'+
+    (_workflowDate<today?'<button onclick="shiftDay(1)">Next &#8594;</button>':'<button disabled style="opacity:.3">Next &#8594;</button>')+
+    '<button class="btn" onclick="processWorkflowDay()" title="Send this day\'s notes to the 3090 to format into notebook entries" style="margin-left:10px">&#9881; Process day</button>'+
+  '</div>';
+
+  if(data.summary){
+    html+='<div class="day-summary">'+esc(data.summary)+'</div>';
+  }
+
+  html+='<div class="timeline" id="workflow-timeline">';
+  if(!entries.length){
+    html+='<div style="padding:32px 0 32px 82px;color:var(--muted);font-size:14px;font-style:italic">No entries yet — jot notes below, they get processed into formatted notebook entries.</div>';
+  } else {
+    html+=entries.map(function(e){
+      const isTask=e.type==='task_done';
+      return '<div class="timeline-entry" id="we-'+e.id+'">'+
+        '<div class="timeline-time">'+esc(e.time||'')+'</div>'+
+        '<div class="timeline-dot '+(isTask?'task':'note')+'"></div>'+
+        '<div class="timeline-body">'+
+          '<div class="timeline-card '+(isTask?'task-card':'note-card')+'">'+
+            (e.group_name?'<div class="timeline-card-group">'+esc(e.group_name)+'</div>':'')+
+            '<div class="timeline-card-text" id="wt-'+e.id+'">'+esc(e.content)+'</div>'+
+            '<div class="timeline-actions">'+
+              '<button class="btn" onclick="editWorkflowEntry('+e.id+')">Edit</button>'+
+              '<button class="btn" onclick="tagWorkflowEntry('+e.id+')" title="Set project group">Tag</button>'+
+              '<button class="btn" style="color:var(--red)" onclick="deleteWorkflowEntry('+e.id+')">&#215;</button>'+
+            '</div>'+
+          '</div>'+
+        '</div>'+
+      '</div>';
+    }).join('');
+  }
+  html+='</div>';
+
+  // Input area
+  html+='<div style="margin-top:8px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 14px">'+
+    '<div style="display:flex;gap:8px;margin-bottom:8px">'+
+      '<input type="text" id="wf-group" placeholder="Project (optional)" spellcheck="false" style="width:140px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:4px;outline:none"/>'+
+    '</div>'+
+    '<div class="add-inline" style="padding:0">'+
+      '<input type="text" id="wf-input" placeholder="Jot down what you\'re doing..." spellcheck="false"/>'+
+      '<button onclick="addWorkflowNote()">Add</button>'+
+    '</div>'+
+  '</div>';
+
+  el.innerHTML=html;
+  var wfInp=document.getElementById('wf-input');
+  if(wfInp){
+    wfInp.addEventListener('keydown',function(e){if(e.key==='Enter')addWorkflowNote();});
+    setTimeout(function(){wfInp.focus();},50);
+  }
+}
+
+function shiftDay(d){
+  const dt=new Date(_workflowDate+'T12:00:00');
+  dt.setDate(dt.getDate()+d);
+  _workflowDate=dt.toISOString().slice(0,10);
+  loadView();
+}
+
+async function addWorkflowNote(){
+  const inp=document.getElementById('wf-input');
+  const grpInp=document.getElementById('wf-group');
+  const text=inp?.value.trim();
+  if(!text)return;
+  var group=grpInp?.value.trim()||null;
+  await api('POST','/api/workflow',{content:text,type:'note',group_name:group});
+  inp.value='';
+  await loadView();
+}
+
+function tagWorkflowEntry(id){
+  var group=prompt('Set project group for this entry (leave empty to clear):');
+  if(group===null)return;
+  api('PUT','/api/workflow/'+id,{group_name:group||null}).then(function(){loadView();toast('Tagged');});
+}
+
+async function processWorkflowDay(){
+  if(!confirm('Send all notes for '+_workflowDate+' to the 3090 for formatting into notebook entries?'))return;
+  toast('Processing — waking 3090...');
+  try{
+    var resp=await api('POST','/api/workflow/process-day',{date:_workflowDate});
+    if(resp.error){toast(resp.error,true);return;}
+    toast('Created '+resp.count+' notebook entries from workflow');
+    await load();
+  }catch(e){toast('Failed: '+e.message,true);}
+}
+
+function editWorkflowEntry(id){
+  const el=document.getElementById('wt-'+id);
+  if(!el)return;
+  const current=el.textContent;
+  el.innerHTML='<textarea id="we-ta-'+id+'" style="min-height:60px;width:100%;background:transparent;border:none;border-bottom:1px solid var(--accent);color:var(--text);font-family:var(--sans);font-size:14px;outline:none;resize:none;padding:2px 0">'+esc(current)+'</textarea>';
+  const ta=el.querySelector('textarea');ta.focus();
+  ta.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();saveWorkflowEntry(id,this.value);}if(e.key==='Escape')loadView();});
+}
+
+async function saveWorkflowEntry(id,content){
+  await api('PUT','/api/workflow/'+id,{content});
+  await loadView();toast('Saved');
+}
+
+async function deleteWorkflowEntry(id){
+  await api('DELETE','/api/workflow/'+id);
+  await loadView();
+}
+registerView('workflow', renderWorkflow);
+
+
+// ── scratch.js ──
+// ── SCRATCH PAD ───────────────────────────────────────────────────────────────
+async function renderScratch(el){
+  const data=await api('GET','/api/scratch');
+  const entries=data.entries||[];
+
+  let html='<div class="scratch-area">'+
+    '<div class="section-label">Quick note</div>'+
+    '<div class="scratch-quick">'+
+      '<input type="text" id="sq-input" placeholder="Type and hit Enter - gets filed overnight" spellcheck="false"/>'+
+      '<button onclick="addScratchQuick()">Dump it</button>'+
+    '</div>'+
+    '<div class="section-label" style="margin-top:14px">Brain dump</div>'+
+    '<textarea class="scratch-big" id="sb-input" placeholder="Dump everything here — rough notes, observations, half-formed ideas. Hit Save and forget it. Gets sorted overnight."></textarea>'+
+    '<div style="display:flex;justify-content:flex-end"><button class="btn primary" onclick="addScratchBig()">Save dump</button></div>'+
+    '<div class="section-label" style="margin-top:14px">Drop a figure</div>'+
+    '<div class="drop-zone" id="drop-zone" onclick="triggerFileInput()" ondrop="handleDrop(event)">'+
+      '<input type="file" id="file-input" accept="image/*,.pdf" onchange="handleFileSelect(event)"/>'+
+      '&#128247; Drop a gel, western blot, SEC trace, or any figure here<br>'+
+      '<span style="font-size:12px;color:var(--dim)">Images get analysed by the 3090 overnight and filed to the right project</span>'+
+    '</div>';
+
+  if(entries.length){
+    html+='<div class="section-label" style="margin-top:14px">Pending — awaiting overnight processing ('+entries.length+')</div>'+
+      '<div class="scratch-list">'+
+      entries.map(function(e){
+        return '<div class="scratch-item '+(e.has_image?'has-image':'')+'">'+
+          (e.has_image?'<img class="scratch-thumb" src="/api/scratch/'+e.id+'/image-raw" onerror="this.style.display=\'none\'" onclick="viewScratchImage('+e.id+')"/>':'')+
+          '<div class="scratch-item-content">'+esc((e.content||e.filename||'image').slice(0,200))+'</div>'+
+          '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">'+
+            '<div class="scratch-item-time">'+relTime(e.created)+'</div>'+
+            '<button class="btn" style="color:var(--red);padding:2px 8px" onclick="deleteScratch('+e.id+')">&#215;</button>'+
+          '</div>'+
+        '</div>';
+      }).join('')+
+      '</div>';
+  } else {
+    html+='<div style="margin-top:8px;color:var(--muted);font-size:13px;font-style:italic">&#10003; All clear — nothing waiting to be processed.</div>';
+  }
+  html+='</div>';
+  el.innerHTML=html;
+  setTimeout(function(){
+    initDropZone();
+    var sqInp=document.getElementById('sq-input');
+    if(sqInp) sqInp.addEventListener('keydown',function(e){if(e.key==='Enter')addScratchQuick();});
+  },50);
+}
+
+async function addScratchQuick(){
+  const inp=document.getElementById('sq-input');
+  const text=inp?.value.trim();if(!text)return;
+  await api('POST','/api/scratch',{type:'text',content:text});
+  inp.value='';await load();toast('Noted — will be filed overnight');
+}
+
+async function addScratchBig(){
+  const ta=document.getElementById('sb-input');
+  const text=ta?.value.trim();if(!text)return;
+  await api('POST','/api/scratch',{type:'text',content:text});
+  ta.value='';await load();toast('Saved — will be sorted overnight');
+}
+
+function viewScratchImage(id){
+  const w=window.open('','_blank','width=800,height=600');
+  w.document.write('<img src="/api/scratch/'+id+'/image-raw" style="max-width:100%;max-height:100vh"/>');
+}
+async function deleteScratch(id){
+  await api('DELETE','/api/scratch/'+id);await load();
+}
+
+function triggerFileInput(){document.getElementById('file-input').click();}
+function initDropZone(){
+  const dz=document.getElementById('drop-zone');
+  if(!dz)return;
+  dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('dragover');});
+  dz.addEventListener('dragleave',function(){dz.classList.remove('dragover');});
+}
+function handleDrop(e){
+  e.preventDefault();
+  document.getElementById('drop-zone').classList.remove('dragover');
+  const file=e.dataTransfer.files[0];
+  if(file)uploadScratchFile(file);
+}
+function handleFileSelect(e){
+  const file=e.target.files[0];
+  if(file)uploadScratchFile(file);
+}
+
+async function uploadScratchFile(file){
+  const reader=new FileReader();
+  reader.onload=async function(e){
+    const b64=e.target.result.split(',')[1];
+    await api('POST','/api/scratch',{
+      type:'image',content:'',
+      filename:file.name,
+      image_data:b64
+    });
+    await load();toast('Figure saved — will be analysed overnight');
+  };
+  reader.readAsDataURL(file);
+}
+registerView('scratch', renderScratch);
+
+
+// ── reminders.js ──
+// ── REMINDERS ─────────────────────────────────────────────────────────────────
+async function renderReminders(el){
+  const data=await api('GET','/api/reminders?include_done=false');
+  const reminders=data.reminders||[];
+  const today=new Date().toISOString().slice(0,10);
+
+  let html='<div id="add-reminder-form" style="display:none;background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:16px;margin-bottom:16px">'+
+    '<div class="field-grid">'+
+      '<div class="field full"><label>Reminder text</label><input type="text" id="rem-text" placeholder="What to remember..." spellcheck="false"/></div>'+
+      '<div class="field"><label>Due date (optional)</label><input type="date" id="rem-date" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/></div>'+
+    '</div>'+
+    '<div class="save-row"><button class="btn" onclick="closeReminderForm()">Cancel</button><button class="btn primary" onclick="submitReminder()">Add reminder</button></div>'+
+  '</div>';
+
+  if(!reminders.length){
+    html+='<div class="empty"><big>&#128276;</big>No reminders — they\'re added automatically when the 3090 processes your scratch pad overnight.</div>';
+  } else {
+    html+=reminders.map(function(r){
+      const due=r.due_date;
+      let dueClass='future',dueText='';
+      if(due){
+        if(due<today){dueClass='overdue';dueText='Overdue: '+due;}
+        else if(due===today){dueClass='today';dueText='Due today';}
+        else{dueClass='future';dueText='Due: '+due;}
+      }
+      return '<div class="reminder-item '+(r.done?'done-reminder':'')+'">'+
+        '<div class="reminder-check" onclick="toggleReminder('+r.id+','+r.done+')">'+(r.done?'&#10003;':'')+'</div>'+
+        '<div style="flex:1">'+
+          '<div class="reminder-text">'+esc(r.text)+'</div>'+
+          (dueText?'<div class="reminder-due '+dueClass+'">'+esc(dueText)+'</div>':'')+
+          (r.source?'<div style="font-size:11px;color:var(--dim);font-family:var(--mono);margin-top:2px">from: '+esc(r.source)+'</div>':'')+
+        '</div>'+
+        '<button class="btn" style="color:var(--red);padding:2px 8px" onclick="deleteReminder('+r.id+')">&#215;</button>'+
+      '</div>';
+    }).join('');
+  }
+  el.innerHTML=html;
+}
+
+function closeReminderForm(){document.getElementById('add-reminder-form').style.display='none';}
+function showAddReminder(){
+  document.getElementById('add-reminder-form').style.display='block';
+  document.getElementById('rem-text')?.focus();
+}
+
+async function submitReminder(){
+  const text=document.getElementById('rem-text')?.value.trim();
+  const date=document.getElementById('rem-date')?.value||null;
+  if(!text){toast('Add some text',true);return;}
+  await api('POST','/api/reminders',{text,due_date:date,source:'manual'});
+  document.getElementById('add-reminder-form').style.display='none';
+  document.getElementById('rem-text').value='';
+  await load();toast('Reminder added');
+}
+
+async function toggleReminder(id,done){
+  await api('PUT','/api/reminders/'+id,{done:!done});await load();
+}
+async function deleteReminder(id){
+  if(!confirm('Delete this reminder?'))return;
+  await api('DELETE','/api/reminders/'+id);await load();
+}
+registerView('reminders', renderReminders);
+
+
+// ── timeline.js ──
+// ── TIMELINE ──────────────────────────────────────────────────────────────────
+let _tlExpanded={};  // {groupName: dateStr}
+
+async function renderTimeline(el){
+  var data=await api('GET','/api/timeline');
+  var projects=data.projects||[];
+
+  if(!projects.length){
+    el.innerHTML='<div class="empty"><big>&#9683;</big>No projects with entries yet — import or create some notebook entries first.</div>';
+    return;
+  }
+
+  var html='';
+  projects.forEach(function(proj){
+    var g=proj.group_name;
+    var days=proj.days||[];
+    var expandedDate=_tlExpanded[g]||null;
+
+    html+='<div class="tl-project" id="tl-proj-'+esc(g)+'">';
+    html+='<div class="tl-project-hdr">'+
+      '<span class="tl-project-name">'+esc(g)+'</span>'+
+      '<span class="tl-project-meta">'+proj.entry_count+' entries &middot; '+days.length+' days</span>'+
+    '</div>';
+
+    // SVG chain
+    if(days.length>0){
+      var svgNS='http://www.w3.org/2000/svg';
+      var nodeW=90,nodeH=50,gap=16,pad=12;
+      var svgW=pad*2+days.length*nodeW+(days.length-1)*gap;
+      var svgH=pad*2+nodeH;
+
+      html+='<div class="tl-chain-wrap"><svg width="'+svgW+'" height="'+svgH+'" viewBox="0 0 '+svgW+' '+svgH+'" style="min-width:'+svgW+'px">';
+
+      // Edges
+      for(var i=1;i<days.length;i++){
+        var x1=pad+(i-1)*(nodeW+gap)+nodeW;
+        var x2=pad+i*(nodeW+gap);
+        var y=pad+nodeH/2;
+        html+='<line class="tl-edge" x1="'+x1+'" y1="'+y+'" x2="'+x2+'" y2="'+y+'"/>';
+      }
+
+      // Nodes
+      days.forEach(function(day,di){
+        var x=pad+di*(nodeW+gap);
+        var y=pad;
+        var isExp=expandedDate===day.date;
+        // Color intensity by entry count
+        var opacity=Math.min(0.15+day.count*0.1,0.6);
+        html+='<g class="tl-day-node'+(isExp?' expanded':'')+'" data-group="'+esc(g)+'" data-date="'+esc(day.date)+'" data-idx="'+di+'">';
+        html+='<rect class="tl-day-rect" x="'+x+'" y="'+y+'" width="'+nodeW+'" height="'+nodeH+'" style="fill:rgba(61,107,79,'+opacity+')"/>';
+        // Date label
+        var dateShort=day.date.slice(5);  // MM-DD
+        html+='<text x="'+(x+nodeW/2)+'" y="'+(y+20)+'" text-anchor="middle" fill="var(--text)" font-family="JetBrains Mono,monospace" font-size="11" pointer-events="none">'+dateShort+'</text>';
+        // Count
+        html+='<text x="'+(x+nodeW/2)+'" y="'+(y+36)+'" text-anchor="middle" fill="var(--muted)" font-family="JetBrains Mono,monospace" font-size="10" pointer-events="none">'+day.count+' entr'+(day.count===1?'y':'ies')+'</text>';
+        html+='</g>';
+      });
+
+      html+='</svg></div>';
+    }
+
+    // Expanded day detail
+    if(expandedDate){
+      html+='<div class="tl-expanded" id="tl-detail-'+esc(g)+'">';
+      html+='<div class="tl-expanded-date">'+formatDate(expandedDate)+'</div>';
+      html+='<div id="tl-entries-'+esc(g)+'"><div class="spin" style="margin:10px auto;display:block;width:16px;height:16px"></div></div>';
+      html+='</div>';
+    }
+    html+='</div>';
+  });
+
+  // Generate predictions button
+  html+='<div style="margin-top:20px;text-align:center">'+
+    '<button class="btn primary" onclick="generatePredictions()" style="padding:10px 24px">'+
+      '&#9733; Predict next tasks from timelines'+
+    '</button>'+
+    '<div style="font-size:12px;color:var(--dim);margin-top:6px">Wakes the 3090, reads all project timelines, suggests upcoming tasks</div>'+
+  '</div>';
+
+  el.innerHTML=html;
+
+  // Bind node clicks
+  setTimeout(function(){
+    el.querySelectorAll('.tl-day-node').forEach(function(node){
+      node.addEventListener('click',function(){
+        var grp=this.dataset.group;
+        var date=this.dataset.date;
+        if(_tlExpanded[grp]===date) delete _tlExpanded[grp];
+        else _tlExpanded[grp]=date;
+        renderTimeline(el);
+      });
+    });
+    // Load expanded entry details
+    projects.forEach(function(proj){
+      var g=proj.group_name;
+      if(_tlExpanded[g]) loadTimelineDetail(g,_tlExpanded[g]);
+    });
+  },50);
+}
+
+async function loadTimelineDetail(group,date){
+  var container=document.getElementById('tl-entries-'+group);
+  if(!container)return;
+  try{
+    var data=await api('GET','/api/timeline/'+encodeURIComponent(group));
+    var dayData=(data.days||[]).find(function(d){return d.date===date;});
+    if(!dayData||!dayData.entries.length){
+      container.innerHTML='<div style="color:var(--dim);font-size:13px">No entries for this day.</div>';
+      return;
+    }
+    container.innerHTML=dayData.entries.map(function(e){
+      return '<div class="tl-expanded-entry">'+
+        '<div class="tl-expanded-title">'+esc(e.title)+'</div>'+
+        (e.notes?'<div class="tl-expanded-notes">'+esc(e.notes.slice(0,500))+(e.notes.length>500?'...':'')+'</div>':'')+
+        (e.results?'<div style="font-size:12px;color:var(--accent);margin-top:4px"><b>Results:</b> '+esc(e.results.slice(0,200))+'</div>':'')+
+        (e.issues?'<div style="font-size:12px;color:var(--red);margin-top:4px"><b>Issues:</b> '+esc(e.issues.slice(0,200))+'</div>':'')+
+      '</div>';
+    }).join('');
+  }catch(e){
+    container.innerHTML='<div style="color:var(--red)">Failed to load: '+esc(e.message)+'</div>';
+  }
+}
+
+async function generatePredictions(){
+  toast('Waking 3090 — generating predictions...');
+  try{
+    var resp=await api('POST','/api/predictions/generate');
+    if(resp.error){toast(resp.error,true);return;}
+    toast('Generated '+resp.count+' predictions');
+    await load();
+    setView('predictions');
+  }catch(e){
+    toast('Failed: '+e.message,true);
+  }
+}
+registerView('timeline', renderTimeline);
+
+
+// ── predictions.js ──
+// ── PREDICTIONS ──────────────────────────────────────────────────────────────
+let _predEditing={};  // {id: true}
+
+async function renderPredictions(el){
+  var data=await api('GET','/api/predictions');
+  var preds=data.predictions||[];
+
+  var html='<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">'+
+    '<span style="font-size:13px;color:var(--muted)">'+(preds.length?preds.length+' pending prediction'+(preds.length>1?'s':''):'No pending predictions')+'</span>'+
+    '<button class="btn" onclick="generatePredictions()" style="margin-left:auto">&#9733; Generate new predictions</button>'+
+  '</div>';
+
+  if(!preds.length){
+    html+='<div class="empty"><big>&#9733;</big>No predicted tasks. Click the button above or use the Timeline view to generate predictions from your project history.</div>';
+    el.innerHTML=html;
+    return;
+  }
+
+  // Group by project
+  var byGroup={};
+  preds.forEach(function(p){
+    byGroup[p.group_name]=byGroup[p.group_name]||[];
+    byGroup[p.group_name].push(p);
+  });
+
+  Object.entries(byGroup).forEach(function(pair){
+    var g=pair[0],items=pair[1];
+    html+='<div class="section-label">'+esc(g)+'</div>';
+    items.forEach(function(p){
+      var isEditing=_predEditing[p.id];
+      html+='<div class="pred-card" id="pred-'+p.id+'">'+
+        '<div class="pred-group">'+esc(p.group_name)+'</div>';
+      if(isEditing){
+        html+='<input class="pred-edit-input" id="pred-edit-'+p.id+'" value="'+esc(p.text)+'"/>'+
+          '<div class="pred-actions">'+
+            '<button class="btn primary" onclick="predSaveEdit('+p.id+')">Save</button>'+
+            '<button class="btn" onclick="predCancelEdit('+p.id+')">Cancel</button>'+
+          '</div>';
+      } else {
+        html+='<div class="pred-text">'+esc(p.text)+'</div>'+
+          (p.reasoning?'<div class="pred-reasoning">'+esc(p.reasoning)+'</div>':'')+
+          '<div class="pred-actions">'+
+            '<button class="btn primary" onclick="predApprove('+p.id+')">&#10003; Approve &amp; add to tasks</button>'+
+            '<button class="btn" onclick="predEdit('+p.id+')">Edit</button>'+
+            '<button class="btn" style="color:var(--red)" onclick="predReject('+p.id+')">&#215; Reject</button>'+
+          '</div>';
+      }
+      html+='</div>';
+    });
+  });
+
+  el.innerHTML=html;
+
+  // Focus edit inputs
+  setTimeout(function(){
+    Object.keys(_predEditing).forEach(function(id){
+      var inp=document.getElementById('pred-edit-'+id);
+      if(inp){
+        inp.focus();
+        inp.addEventListener('keydown',function(e){
+          if(e.key==='Enter') predSaveEdit(parseInt(id));
+          if(e.key==='Escape') predCancelEdit(parseInt(id));
+        });
+      }
+    });
+  },50);
+}
+
+async function predApprove(id){
+  try{
+    var resp=await api('PUT','/api/predictions/'+id,{action:'approve'});
+    if(resp.error){toast(resp.error,true);return;}
+    toast('Approved — added to todo app');
+    await load();
+    await renderPredictions(document.getElementById('content'));
+  }catch(e){toast('Failed: '+e.message,true);}
+}
+
+async function predReject(id){
+  try{
+    await api('PUT','/api/predictions/'+id,{action:'reject'});
+    toast('Rejected');
+    await load();
+    await renderPredictions(document.getElementById('content'));
+  }catch(e){toast('Failed: '+e.message,true);}
+}
+
+function predEdit(id){
+  _predEditing[id]=true;
+  renderPredictions(document.getElementById('content'));
+}
+
+function predCancelEdit(id){
+  delete _predEditing[id];
+  renderPredictions(document.getElementById('content'));
+}
+
+async function predSaveEdit(id){
+  var inp=document.getElementById('pred-edit-'+id);
+  var text=inp?inp.value.trim():'';
+  if(!text){toast('Enter some text',true);return;}
+  try{
+    await api('PUT','/api/predictions/'+id,{action:'edit',text:text});
+    delete _predEditing[id];
+    await renderPredictions(document.getElementById('content'));
+    toast('Saved');
+  }catch(e){toast('Failed: '+e.message,true);}
+}
+registerView('predictions', renderPredictions);
+
+
+// ── dilution.js ──
+// ── DILUTION CALCULATOR ──────────────────────────────────────────────────────
+let _dilSeqRows=[{name:'',conc:'',vol:''}];
+var _concUnits=['ng/\u00B5L','\u00B5g/\u00B5L','mg/mL','\u00B5g/mL','ng/mL','nM','\u00B5M','mM','M'];
+var _volUnits=['\u00B5L','mL','L'];
+
+function renderDilution(el){
+  var concOpts=_concUnits.map(function(u){return '<option value="'+esc(u)+'">'+esc(u)+'</option>';}).join('');
+  var volOpts=_volUnits.map(function(u){return '<option value="'+esc(u)+'">'+esc(u)+'</option>';}).join('');
+
+  var html='<div class="dil-card">'+
+    '<h3>C1V1 = C2V2</h3>'+
+    '<div class="dil-formula">C&#8321; &times; V&#8321; = C&#8322; &times; V&#8322; &mdash; units must match</div>'+
+    '<div class="dil-row">'+
+      '<div class="dil-field"><label>C1 (stock)</label><input type="number" id="dil-c1" step="any" oninput="calcDilution()"/></div>'+
+      '<div class="dil-field"><label>Unit</label><select id="dil-c-unit" onchange="calcDilution()">'+concOpts+'</select></div>'+
+      '<div class="dil-field"><label>C2 (target)</label><input type="number" id="dil-c2" step="any" oninput="calcDilution()"/></div>'+
+    '</div>'+
+    '<div class="dil-row">'+
+      '<div class="dil-field"><label>V2 (final vol)</label><input type="number" id="dil-v2" step="any" oninput="calcDilution()"/></div>'+
+      '<div class="dil-field"><label>Unit</label><select id="dil-v-unit" onchange="calcDilution()">'+volOpts+'</select></div>'+
+      '<div class="dil-field"><label>V1 (sample)</label><input type="text" id="dil-v1" readonly style="background:var(--tag-bg);font-weight:600;color:var(--accent);width:140px" value="\u2014"/></div>'+
+      '<div class="dil-field"><label>Diluent</label><input type="text" id="dil-water" readonly style="background:var(--surface2);color:var(--muted);width:140px" value="\u2014"/></div>'+
+    '</div>'+
+  '</div>';
+
+  // Sequencing prep — fixed ng/µL
+  html+='<div class="dil-card">'+
+    '<h3>Sequencing prep</h3>'+
+    '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">All concentrations in ng/\u00B5L, volumes in \u00B5L</div>'+
+    '<div class="dil-row" style="margin-bottom:16px">'+
+      '<div class="dil-field"><label>Target conc (ng/µL)</label><input type="number" id="seq-target-conc" step="any" value="100" oninput="calcSeqTable()"/></div>'+
+      '<div class="dil-field"><label>Final vol (µL)</label><input type="number" id="seq-final-vol" step="any" value="15" oninput="calcSeqTable()"/></div>'+
+    '</div>'+
+    '<table class="dil-seq-table">'+
+      '<thead><tr><th>Sample</th><th>Conc (ng/µL)</th><th>DNA (\u00B5L)</th><th>Water (\u00B5L)</th></tr></thead>'+
+      '<tbody id="seq-tbody"></tbody>'+
+    '</table>'+
+    '<div style="margin-top:10px;display:flex;gap:8px">'+
+      '<button class="btn" onclick="addSeqRow()">+ Add row</button>'+
+      '<button class="btn" onclick="clearSeqTable()">Clear</button>'+
+    '</div>'+
+  '</div>';
+
+  // Serial dilution with unit selector
+  html+='<div class="dil-card">'+
+    '<h3>Serial dilution</h3>'+
+    '<div class="dil-row">'+
+      '<div class="dil-field"><label>Stock conc</label><input type="number" id="ser-stock" step="any" oninput="calcSerial()"/></div>'+
+      '<div class="dil-field"><label>Unit</label><select id="ser-unit" onchange="calcSerial()">'+concOpts+'</select></div>'+
+      '<div class="dil-field"><label>Dilution factor</label><input type="number" id="ser-factor" step="any" value="10" oninput="calcSerial()"/></div>'+
+      '<div class="dil-field"><label># steps</label><input type="number" id="ser-steps" value="5" min="1" max="12" oninput="calcSerial()"/></div>'+
+      '<div class="dil-field"><label>Vol/tube</label><input type="number" id="ser-vol" step="any" value="100" oninput="calcSerial()"/></div>'+
+      '<div class="dil-field"><label>Vol unit</label><select id="ser-vol-unit" onchange="calcSerial()">'+volOpts+'</select></div>'+
+    '</div>'+
+    '<div id="ser-result" style="margin-top:8px"></div>'+
+  '</div>';
+
+  el.innerHTML=html;
+  setTimeout(function(){renderSeqRows();calcSeqTable();},0);
+}
+
+function calcDilution(){
+  var c1=parseFloat(document.getElementById('dil-c1')?.value);
+  var c2=parseFloat(document.getElementById('dil-c2')?.value);
+  var v2=parseFloat(document.getElementById('dil-v2')?.value);
+  var cUnit=document.getElementById('dil-c-unit')?.value||'';
+  var vUnit=document.getElementById('dil-v-unit')?.value||'';
+  var v1El=document.getElementById('dil-v1');
+  var wEl=document.getElementById('dil-water');
+  if(c1>0&&c2>0&&v2>0){
+    var v1=(c2*v2)/c1;
+    var water=v2-v1;
+    v1El.value=v1.toFixed(2)+' '+vUnit;
+    wEl.value=water>0?water.toFixed(2)+' '+vUnit:'\u2014';
+    if(v1>v2){v1El.value='C1 too low!';v1El.style.color='var(--red)';wEl.value='\u2014';}
+    else{v1El.style.color='var(--accent)';}
+  } else {
+    v1El.value='\u2014';wEl.value='\u2014';v1El.style.color='var(--accent)';
+  }
+}
+
+function renderSeqRows(){
+  var tbody=document.getElementById('seq-tbody');
+  if(!tbody)return;
+  tbody.innerHTML=_dilSeqRows.map(function(r,i){
+    return '<tr>'+
+      '<td><input type="text" id="seq-name-'+i+'" value="'+esc(r.name)+'" placeholder="Sample '+(i+1)+'" style="width:140px" oninput="_dilSeqRows['+i+'].name=this.value"/></td>'+
+      '<td><input type="number" id="seq-conc-'+i+'" value="'+(r.conc||'')+'" step="any" placeholder="ng/&mu;L" oninput="_dilSeqRows['+i+'].conc=this.value;calcSeqTable()"/></td>'+
+      '<td id="seq-dna-'+i+'" style="font-weight:500;color:var(--accent)">—</td>'+
+      '<td id="seq-water-'+i+'" style="color:var(--muted)">—</td>'+
+    '</tr>';
+  }).join('');
+}
+
+function calcSeqTable(){
+  var targetConc=parseFloat(document.getElementById('seq-target-conc')?.value)||100;
+  var finalVol=parseFloat(document.getElementById('seq-final-vol')?.value)||15;
+  _dilSeqRows.forEach(function(r,i){
+    var conc=parseFloat(document.getElementById('seq-conc-'+i)?.value||r.conc);
+    var dnaEl=document.getElementById('seq-dna-'+i);
+    var waterEl=document.getElementById('seq-water-'+i);
+    if(!dnaEl||!waterEl)return;
+    if(conc>0&&targetConc>0&&finalVol>0){
+      var dnaVol=(targetConc*finalVol)/conc;
+      var water=finalVol-dnaVol;
+      if(dnaVol>finalVol){
+        dnaEl.textContent='too dilute';dnaEl.style.color='var(--red)';
+        waterEl.textContent='—';
+      } else {
+        dnaEl.textContent=dnaVol.toFixed(2);dnaEl.style.color='var(--accent)';
+        waterEl.textContent=water.toFixed(2);
+      }
+    } else {
+      dnaEl.textContent='—';waterEl.textContent='—';
+    }
+  });
+}
+
+function addSeqRow(){
+  _dilSeqRows.push({name:'',conc:'',vol:''});
+  renderSeqRows();calcSeqTable();
+  // Focus the new name input
+  var inp=document.getElementById('seq-name-'+(_dilSeqRows.length-1));
+  if(inp)inp.focus();
+}
+
+function clearSeqTable(){
+  _dilSeqRows=[{name:'',conc:'',vol:''}];
+  renderSeqRows();calcSeqTable();
+}
+
+function calcSerial(){
+  var stock=parseFloat(document.getElementById('ser-stock')?.value);
+  var factor=parseFloat(document.getElementById('ser-factor')?.value)||10;
+  var steps=parseInt(document.getElementById('ser-steps')?.value)||5;
+  var vol=parseFloat(document.getElementById('ser-vol')?.value)||100;
+  var cUnit=document.getElementById('ser-unit')?.value||'';
+  var vUnit=document.getElementById('ser-vol-unit')?.value||'\u00B5L';
+  var el=document.getElementById('ser-result');
+  if(!el||!stock||stock<=0){el.innerHTML='';return;}
+  var transferVol=vol/factor;
+  var diluent=vol-transferVol;
+  var html='<div style="font-size:12px;color:var(--muted);margin-bottom:8px">Transfer '+transferVol.toFixed(1)+' '+vUnit+' into '+diluent.toFixed(1)+' '+vUnit+' diluent per step</div>';
+  html+='<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">';
+  var conc=stock;
+  for(var i=0;i<=steps;i++){
+    var label=conc>=1?conc.toFixed(1):conc.toExponential(1);
+    html+='<div style="background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:8px 12px;text-align:center;min-width:70px">'+
+      '<div style="font-family:var(--mono);font-size:13px;font-weight:500;color:var(--text)">'+label+'</div>'+
+      '<div style="font-size:10px;color:var(--dim)">'+esc(cUnit)+'</div>'+
+    '</div>';
+    if(i<steps) html+='<span style="color:var(--dim)">\u2192</span>';
+    conc=conc/factor;
+  }
+  html+='</div>';
+  el.innerHTML=html;
+}
+registerView('dilution', renderDilution);
+
+
+// ── import_data.js ──
+// Import Data feature — import CSV/Excel as primers or plasmids
+
+var _importState = { tempId: null, ext: null, filename: null, headers: [], preview: [] };
+
+async function renderImportData(el) {
+  el.innerHTML =
+    '<h2>Import Data</h2>' +
+    '<div id="import-upload-section">' + _renderUploadForm() + '</div>' +
+    '<div id="import-mapping-section" style="display:none"></div>' +
+    '<div id="import-result-section" style="display:none"></div>' +
+    '<hr style="margin:2rem 0">' +
+    '<h3>Import History</h3>' +
+    '<div id="import-history-section"><span class="muted">Loading…</span></div>';
+
+  _loadImportHistory();
+}
+
+/* ── Upload step ──────────────────────────────────────────────────────────── */
+
+function _renderUploadForm() {
+  return (
+    '<div class="card" style="margin-bottom:1rem">' +
+      '<p>Upload a <strong>.csv</strong>, <strong>.tsv</strong>, or <strong>.xlsx</strong> file containing primers or plasmids.</p>' +
+      '<input type="file" id="import-file-input" accept=".csv,.tsv,.xlsx,.xls">' +
+      ' <button class="btn" onclick="_handleFileUpload()">Upload &amp; Preview</button>' +
+    '</div>'
+  );
+}
+
+async function _handleFileUpload() {
+  var input = document.getElementById('import-file-input');
+  if (!input || !input.files.length) { toast('Please select a file first.'); return; }
+
+  var file = input.files[0];
+  var formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    var resp = await fetch('/api/import/upload', { method: 'POST', body: formData });
+    if (!resp.ok) {
+      var err = await resp.json().catch(function () { return {}; });
+      toast(err.detail || 'Upload failed'); return;
+    }
+    var data = await resp.json();
+    _importState.tempId   = data.temp_id;
+    _importState.ext      = data.ext;
+    _importState.filename = data.filename;
+    _importState.headers  = data.headers;
+    _importState.preview  = data.preview;
+    _showMappingStep();
+  } catch (e) {
+    toast('Upload error: ' + e.message);
+  }
+}
+
+/* ── Column-mapping step ──────────────────────────────────────────────────── */
+
+function _showMappingStep() {
+  var sec = document.getElementById('import-mapping-section');
+  var h = _importState.headers;
+
+  var optionsHtml = '<option value="-1">— skip —</option>';
+  for (var i = 0; i < h.length; i++) {
+    optionsHtml += '<option value="' + i + '">' + esc(h[i]) + '</option>';
+  }
+
+  // Try to auto-detect columns by header name
+  var guessName = -1, guessSeq = -1, guessNotes = -1;
+  for (var j = 0; j < h.length; j++) {
+    var lc = h[j].toLowerCase();
+    if (guessName === -1 && lc.match(/name/))                     guessName = j;
+    if (guessSeq  === -1 && lc.match(/seq/))                      guessSeq  = j;
+    if (guessNotes === -1 && (lc.match(/note/) || lc.match(/desc/) || lc.match(/comment/))) guessNotes = j;
+  }
+
+  function sel(opts, chosen) {
+    return opts.replace(
+      'value="' + chosen + '"',
+      'value="' + chosen + '" selected'
+    );
+  }
+
+  var html =
+    '<div class="card">' +
+      '<h3>Map Columns — ' + esc(_importState.filename) + '</h3>' +
+      '<div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem">' +
+        '<label>Type ' +
+          '<select id="import-type">' +
+            '<option value="primer">Primers</option>' +
+            '<option value="plasmid">Plasmids</option>' +
+          '</select>' +
+        '</label>' +
+        '<label>Name column ' +
+          '<select id="import-col-name">' + sel(optionsHtml, guessName) + '</select>' +
+        '</label>' +
+        '<label>Sequence column ' +
+          '<select id="import-col-seq">' + sel(optionsHtml, guessSeq) + '</select>' +
+        '</label>' +
+        '<label>Notes column <small>(optional)</small> ' +
+          '<select id="import-col-notes">' + sel(optionsHtml, guessNotes) + '</select>' +
+        '</label>' +
+      '</div>' +
+      _renderPreviewTable() +
+      '<div style="margin-top:1rem">' +
+        '<button class="btn btn-primary" onclick="_executeImport()">Import</button> ' +
+        '<button class="btn" onclick="_resetImport()">Cancel</button>' +
+      '</div>' +
+    '</div>';
+
+  sec.innerHTML = html;
+  sec.style.display = '';
+}
+
+function _renderPreviewTable() {
+  var h = _importState.headers;
+  var rows = _importState.preview;
+  if (!rows.length) return '<p class="muted">No data rows found in file.</p>';
+
+  var html = '<div style="overflow-x:auto"><table class="table"><thead><tr>';
+  for (var i = 0; i < h.length; i++) {
+    html += '<th>' + esc(h[i]) + '</th>';
+  }
+  html += '</tr></thead><tbody>';
+  for (var r = 0; r < rows.length; r++) {
+    html += '<tr>';
+    for (var c = 0; c < h.length; c++) {
+      var val = rows[r][c] !== undefined ? rows[r][c] : '';
+      html += '<td>' + esc(val) + '</td>';
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+  html += '<p class="muted">Showing first ' + rows.length + ' data row(s).</p>';
+  return html;
+}
+
+/* ── Execute import ───────────────────────────────────────────────────────── */
+
+async function _executeImport() {
+  var colName = parseInt(document.getElementById('import-col-name').value, 10);
+  var colSeq  = parseInt(document.getElementById('import-col-seq').value, 10);
+  var colNotes = parseInt(document.getElementById('import-col-notes').value, 10);
+  var recordType = document.getElementById('import-type').value;
+
+  if (colName < 0) { toast('Please select a Name column.'); return; }
+  if (colSeq  < 0) { toast('Please select a Sequence column.'); return; }
+
+  var body = {
+    temp_id: _importState.tempId,
+    ext: _importState.ext,
+    record_type: recordType,
+    col_name: colName,
+    col_sequence: colSeq
+  };
+  if (colNotes >= 0) body.col_notes = colNotes;
+
+  try {
+    var data = await api('POST', '/api/import/execute', body);
+    document.getElementById('import-mapping-section').style.display = 'none';
+
+    var rSec = document.getElementById('import-result-section');
+    rSec.innerHTML =
+      '<div class="card" style="border-left:4px solid var(--accent,#4caf50);padding:1rem">' +
+        '<strong>Import complete!</strong> ' +
+        esc(String(data.record_count)) + ' ' + esc(data.record_type) + '(s) imported.' +
+        ' <button class="btn" onclick="_resetImport()" style="margin-left:1rem">Import Another</button>' +
+      '</div>';
+    rSec.style.display = '';
+
+    toast(data.record_count + ' ' + data.record_type + '(s) imported.');
+    _loadImportHistory();
+  } catch (e) {
+    toast('Import failed: ' + e.message);
+  }
+}
+
+/* ── Import history ───────────────────────────────────────────────────────── */
+
+async function _loadImportHistory() {
+  var sec = document.getElementById('import-history-section');
+  if (!sec) return;
+  try {
+    var data = await api('GET', '/api/import/history');
+    var items = data.items || [];
+    if (!items.length) {
+      sec.innerHTML = '<div class="muted">No imports yet.</div>';
+      return;
+    }
+    var html = '<table class="table"><thead><tr>' +
+      '<th>File</th><th>Type</th><th>Records</th><th>Date</th><th></th>' +
+      '</tr></thead><tbody>';
+    items.forEach(function (item) {
+      html += '<tr>' +
+        '<td>' + esc(item.filename) + '</td>' +
+        '<td>' + esc(item.record_type) + '</td>' +
+        '<td>' + esc(String(item.record_count)) + '</td>' +
+        '<td>' + esc(item.created.slice(0, 16).replace('T', ' ')) + '</td>' +
+        '<td><button class="btn btn-sm btn-danger" onclick="_deleteImport(' + item.id + ')">Delete</button></td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    sec.innerHTML = html;
+  } catch (e) {
+    sec.innerHTML = '<div class="muted">Could not load history.</div>';
+  }
+}
+
+async function _deleteImport(id) {
+  if (!confirm('Delete this import and all its records?')) return;
+  try {
+    await api('DELETE', '/api/import/' + id);
+    toast('Import deleted.');
+    _loadImportHistory();
+  } catch (e) {
+    toast('Delete failed: ' + e.message);
+  }
+}
+
+/* ── Reset ────────────────────────────────────────────────────────────────── */
+
+function _resetImport() {
+  _importState = { tempId: null, ext: null, filename: null, headers: [], preview: [] };
+  var m = document.getElementById('import-mapping-section');
+  var r = document.getElementById('import-result-section');
+  if (m) { m.innerHTML = ''; m.style.display = 'none'; }
+  if (r) { r.innerHTML = ''; r.style.display = 'none'; }
+  var u = document.getElementById('import-upload-section');
+  if (u) u.innerHTML = _renderUploadForm();
+}
+
+// Register with core
+registerView('import_data', renderImportData);
+
+
+// ── import.js ──
+// ── IMPORT ────────────────────────────────────────────────────────────────────
+let _importPages=[];
+let _importExpandedSet=new Set();
+let _importBatchId='';
+
+function renderImport(el){
+  var html='<div class="import-dropzone" id="import-dz" onclick="document.getElementById(\'import-files\').click()">'+
+    '<big>&#128229;</big>'+
+    'Drop OneNote <b>.mht</b> exports or a <b>.zip</b> here<br>'+
+    '<span style="font-size:12px;color:var(--dim)">Export: File &#8594; Export &#8594; Section/Notebook &#8594; Single File Web Page (.mht)</span>'+
+    '<input type="file" id="import-files" multiple accept=".html,.htm,.mht,.mhtml,.zip"/>'+
+  '</div>';
+
+  if(_importPages.length){
+    var entryCount=_importPages.filter(function(p){return p.content_type==='entry';}).length;
+    var protoCount=_importPages.filter(function(p){return p.content_type==='protocol';}).length;
+    var skipCount=_importPages.filter(function(p){return p.content_type==='skip';}).length;
+
+    // Batch controls
+    html+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 16px;margin-bottom:14px">'+
+      '<div style="font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono);margin-bottom:10px">Batch controls</div>'+
+      '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'+
+        '<span style="font-size:12px;color:var(--muted)">Set group for all:</span>'+
+        '<input type="text" id="imp-batch-group" placeholder="e.g. NorV, Protein X..." spellcheck="false" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:12px;padding:5px 10px;border-radius:4px;outline:none;width:180px"/>'+
+        '<button class="btn" onclick="importBatchGroup()">Apply to all</button>'+
+        '<span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>'+
+        '<button class="btn" onclick="importSetAllType(\'entry\')">All &#8594; entries</button>'+
+        '<button class="btn" onclick="importSetAllType(\'protocol\')">All &#8594; protocols</button>'+
+        '<button class="btn" onclick="importSetAllType(\'skip\')">Skip all</button>'+
+      '</div>'+
+    '</div>';
+
+    // Summary + import button
+    html+='<div class="import-actions" style="margin-bottom:14px">'+
+      '<span class="import-count"><b>'+_importPages.length+'</b> pages: <b>'+entryCount+'</b> entries, <b>'+protoCount+'</b> protocols, <b>'+skipCount+'</b> skipped</span>'+
+      '<button class="btn primary" onclick="importCommit()" style="padding:8px 20px">Import '+Math.max(0,entryCount+protoCount)+' items</button>'+
+    '</div>';
+
+    // Pages list — card-style instead of cramped table
+    html+='<div style="display:flex;flex-direction:column;gap:8px">';
+    _importPages.forEach(function(p,i){
+      var isSkip=p.content_type==='skip';
+      var isExpanded=_importExpandedSet.has(i);
+      var section=p.source?p.source.replace(/\\/g,'/').split('/').slice(0,-1).join('/'):p.filename||'';
+
+      html+='<div class="'+(isSkip?'skip-row':'')+'" id="imp-row-'+i+'" style="background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:opacity .15s;'+(isSkip?'opacity:.4':'')+'">'+
+        // Header row
+        '<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer" data-idx="'+i+'" id="imp-hdr-'+i+'">'+
+          '<span style="color:var(--dim);font-family:var(--mono);font-size:11px;min-width:24px">'+(i+1)+'</span>'+
+          '<div style="flex:1;min-width:0">'+
+            '<div style="font-weight:500;font-size:14px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+esc(p.title)+'">'+esc(p.title)+'</div>'+
+            '<div style="font-size:11px;color:var(--dim);font-family:var(--mono);margin-top:2px">'+
+              (section?esc(section)+' &middot; ':'')+
+              (p.char_count||0)+' chars'+
+              (p.image_count?' &middot; '+p.image_count+' img'+(p.image_count>1?'s':''):'')+
+              (p.date&&p.date!==new Date().toISOString().slice(0,10)?' &middot; '+esc(p.date):'')+
+            '</div>'+
+          '</div>'+
+          '<select class="import-type-sel" data-idx="'+i+'" id="imp-type-'+i+'" style="width:90px" onclick="event.stopPropagation()">'+
+            '<option value="entry"'+(p.content_type==='entry'?' selected':'')+'>Entry</option>'+
+            '<option value="protocol"'+(p.content_type==='protocol'?' selected':'')+'>Protocol</option>'+
+            '<option value="skip"'+(p.content_type==='skip'?' selected':'')+'>Skip</option>'+
+          '</select>'+
+          '<input class="import-group-inp" type="text" data-idx="'+i+'" id="imp-group-'+i+'" value="'+esc(p.group_name)+'" placeholder="group..." spellcheck="false" style="width:120px" onclick="event.stopPropagation()"/>'+
+          '<input class="import-date-inp" type="date" data-idx="'+i+'" id="imp-date-'+i+'" value="'+esc(p.date||'')+'" onclick="event.stopPropagation()"/>'+
+          '<span style="font-size:10px;color:var(--dim)">'+(isExpanded?'&#9660;':'&#9654;')+'</span>'+
+        '</div>';
+
+      // Expandable preview
+      if(isExpanded){
+        html+='<div style="border-top:1px solid var(--border);padding:12px 14px 14px;background:var(--surface2)">'+
+          '<pre style="white-space:pre-wrap;word-break:break-word;font-family:var(--sans);font-size:13px;color:var(--text);line-height:1.6;max-height:400px;overflow-y:auto;margin:0">'+esc(p.notes||p.preview||'')+'</pre>'+
+        '</div>';
+      }
+      html+='</div>';
+    });
+    html+='</div>';
+  }
+
+  el.innerHTML=html;
+
+  // Bind events
+  setTimeout(function(){
+    var dz=document.getElementById('import-dz');
+    var fi=document.getElementById('import-files');
+    if(dz){
+      dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('dragover');});
+      dz.addEventListener('dragleave',function(){dz.classList.remove('dragover');});
+      dz.addEventListener('drop',function(e){
+        e.preventDefault();dz.classList.remove('dragover');
+        if(e.dataTransfer.files.length) importUploadFiles(e.dataTransfer.files);
+      });
+    }
+    if(fi){
+      fi.addEventListener('change',function(e){
+        if(e.target.files.length) importUploadFiles(e.target.files);
+      });
+    }
+    // Bind per-row controls
+    _importPages.forEach(function(p,i){
+      var hdr=document.getElementById('imp-hdr-'+i);
+      if(hdr) hdr.addEventListener('click',function(){
+        if(_importExpandedSet.has(i)) _importExpandedSet.delete(i);
+        else _importExpandedSet.add(i);
+        renderImport(document.getElementById('content'));
+      });
+      var typeSel=document.getElementById('imp-type-'+i);
+      if(typeSel) typeSel.addEventListener('change',function(){
+        _importPages[i].content_type=this.value;
+        renderImport(document.getElementById('content'));
+      });
+      var grpInp=document.getElementById('imp-group-'+i);
+      if(grpInp) grpInp.addEventListener('input',function(){_importPages[i].group_name=this.value;});
+      var dateInp=document.getElementById('imp-date-'+i);
+      if(dateInp) dateInp.addEventListener('change',function(){_importPages[i].date=this.value;});
+    });
+    // Batch group enter key
+    var batchInp=document.getElementById('imp-batch-group');
+    if(batchInp) batchInp.addEventListener('keydown',function(e){if(e.key==='Enter')importBatchGroup();});
+  },50);
+}
+
+async function importUploadFiles(fileList){
+  var fd=new FormData();
+  for(var i=0;i<fileList.length;i++){
+    fd.append('files',fileList[i]);
+  }
+  var dz=document.getElementById('import-dz');
+  if(dz){dz.innerHTML='<big>&#9881;</big>Parsing '+fileList.length+' file'+(fileList.length>1?'s':'')+'...';}
+  try{
+    var resp=await fetch('/api/import/parse',{method:'POST',body:fd});
+    if(!resp.ok) throw new Error(await resp.text());
+    var data=await resp.json();
+    _importPages=data.pages||[];
+    _importBatchId=data.batch_id||'';
+    toast('Parsed '+_importPages.length+' pages');
+    renderImport(document.getElementById('content'));
+  }catch(e){
+    toast('Parse failed: '+e.message,true);
+    if(dz) dz.innerHTML='<big>&#128229;</big>Error — try again';
+  }
+}
+
+function importSetAllType(type){
+  _importPages.forEach(function(p){p.content_type=type;});
+  renderImport(document.getElementById('content'));
+}
+
+function importBatchGroup(){
+  var inp=document.getElementById('imp-batch-group');
+  var val=inp?inp.value.trim():'';
+  if(!val){toast('Enter a group name first',true);return;}
+  _importPages.forEach(function(p){if(p.content_type!=='skip')p.group_name=val;});
+  renderImport(document.getElementById('content'));
+  toast('Set group "'+val+'" on all items');
+}
+
+async function importCommit(){
+  // Read current values from the DOM
+  var items=_importPages.map(function(p,i){
+    return {
+      title:p.title,
+      content_type:document.getElementById('imp-type-'+i)?.value||p.content_type,
+      group_name:document.getElementById('imp-group-'+i)?.value||p.group_name||'',
+      subgroup:'Notes',
+      date:document.getElementById('imp-date-'+i)?.value||p.date||'',
+      notes:p.notes||'',
+      results:p.results||'',
+      issues:p.issues||'',
+      steps:p.steps||'',
+    };
+  });
+  var toImport=items.filter(function(i){return i.content_type!=='skip';});
+  if(!toImport.length){toast('Nothing selected to import',true);return;}
+  if(!confirm('Import '+toImport.length+' item'+(toImport.length>1?'s':'')+'?'))return;
+  try{
+    var resp=await api('POST','/api/import/commit',{items:items,batch_id:_importBatchId});
+    var imgMsg=resp.created_images?' + '+resp.created_images+' images':'';
+    toast('Imported: '+resp.created_entries+' entries, '+resp.created_protocols+' protocols'+imgMsg);
+    _importPages=[];_importBatchId='';
+    await load();
+    renderImport(document.getElementById('content'));
+  }catch(e){
+    toast('Import failed: '+e.message,true);
+  }
+}
+registerView('import', renderImport);
+
+
+// ── enrichment.js ──
+// ── Enrichment ───────────────────────────────────────────────────────────────
+let _enrichPollTimer=null;
+
+async function triggerEnrichment(){
+  var btn=document.getElementById('enrich-btn');
+  var icon=document.getElementById('enrich-icon');
+  var label=document.getElementById('enrich-label');
+  try{
+    var resp=await fetch('/api/enrich',{method:'POST'});
+    if(!resp.ok) throw new Error('Enrich endpoint not available');
+    btn.style.borderColor='var(--amber)';
+    btn.style.color='var(--amber)';
+    icon.style.animation='spin .8s linear infinite';
+    label.textContent='Running...';
+    toast('3090 waking up — enrichment started');
+    if(_enrichPollTimer) clearInterval(_enrichPollTimer);
+    _enrichPollTimer=setInterval(async function(){
+      try{
+        var sr=await fetch('/api/enrich-status');
+        if(!sr.ok)return;
+        var s=await sr.json();
+        var logs=s.recent_log||[];
+        if(logs.length) label.textContent=logs[logs.length-1].replace(/^\[[\d:]+\] /,'').slice(0,25)+'...';
+        if(!s.enrichment_running){
+          clearInterval(_enrichPollTimer);
+          _enrichPollTimer=null;
+          btn.style.borderColor='var(--accent)';
+          btn.style.color='var(--accent)';
+          icon.style.animation='';
+          icon.innerHTML='&#10003;';
+          label.textContent='Done';
+          toast('Enrichment complete');
+          await load();
+          setTimeout(function(){
+            btn.style.borderColor='var(--border2)';
+            btn.style.color='var(--muted)';
+            icon.innerHTML='&#9881;';
+            label.textContent='Enrich';
+          },3000);
+        }
+      }catch(e){}
+    },5000);
+  }catch(e){
+    toast('Could not start enrichment: '+e.message,true);
+  }
+}
+
+// ── CSV ───────────────────────────────────────────────────────────────
+boot();
+
+
+boot();
+</script>
+</body>
+</html>

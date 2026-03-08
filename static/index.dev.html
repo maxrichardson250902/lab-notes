@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,300;1,400&family=JetBrains+Mono:wght@300;400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="layout">
+
+<!-- Sidebar -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-logo">
+    <h1>Lab Notes</h1>
+    <p>notebook + protocols</p>
+  </div>
+  <div class="sidebar-scroll">
+    <div class="nav-section">Views</div>
+    <div class="nav-item active" id="nav-notebook" onclick="setView('notebook')">
+      <span>&#128221;</span><span>Notebook</span><span class="count" id="cnt-entries">0</span>
+    </div>
+    <div class="nav-item" id="nav-protocols" onclick="setView('protocols')">
+      <span>&#128196;</span><span>Protocols</span><span class="count" id="cnt-protocols">0</span>
+    </div>
+    <div class="nav-item" id="nav-summaries" onclick="setView('summaries')">
+      <span>&#128202;</span><span>Summaries</span>
+    </div>
+    <div class="nav-item" id="nav-workflow" onclick="setView('workflow')">
+      <span>&#128336;</span><span>Daily Workflow</span>
+    </div>
+    <div class="nav-item" id="nav-import_data" onclick="setView('import_data')">
+      <span>&#128736;</span><span>DNA manager</span><span class="count" id="cnt-project-flow">0</span>
+    </div>
+    <div class="nav-item" id="nav-scratch" onclick="setView('scratch')">
+      <span>&#9881;</span><span>Scratch Pad</span><span class="count" id="cnt-scratch">0</span>
+    </div>
+    <div class="nav-item" id="nav-reminders" onclick="setView('reminders')">
+      <span>&#128276;</span><span>Reminders</span><span class="count" id="cnt-reminders">0</span>
+    </div>
+    <div class="nav-divider"></div>
+    <div class="nav-section">Tools</div>
+    <div class="nav-item" id="nav-timeline" onclick="setView('timeline')">
+      <span>&#9683;</span><span>Timeline</span>
+    </div>
+    <div class="nav-item" id="nav-predictions" onclick="setView('predictions')">
+      <span>&#9733;</span><span>Predictions</span><span class="count" id="cnt-predictions">0</span>
+    </div>
+    <div class="nav-item" id="nav-cloning" onclick="setView('cloning')">
+      <span>&#129516;</span><span>Cloning</span>
+    </div>
+    <div class="nav-item" id="nav-dilution" onclick="setView('dilution')">
+      <span>&#9874;</span><span>Dilution Calc</span>
+    </div>
+    <div class="nav-item" id="nav-tm_calc" onclick="setView('tm_calc')">  
+      <span>&#127777;</span><span>Tm Calculator</span>
+    </div>
+    <div class="nav-item" id="nav-import" onclick="setView('import')">
+      <span>&#128229;</span><span>Import</span>
+    </div>
+    <div class="nav-divider"></div>
+    <!-- Dynamic nav items from features go here -->
+    <div id="dynamic-nav"></div>
+    <div class="nav-divider"></div>
+    <div class="nav-section">Projects</div>
+    <div id="group-nav"></div>
+  </div>
+</aside>
+
+<!-- Main -->
+<div class="main">
+  <header>
+    <button class="toggle-sb" onclick="toggleSidebar()">&#9776;</button>
+    <div class="page-title" id="page-title">Notebook</div>
+    <div class="header-right">
+      <button id="enrich-btn" title="Wake 3090 — fill entries, summarise, process scratch pad, update summaries" style="background:transparent;border:1px solid var(--border2);color:var(--muted);font-family:var(--mono);font-size:11px;padding:5px 12px;cursor:pointer;border-radius:4px;transition:all .15s;display:flex;align-items:center;gap:5px" onclick="triggerEnrichment()">
+        <span id="enrich-icon" style="display:inline-block">&#9881;</span><span id="enrich-label">Enrich</span>
+      </button>
+      <button class="btn primary" id="add-btn" onclick="showAddForm()">+ New entry</button>
+    </div>
+  </header>
+  <div class="content" id="content">
+    <div class="empty"><big>&#128221;</big>Loading...</div>
+  </div>
+</div>
+</div>
+<div id="toast"></div>
+
+<!-- SCRIPTS_START -->
+<script src="/static/core.js"></script>
+<script src="/static/features/cloning.js"></script>
+<script src="/static/features/tm_calc.js"></script>
+<script src="/static/features/notebook.js"></script>
+<script src="/static/features/import_data.js"></script>
+<script src="/static/features/protocols.js"></script>
+<script src="/static/features/summaries.js"></script>
+<script src="/static/features/addform.js"></script>
+<script src="/static/features/workflow.js"></script>
+<script src="/static/features/scratch.js"></script>
+<script src="/static/features/reminders.js"></script>
+<script src="/static/features/timeline.js"></script>
+<script src="/static/features/predictions.js"></script>
+<script src="/static/features/dilution.js"></script>
+<script src="/static/features/import.js"></script>
+<script src="/static/features/enrichment.js"></script>
+
+<!-- Boot -->
+<script>boot();</script>
+<!-- SCRIPTS_END -->
+</body>
+</html>
