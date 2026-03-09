@@ -10,6 +10,8 @@ services:
       - lab-data:/data
       # SSH key for 3090 enrichment (read-only)
       - ~/.ssh/boltz_key:/root/.ssh/boltz_key:ro
+      # rclone config for Google Drive backups
+      - /home/max/.config/rclone:/root/.config/rclone:ro
     environment:
       - PC_IP=192.168.1.144
       - PC_USER=max
@@ -30,3 +32,4 @@ services:
 
 volumes:
   lab-data:
+  
