@@ -19,6 +19,9 @@
   </div>
   <div class="sidebar-scroll">
     <div class="nav-section">Views</div>
+    <div class="nav-item" id="nav-workflow" onclick="setView('workflow')">
+      <span>&#128336;</span><span>Workflow</span>
+    </div>
     <div class="nav-item active" id="nav-notebook" onclick="setView('notebook')">
       <span>&#128221;</span><span>Notebook</span><span class="count" id="cnt-entries">0</span>
     </div>
@@ -28,8 +31,8 @@
     <div class="nav-item" id="nav-summaries" onclick="setView('summaries')">
       <span>&#128202;</span><span>Summaries</span>
     </div>
-    <div class="nav-item" id="nav-workflow" onclick="setView('workflow')">
-      <span>&#128336;</span><span>Daily Workflow</span>
+    <div class="nav-item" id="nav-pipeline" onclick="setView('pipeline')">
+      <span>&#128200;</span><span>Pipeline</span>
     </div>
     <div class="nav-item" id="nav-import_data" onclick="setView('import_data')">
       <span>&#128736;</span><span>DNA manager</span><span class="count" id="cnt-project-flow">0</span>
@@ -50,6 +53,9 @@
     </div>
     <div class="nav-item" id="nav-cloning" onclick="setView('cloning')">
       <span>&#129516;</span><span>Cloning</span>
+    </div>
+    <div class="nav-item" id="nav-sanger" onclick="setView('sanger')">
+      <span>&#7784;</span><span>Sanger</span>
     </div>
     <div class="nav-item" id="nav-dilution" onclick="setView('dilution')">
       <span>&#9874;</span><span>Dilution Calc</span>
@@ -93,6 +99,8 @@
 
 <!-- SCRIPTS_START -->
 <script src="/static/core.js"></script>
+<script src="/static/features/sanger.js"></script>
+<script src="/static/features/pipeline.js"></script>
 <script src="/static/features/backup.js"></script>
 <script src="/static/features/cloning.js"></script>
 <script src="/static/features/tm_calc.js"></script>

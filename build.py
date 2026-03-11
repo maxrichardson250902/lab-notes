@@ -14,9 +14,9 @@ OUT_HTML = STATIC / "index.html"
 
 # Order matters — core first, then features in the order the dev HTML lists them
 FEATURE_ORDER = [
-    "notebook", "protocols", "summaries", "addform",
-    "workflow", "scratch", "reminders", "timeline",
-    "predictions","cloning", "dilution","import_data","backup","tm_calc",  "import", "enrichment",
+    "notebook", "workflow",  "protocols", "summaries","pipeline" ,"addform",
+     "scratch", "reminders", "timeline",
+    "predictions","cloning","sanger", "dilution","import_data","backup","tm_calc",  "import", "enrichment",
 ]
 
 

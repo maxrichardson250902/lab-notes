@@ -43,7 +43,7 @@ async function api(method, path, body) {
 async function boot() {
   buildSidebarNav();
   await load();
-  setInterval(load, 30000);
+  setInterval(load, 600000);
 }
 
 function buildSidebarNav() {
@@ -147,7 +147,7 @@ function setGroup(g) {
 
 async function loadView() {
   const el = document.getElementById('content');
-  if ((S.view === 'notebook' && S.nbBook) || S.view === 'cloning') {
+  if ((S.view === 'notebook' && S.nbBook) || S.view === 'cloning' || S.view === 'pipeline' || S.view === 'sanger') {
     el.style.maxWidth = 'none'; el.style.padding = '0';
   } else {
     el.style.maxWidth = ''; el.style.padding = '';

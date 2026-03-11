@@ -187,7 +187,7 @@ async function _dnaDeletePrimer(id) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PLASMID TABLE
+//  PLASMID TABLE — now includes Antibiotic Resistance column
 // ══════════════════════════════════════════════════════════════════════════════
 
 function _dnaPlasmidTable() {
@@ -197,13 +197,18 @@ function _dnaPlasmidTable() {
   if (!items.length) {
     html += '<div class="dna-empty">No plasmids yet \u2014 add one below or import from a file.</div>';
   } else {
+    // Check if any plasmid has resistance data
+    var anyResistance = items.some(function(p) { return p.antibiotic_resistance; });
+    var anyGb = items.some(function(p) { return p.gb_file; });
+
     html += '<div class="dna-table-wrap"><table class="dna-table"><thead><tr>';
-    html += '<th>Name</th><th>Use</th><th>Box Location</th><th>Glycerol</th><th>.gb</th><th style="width:2.5rem"></th>';
+    html += '<th>Name</th><th>Use</th><th>Resistance</th><th>Box Location</th><th>Glycerol</th><th>.gb</th><th style="width:2.5rem"></th>';
     html += '</tr></thead><tbody>';
     items.forEach(function(p) {
       html += '<tr>';
       html += '<td class="dna-cell-name">' + esc(p.name) + '</td>';
       html += '<td>' + esc(p.use || '') + '</td>';
+      html += '<td>' + _dnaResistanceCell(p) + '</td>';
       html += '<td>' + esc(p.box_location || '') + '</td>';
       html += '<td>' + esc(p.glycerol_location || '') + '</td>';
       html += '<td>' + _dnaGbCell('plasmid', p) + '</td>';
@@ -211,6 +216,13 @@ function _dnaPlasmidTable() {
       html += '</tr>';
     });
     html += '</tbody></table></div>';
+
+    // Rescan button — useful for populating resistance on existing .gb files
+    if (anyGb) {
+      html += '<div style="margin-top:.3rem;text-align:right">';
+      html += '<button class="btn btn-sm" onclick="_dnaRescanResistance()" title="Re-parse all .gb files for antibiotic resistance annotations" style="font-size:.78rem;color:#8a7f72">\u{1F50D} Rescan .gb files for resistance</button>';
+      html += '</div>';
+    }
   }
 
   html += '<div class="dna-add-row">';
@@ -221,6 +233,30 @@ function _dnaPlasmidTable() {
   html += '<button class="btn btn-sm" onclick="_dnaAddPlasmid()">Add</button>';
   html += '</div>';
   return html;
+}
+
+function _dnaResistanceCell(p) {
+  var res = p.antibiotic_resistance || '';
+  if (!res) {
+    if (p.gb_file) return '<span class="muted" style="font-size:.78rem">none detected</span>';
+    return '<span class="muted">\u2014</span>';
+  }
+  // Show as styled badges
+  var parts = res.split(',');
+  var html = '';
+  parts.forEach(function(r) {
+    r = r.trim();
+    if (r) html += '<span class="dna-resist-badge">' + esc(r) + '</span> ';
+  });
+  return html;
+}
+
+async function _dnaRescanResistance() {
+  try {
+    var data = await api('POST', '/api/plasmids/rescan-resistance');
+    toast(data.updated + ' plasmid(s) rescanned.');
+    _dnaRefresh();
+  } catch(e) { toast('Error: ' + e.message); }
 }
 
 async function _dnaAddPlasmid() {
@@ -264,7 +300,14 @@ async function _dnaUploadGb(type, id, input) {
   try {
     var resp = await fetch('/api/' + type + 's/' + id + '/gb', { method: 'POST', body: fd });
     if (!resp.ok) { var e = await resp.json().catch(function(){return {};}); toast(e.detail || 'Upload failed'); return; }
-    toast('.gb file attached.'); _dnaRefresh();
+    var result = await resp.json();
+    // Show resistance info in toast if detected on a plasmid
+    if (type === 'plasmid' && result.antibiotic_resistance) {
+      toast('.gb file attached \u2014 resistance detected: ' + result.antibiotic_resistance);
+    } else {
+      toast('.gb file attached.');
+    }
+    _dnaRefresh();
   } catch(e) { toast('Upload error: ' + e.message); }
 }
 
@@ -619,6 +662,20 @@ function _dnaLinkifyElement(el) {
   if (el.dataset) el.dataset.dnaLinked = '1';
 }
 
+// ── Scan all existing content for linkification ─────────────────────────────
+// This fixes the bug where links only appeared when scrolling through days
+// (i.e. only on new mutations) but not on initial view render.
+
+function _dnaLinkifyAll() {
+  if (!_dna.linkRegex) return;
+  var target = document.getElementById('main') || document.getElementById('content') || document.body;
+  // Find all elements that could contain text content to linkify
+  var candidates = target.querySelectorAll('.card, .entry, .entry-content, [class*="content"], p, div, td, li, span, h1, h2, h3, h4');
+  for (var i = 0; i < candidates.length; i++) {
+    _dnaLinkifyElement(candidates[i]);
+  }
+}
+
 var _dnaObserver = null;
 
 function _dnaStartObserver() {
@@ -633,6 +690,28 @@ function _dnaStartObserver() {
     });
   });
   _dnaObserver.observe(target, { childList: true, subtree: true });
+
+  // Immediately linkify existing content on the page
+  _dnaLinkifyAll();
+}
+
+// ── Hook into view changes so we re-linkify after navigation ────────────────
+// When setView() is called, the new view renders async content that may not
+// be caught by the mutation observer (e.g. if innerHTML is set on an element
+// that already exists). We re-scan after a short delay to catch these cases.
+
+var _dnaOrigSetView = null;
+
+function _dnaHookSetView() {
+  if (_dnaOrigSetView) return; // already hooked
+  if (typeof setView !== 'function') return;
+  _dnaOrigSetView = setView;
+  setView = function(name) {
+    _dnaOrigSetView(name);
+    // Re-linkify after the new view has rendered (async content needs time)
+    setTimeout(_dnaLinkifyAll, 200);
+    setTimeout(_dnaLinkifyAll, 800);
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -688,6 +767,7 @@ function _dnaShowPopover(linkEl) {
     html += '<div class="dna-pop-body">';
     html += '<div class="dna-pop-type">PLASMID</div>';
     if (item.use) html += '<div class="dna-pop-row"><span class="dna-pop-label">Use</span>' + esc(item.use) + '</div>';
+    if (item.antibiotic_resistance) html += '<div class="dna-pop-row"><span class="dna-pop-label">Resistance</span>' + esc(item.antibiotic_resistance) + '</div>';
     if (item.box_location) html += '<div class="dna-pop-row"><span class="dna-pop-label">Box</span>' + esc(item.box_location) + '</div>';
     if (item.glycerol_location) html += '<div class="dna-pop-row"><span class="dna-pop-label">Glycerol</span>' + esc(item.glycerol_location) + '</div>';
     if (item.gb_file) html += '<div class="dna-pop-row"><a href="/api/plasmids/' + item.id + '/gb" class="dna-gb-link">\u2b07 ' + esc(item.gb_file) + '</a></div>';
@@ -759,6 +839,9 @@ function _dnaStyles() {
     '.dna-del:hover { color:#c0392b; }' +
     '.dna-setting-label { display:flex; flex-direction:column; font-size:.82rem; color:#8a7f72; gap:.2rem; }' +
 
+    /* resistance badges */
+    '.dna-resist-badge { display:inline-block; font-size:.75rem; padding:.15rem .45rem; background:#e8f0e8; color:#3d5a3f; border:1px solid #b8cfb8; border-radius:3px; font-weight:500; letter-spacing:.02em; white-space:nowrap; }' +
+
     /* .gb */
     '.dna-gb-link { color:#5b7a5e; font-size:.82rem; text-decoration:none; }' +
     '.dna-gb-link:hover { text-decoration:underline; }' +
@@ -810,6 +893,7 @@ function _dnaInitLinking() {
     _dna.plasmids = (results[2] && results[2].items) || [];
     _dnaBuildRegex();
     _dnaStartObserver();
+    _dnaHookSetView();
   });
 }
 

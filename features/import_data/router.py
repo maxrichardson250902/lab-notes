@@ -10,12 +10,19 @@ import csv
 import io
 import os
 import uuid
+import re
 
 try:
     import openpyxl
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
+
+try:
+    from Bio import SeqIO
+    HAS_BIOPYTHON = True
+except ImportError:
+    HAS_BIOPYTHON = False
 
 # ── Tables ───────────────────────────────────────────────────────────────────
 
@@ -59,9 +66,165 @@ GB_DIR = "/data/gb_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(GB_DIR, exist_ok=True)
 
+# ── Antibiotic resistance detection ─────────────────────────────────────────
+
+# Map of gene name patterns → antibiotic name
+RESISTANCE_GENES = {
+    r'\bbla\b': 'Ampicillin',
+    r'\bampR\b': 'Ampicillin',
+    r'\bamp\b': 'Ampicillin',
+    r'beta-lactamase': 'Ampicillin',
+    r'\bkan\b': 'Kanamycin',
+    r'\bkanR\b': 'Kanamycin',
+    r'\baph\b': 'Kanamycin',
+    r'\bneo\b': 'Kanamycin/Neomycin',
+    r'\bnptII\b': 'Kanamycin',
+    r'\bcat\b': 'Chloramphenicol',
+    r'\bcmR\b': 'Chloramphenicol',
+    r'chloramphenicol acetyltransferase': 'Chloramphenicol',
+    r'\btet\b': 'Tetracycline',
+    r'\btetR\b': 'Tetracycline',
+    r'\btetA\b': 'Tetracycline',
+    r'\bspec\b': 'Spectinomycin',
+    r'\baadA\b': 'Spectinomycin',
+    r'\berm\b': 'Erythromycin',
+    r'\bhyg\b': 'Hygromycin',
+    r'\bhygR\b': 'Hygromycin',
+    r'\bhph\b': 'Hygromycin',
+    r'\bzeo\b': 'Zeocin',
+    r'\bble\b': 'Zeocin',
+    r'\bbsr\b': 'Blasticidin',
+    r'\bpac\b': 'Puromycin',
+    r'\bpuro\b': 'Puromycin',
+    r'\bnat\b': 'Nourseothricin',
+    r'\bgent\b': 'Gentamicin',
+    r'\baac': 'Gentamicin',
+    r'\bstrep\b': 'Streptomycin',
+    r'\bsulI\b': 'Sulfonamide',
+    r'\btmp\b': 'Trimethoprim',
+    r'\bdhfr\b': 'Trimethoprim',
+}
+
+# Keywords to search in qualifier values
+RESISTANCE_KEYWORDS = [
+    'ampicillin', 'kanamycin', 'chloramphenicol', 'tetracycline',
+    'spectinomycin', 'erythromycin', 'hygromycin', 'zeocin',
+    'blasticidin', 'puromycin', 'nourseothricin', 'gentamicin',
+    'streptomycin', 'sulfonamide', 'trimethoprim', 'carbenicillin',
+    'neomycin', 'G418',
+]
+
+# Common shorthand annotation labels → antibiotic
+RESISTANCE_SHORTHANDS = {
+    'AmpR': 'Ampicillin',
+    'Amp(R)': 'Ampicillin',
+    'KanR': 'Kanamycin',
+    'Kan(R)': 'Kanamycin',
+    'CmR': 'Chloramphenicol',
+    'Cm(R)': 'Chloramphenicol',
+    'TetR': 'Tetracycline',
+    'Tet(R)': 'Tetracycline',
+    'SpecR': 'Spectinomycin',
+    'Spec(R)': 'Spectinomycin',
+    'ErmR': 'Erythromycin',
+    'HygR': 'Hygromycin',
+    'Hyg(R)': 'Hygromycin',
+    'ZeoR': 'Zeocin',
+    'Zeo(R)': 'Zeocin',
+    'BsrR': 'Blasticidin',
+    'BlastR': 'Blasticidin',
+    'PuroR': 'Puromycin',
+    'Puro(R)': 'Puromycin',
+    'NatR': 'Nourseothricin',
+    'GenR': 'Gentamicin',
+    'Gen(R)': 'Gentamicin',
+    'StrepR': 'Streptomycin',
+    'NeoR': 'Kanamycin/Neomycin',
+    'Neo(R)': 'Kanamycin/Neomycin',
+    'SmR': 'Streptomycin',
+}
+
+
+def _parse_resistance_from_gb(contents: bytes) -> str:
+    """Parse a GenBank file and extract antibiotic resistance annotations.
+    Returns comma-separated list of antibiotics, or empty string."""
+    if not HAS_BIOPYTHON:
+        return ""
+
+    found = set()
+
+    try:
+        records = list(SeqIO.parse(io.StringIO(contents.decode("utf-8", errors="replace")), "genbank"))
+    except Exception:
+        return ""
+
+    for record in records:
+        for feature in record.features:
+            # Collect ALL qualifier text for this feature (every qualifier, not just a subset)
+            all_text = ""
+            for key, vals in feature.qualifiers.items():
+                for v in vals:
+                    all_text += " " + v
+            lower_text = all_text.lower()
+
+            # Method 1: Direct keyword match — antibiotic name + resistance context
+            for kw in RESISTANCE_KEYWORDS:
+                if kw.lower() in lower_text and any(
+                    t in lower_text for t in ("resistance", "resistant", "selectable marker")
+                ):
+                    found.add(kw.capitalize())
+
+            # Method 2: Gene name pattern matching against ALL qualifier text
+            for pattern, antibiotic in RESISTANCE_GENES.items():
+                if re.search(pattern, all_text, re.IGNORECASE):
+                    found.add(antibiotic)
+
+            # Method 3: Common shorthand label names (AmpR, KanR, CmR, etc.)
+            for shorthand, antibiotic in RESISTANCE_SHORTHANDS.items():
+                if re.search(r'(?:^|\s|")' + re.escape(shorthand) + r'(?:\s|"|$)', all_text, re.IGNORECASE):
+                    found.add(antibiotic)
+
+            # Method 4: Antibiotic keyword in any qualifier (no "resistance" context needed)
+            for kw in RESISTANCE_KEYWORDS:
+                if kw.lower() in lower_text:
+                    found.add(kw.capitalize())
+
+    # Normalize some names
+    normalized = set()
+    for a in found:
+        a_lower = a.lower()
+        if a_lower == 'g418':
+            normalized.add('Kanamycin/G418')
+        elif a_lower == 'carbenicillin':
+            normalized.add('Ampicillin/Carbenicillin')
+        elif a_lower == 'neomycin':
+            normalized.add('Kanamycin/Neomycin')
+        else:
+            normalized.add(a)
+
+    return ", ".join(sorted(normalized))
+
+
 # ── Router ───────────────────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/api", tags=["dna_manager"])
+
+# ── Ensure antibiotic_resistance column exists (lazy) ────────────────────────
+
+_resistance_col_checked = False
+
+def _ensure_resistance_column():
+    """Add antibiotic_resistance column to plasmids if it doesn't exist.
+    Called lazily on first plasmid API hit, so the table is guaranteed to exist."""
+    global _resistance_col_checked
+    if _resistance_col_checked:
+        return
+    _resistance_col_checked = True
+    with get_db() as conn:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(plasmids)").fetchall()]
+        if "antibiotic_resistance" not in cols:
+            conn.execute("ALTER TABLE plasmids ADD COLUMN antibiotic_resistance TEXT DEFAULT ''")
+            conn.commit()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PRIMERS CRUD
@@ -113,7 +276,6 @@ def update_primer(item_id: int, body: UpdatePrimer):
 
 @router.delete("/primers/{item_id}")
 def delete_primer(item_id: int):
-    # also remove .gb file
     path = os.path.join(GB_DIR, f"primer_{item_id}.gb")
     if os.path.exists(path):
         os.remove(path)
@@ -177,9 +339,11 @@ class UpdatePlasmid(BaseModel):
     use: Optional[str] = None
     box_location: Optional[str] = None
     glycerol_location: Optional[str] = None
+    antibiotic_resistance: Optional[str] = None
 
 @router.get("/plasmids")
 def list_plasmids():
+    _ensure_resistance_column()
     with get_db() as conn:
         rows = conn.execute("SELECT * FROM plasmids ORDER BY created DESC").fetchall()
     return {"items": [dict(r) for r in rows]}
@@ -224,6 +388,7 @@ def delete_plasmid(item_id: int):
 
 @router.post("/plasmids/{item_id}/gb")
 async def upload_plasmid_gb(item_id: int, file: UploadFile = File(...)):
+    _ensure_resistance_column()
     with get_db() as conn:
         row = conn.execute("SELECT * FROM plasmids WHERE id=?", (item_id,)).fetchone()
         if not row:
@@ -232,8 +397,14 @@ async def upload_plasmid_gb(item_id: int, file: UploadFile = File(...)):
     stored = os.path.join(GB_DIR, f"plasmid_{item_id}.gb")
     with open(stored, "wb") as f:
         f.write(contents)
+
+    # Parse antibiotic resistance from the .gb file
+    resistance = _parse_resistance_from_gb(contents)
+
     with get_db() as conn:
-        conn.execute("UPDATE plasmids SET gb_file=? WHERE id=?", (file.filename, item_id))
+        conn.execute(
+            "UPDATE plasmids SET gb_file=?, antibiotic_resistance=? WHERE id=?",
+            (file.filename, resistance, item_id))
         conn.commit()
         row = dict(conn.execute("SELECT * FROM plasmids WHERE id=?", (item_id,)).fetchone())
     return row
@@ -252,13 +423,37 @@ def download_plasmid_gb(item_id: int):
 
 @router.delete("/plasmids/{item_id}/gb")
 def delete_plasmid_gb(item_id: int):
+    _ensure_resistance_column()
     stored = os.path.join(GB_DIR, f"plasmid_{item_id}.gb")
     if os.path.exists(stored):
         os.remove(stored)
     with get_db() as conn:
-        conn.execute("UPDATE plasmids SET gb_file=NULL WHERE id=?", (item_id,))
+        conn.execute("UPDATE plasmids SET gb_file=NULL, antibiotic_resistance='' WHERE id=?", (item_id,))
         conn.commit()
     return {"ok": True}
+
+# ── Re-scan existing .gb files for resistance ────────────────────────────────
+
+@router.post("/plasmids/rescan-resistance")
+def rescan_all_resistance():
+    """Re-parse all existing plasmid .gb files to populate antibiotic_resistance."""
+    _ensure_resistance_column()
+    updated = 0
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, gb_file FROM plasmids WHERE gb_file IS NOT NULL AND gb_file != ''").fetchall()
+        for row in rows:
+            stored = os.path.join(GB_DIR, f"plasmid_{row['id']}.gb")
+            if not os.path.exists(stored):
+                continue
+            with open(stored, "rb") as f:
+                contents = f.read()
+            resistance = _parse_resistance_from_gb(contents)
+            conn.execute(
+                "UPDATE plasmids SET antibiotic_resistance=? WHERE id=?",
+                (resistance, row["id"]))
+            updated += 1
+        conn.commit()
+    return {"updated": updated}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DNA LINK SETTINGS

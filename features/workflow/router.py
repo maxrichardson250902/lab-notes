@@ -146,8 +146,8 @@ async def process_workflow_day(body: dict):
                         cur = conn.execute(
                             "INSERT INTO entries (title,group_name,subgroup,date,notes,results,yields,issues,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?)",
                             (data.get("title", f"Workflow {date}"), group, "Notes",
-                             date, data.get("notes", ""), data.get("results", ""), "",
-                             data.get("issues", ""), now, now))
+                             date, str(data.get("notes", "")), str(data.get("results", "")), "",
+                             str(data.get("issues", "")), now, now))
                         conn.commit()
                         created.append({"id": cur.lastrowid, "group": group, "title": data.get("title", "")})
             except Exception as e:
