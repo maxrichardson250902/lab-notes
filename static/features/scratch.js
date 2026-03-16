@@ -1,20 +1,94 @@
 // ── SCRATCH PAD ───────────────────────────────────────────────────────────────
 
 var _scratchProtoRun = null;
-var _RUNS_KEY = 'lab_proto_runs';
+var _RUNS_KEY = 'lab_proto_runs'; // localStorage cache key
+var _dbSaveTimer = null;          // debounce timer for DB writes
 
-function _getAllRuns() { try { return JSON.parse(localStorage.getItem(_RUNS_KEY) || '[]'); } catch(e) { return []; } }
-function _saveRun(run) {
+// ── run persistence: localStorage (fast) + DB (cross-machine) ────────────────
+
+function _getAllRunsLocal() {
+  try { return JSON.parse(localStorage.getItem(_RUNS_KEY) || '[]'); } catch(e) { return []; }
+}
+
+function _saveLocalOnly(run) {
   if (!run || !run.runId) return;
-  var runs = _getAllRuns();
+  var runs = _getAllRunsLocal();
   var idx = -1; runs.forEach(function(r, i) { if (r.runId === run.runId) idx = i; });
   if (idx >= 0) runs[idx] = run; else runs.push(run);
   try { localStorage.setItem(_RUNS_KEY, JSON.stringify(runs)); } catch(e) {}
 }
-function _removeRun(runId) {
-  try { localStorage.setItem(_RUNS_KEY, JSON.stringify(_getAllRuns().filter(function(r) { return r.runId !== runId; }))); } catch(e) {}
+
+function _removeLocal(runId) {
+  try { localStorage.setItem(_RUNS_KEY, JSON.stringify(_getAllRunsLocal().filter(function(r) { return r.runId !== runId; }))); } catch(e) {}
 }
-function _getRunById(runId) { return _getAllRuns().find(function(r) { return r.runId === runId; }) || null; }
+
+function _getRunByIdLocal(runId) {
+  return _getAllRunsLocal().find(function(r) { return r.runId === runId; }) || null;
+}
+
+// save to localStorage immediately + debounced DB write 800ms later
+function _saveRun(run) {
+  if (!run || !run.runId) return;
+  _saveLocalOnly(run);
+  if (_dbSaveTimer) clearTimeout(_dbSaveTimer);
+  _dbSaveTimer = setTimeout(function() { _saveRunToDb(run); }, 800);
+}
+
+async function _saveRunToDb(run) {
+  try {
+    await api('PUT', '/api/active-runs/' + encodeURIComponent(run.runId), {
+      steps_json:   JSON.stringify(run.steps),
+      recipe_json:  JSON.stringify(run.recipe),
+      scaling:      run.scaling || false,
+      scale_factor: run.scaleFactor || 1.0
+    });
+  } catch(e) {
+    // record may not exist yet - create it
+    try {
+      await api('POST', '/api/active-runs', {
+        run_id:        run.runId,
+        protocol_id:   run.protocol.id,
+        protocol_json: JSON.stringify(run.protocol),
+        steps_json:    JSON.stringify(run.steps),
+        recipe_json:   JSON.stringify(run.recipe),
+        group_name:    run.group_name || '',
+        subgroup:      run.subgroup || '',
+        scaling:       run.scaling || false,
+        scale_factor:  run.scaleFactor || 1.0,
+        started_at:    run.startedAt
+      });
+    } catch(e2) {}
+  }
+}
+
+async function _removeRun(runId) {
+  _removeLocal(runId);
+  try { await api('DELETE', '/api/active-runs/' + encodeURIComponent(runId)); } catch(e) {}
+}
+
+// fetch from DB (source of truth), fall back to localStorage
+async function _getAllRuns() {
+  try {
+    var data = await api('GET', '/api/active-runs');
+    var dbRuns = (data.runs || []).map(function(r) {
+      return {
+        runId:       r.run_id,
+        protocol:    JSON.parse(r.protocol_json),
+        steps:       JSON.parse(r.steps_json || '[]'),
+        recipe:      JSON.parse(r.recipe_json || 'null') || _parseRecipeRun(null),
+        scaling:     !!r.scaling,
+        scaleFactor: r.scale_factor || 1.0,
+        group_name:  r.group_name || 'Protocols',
+        subgroup:    r.subgroup || '',
+        startedAt:   r.started_at
+      };
+    });
+    try { localStorage.setItem(_RUNS_KEY, JSON.stringify(dbRuns)); } catch(e) {}
+    return dbRuns;
+  } catch(e) {
+    return _getAllRunsLocal();
+  }
+}
 
 (function injectScratchProtoStyles() {
   if (document.getElementById('scratch-proto-styles')) return;
@@ -77,8 +151,21 @@ var _DEFAULT_RECIPE = { columns: ['Component', 'Stock conc.', 'Volume (uL)', 'Fi
 
 function _parseRecipeRun(raw) {
   if (!raw) return JSON.parse(JSON.stringify(_DEFAULT_RECIPE));
-  try { var r = JSON.parse(raw); if (r && Array.isArray(r.columns) && Array.isArray(r.rows)) return r; } catch(e) {}
+  try {
+    var r = JSON.parse(raw);
+    if (Array.isArray(r) && r.length && r[0].columns) return r[0];
+    if (r && Array.isArray(r.columns) && Array.isArray(r.rows)) return r;
+  } catch(e) {}
   return JSON.parse(JSON.stringify(_DEFAULT_RECIPE));
+}
+
+function _parseAllRecipesRun(raw) {
+  if (!raw) return null;
+  try {
+    var r = JSON.parse(raw);
+    if (Array.isArray(r) && r.length && r[0].columns) return r;
+  } catch(e) {}
+  return null;
 }
 
 function _volColIndex(columns) {
@@ -86,38 +173,51 @@ function _volColIndex(columns) {
   return -1;
 }
 
+function _renderSingleTable(recipe, scaling, factor) {
+  var volCol = _volColIndex(recipe.columns);
+  if (!recipe.rows.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components defined.</div>';
+  var html = '<div class="sp-recipe-wrap"><table class="sp-recipe-table"><thead><tr>';
+  recipe.columns.forEach(function(c) { html += '<th>' + esc(c) + '</th>'; });
+  html += '</tr></thead><tbody>';
+  recipe.rows.forEach(function(row, ri) {
+    html += '<tr>';
+    recipe.columns.forEach(function(_, ci) {
+      var rawVal = row[ci] || '', isVol = (ci === volCol), displayVal = rawVal;
+      if (isVol && scaling && factor && rawVal) { var num = parseFloat(rawVal); if (!isNaN(num)) displayVal = (num * factor).toFixed(2).replace(/\.00$/, ''); }
+      var cc = isVol ? ' class="vol-cell"' : '';
+      if (isVol && scaling) {
+        html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" readonly/></td>';
+      } else {
+        html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" oninput="spRecipeCell(' + ri + ',' + ci + ',this.value)"/></td>';
+      }
+    });
+    html += '</tr>';
+  });
+  return html + '</tbody></table></div>';
+}
+
 function _renderRunRecipe() {
   var rs = _scratchProtoRun; if (!rs) return '';
-  var recipe = rs.recipe, scaling = rs.scaling, factor = rs.scaleFactor || 1, volCol = _volColIndex(recipe.columns);
+  var scaling = rs.scaling, factor = rs.scaleFactor || 1;
+  var tables = _parseAllRecipesRun(rs.protocol.recipe);
   var html = '<div class="sp-recipe-section"><div class="sp-recipe-head"><span class="sp-recipe-label">Reaction Recipe</span>';
   html += '<div class="sp-scale-row"><input type="checkbox" id="sp-scale-toggle"' + (scaling ? ' checked' : '') +
     ' onchange="spToggleScale(this.checked)"/> <label for="sp-scale-toggle" style="cursor:pointer">Scale</label>';
   if (scaling) html += '&nbsp;&times;&nbsp;<input type="number" id="sp-scale-factor" value="' + factor + '" min="0.01" step="0.1" style="width:65px" oninput="spUpdateScale(this.value)"/>';
   html += '</div></div>';
-  if (!recipe.rows.length) {
-    html += '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components defined.</div>';
-  } else {
-    html += '<div class="sp-recipe-wrap"><table class="sp-recipe-table"><thead><tr>';
-    recipe.columns.forEach(function(c) { html += '<th>' + esc(c) + '</th>'; });
-    html += '</tr></thead><tbody>';
-    recipe.rows.forEach(function(row, ri) {
-      html += '<tr>';
-      recipe.columns.forEach(function(_, ci) {
-        var rawVal = row[ci] || '', isVol = (ci === volCol), displayVal = rawVal;
-        if (isVol && scaling && factor && rawVal) { var num = parseFloat(rawVal); if (!isNaN(num)) displayVal = (num * factor).toFixed(2).replace(/\.00$/, ''); }
-        var cc = isVol ? ' class="vol-cell"' : '';
-        if (isVol && scaling) {
-          html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" readonly/></td>';
-        } else {
-          html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" oninput="spRecipeCell(' + ri + ',' + ci + ',this.value)"/></td>';
-        }
-      });
-      html += '</tr>';
+  if (tables && tables.length > 1) {
+    tables.forEach(function(t, ti) {
+      html += '<div style="margin-bottom:12px">';
+      if (t.name) html += '<div style="font-size:11px;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">' + esc(t.name) + '</div>';
+      html += _renderSingleTable(ti === 0 ? rs.recipe : t, scaling, factor);
+      html += '</div>';
     });
-    html += '</tbody></table></div>';
+    html += '<div class="sp-recipe-add"><button class="btn" onclick="spAddRecipeRow()">+ Row (table 1)</button><button class="btn" onclick="spAddRecipeCol()">+ Column</button></div>';
+  } else {
+    html += _renderSingleTable(rs.recipe, scaling, factor);
+    html += '<div class="sp-recipe-add"><button class="btn" onclick="spAddRecipeRow()">+ Row</button><button class="btn" onclick="spAddRecipeCol()">+ Column</button></div>';
   }
-  html += '<div class="sp-recipe-add"><button class="btn" onclick="spAddRecipeRow()">+ Row</button><button class="btn" onclick="spAddRecipeCol()">+ Column</button></div></div>';
-  return html;
+  return html + '</div>';
 }
 
 function spToggleScale(c) { if (!_scratchProtoRun) return; _scratchProtoRun.scaling = c; if (c && !_scratchProtoRun.scaleFactor) _scratchProtoRun.scaleFactor = 1; _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
@@ -195,14 +295,15 @@ function spLaunchRun() {
   var sel = document.getElementById('sp-pk-sel');
   if (!sel || !sel.value) { toast('Select a protocol first', true); return; }
   var p = (S.protocols || []).find(function(x) { return x.id === parseInt(sel.value); });
-  if (p) spLaunchRunDirect(p, null);
+  if (p) spLaunchRunDirect(p, null, null);
 }
 
 // ── shared launch ─────────────────────────────────────────────────────────────
-function spLaunchRunDirect(p, group) {
+function spLaunchRunDirect(p, group, subgroup) {
   var steps = [];
   try { var parsed = JSON.parse(p.steps || '[]'); if (Array.isArray(parsed) && parsed.length && typeof parsed[0].text !== 'undefined') steps = parsed; } catch(e) {}
   if (!steps.length) { toast('No structured steps yet', true); return; }
+
   _scratchProtoRun = {
     runId:       p.id + '_' + Date.now(),
     protocol:    p,
@@ -211,9 +312,26 @@ function spLaunchRunDirect(p, group) {
     scaling:     false,
     scaleFactor: 1,
     group_name:  group || 'Protocols',
+    subgroup:    subgroup || '',
     startedAt:   new Date().toISOString()
   };
-  _saveRun(_scratchProtoRun);
+
+  // create in DB immediately (non-blocking)
+  api('POST', '/api/active-runs', {
+    run_id:        _scratchProtoRun.runId,
+    protocol_id:   p.id,
+    protocol_json: JSON.stringify(p),
+    steps_json:    JSON.stringify(_scratchProtoRun.steps),
+    recipe_json:   JSON.stringify(_scratchProtoRun.recipe),
+    group_name:    _scratchProtoRun.group_name,
+    subgroup:      _scratchProtoRun.subgroup,
+    scaling:       false,
+    scale_factor:  1.0,
+    started_at:    _scratchProtoRun.startedAt
+  }).catch(function() {});
+
+  _saveLocalOnly(_scratchProtoRun);
+
   if (S.view === 'scratch') {
     var el = document.getElementById('content');
     if (el) { _renderProtoRunInScratch(el); return; }
@@ -221,15 +339,37 @@ function spLaunchRunDirect(p, group) {
   if (typeof setView === 'function') setView('scratch');
 }
 
-function spResumeRunById(runId) {
-  var run = _getRunById(runId); if (!run) { toast('Run not found', true); return; }
-  _scratchProtoRun = run;
-  if (typeof setView === 'function') setView('scratch');
+// resume by runId — fetches from DB so works across machines
+async function spResumeRunById(runId) {
+  try {
+    var data = await api('GET', '/api/active-runs');
+    var dbRun = (data.runs || []).find(function(r) { return r.run_id === runId; });
+    if (dbRun) {
+      _scratchProtoRun = {
+        runId:       dbRun.run_id,
+        protocol:    JSON.parse(dbRun.protocol_json),
+        steps:       JSON.parse(dbRun.steps_json || '[]'),
+        recipe:      JSON.parse(dbRun.recipe_json || 'null') || _parseRecipeRun(null),
+        scaling:     !!dbRun.scaling,
+        scaleFactor: dbRun.scale_factor || 1.0,
+        group_name:  dbRun.group_name || 'Protocols',
+        subgroup:    dbRun.subgroup || '',
+        startedAt:   dbRun.started_at
+      };
+      _saveLocalOnly(_scratchProtoRun);
+      if (typeof setView === 'function') setView('scratch');
+      return;
+    }
+  } catch(e) {}
+  // fallback to localStorage
+  var local = _getRunByIdLocal(runId);
+  if (local) { _scratchProtoRun = local; if (typeof setView === 'function') setView('scratch'); return; }
+  toast('Run not found', true);
 }
 
-function spDiscardRunById(runId) {
+async function spDiscardRunById(runId) {
   if (!confirm('Discard this run? Progress will be lost.')) return;
-  _removeRun(runId);
+  await _removeRun(runId);
   if (_scratchProtoRun && _scratchProtoRun.runId === runId) _scratchProtoRun = null;
   loadView();
 }
@@ -248,13 +388,14 @@ function _renderProtoRunInScratch(el) {
       '<div class="sp-dev-note' + (hasDev ? ' open' : '') + '" id="spd-' + step.id + '"><textarea placeholder="What did you change?" oninput="spUpdateDev(' + step.id + ',this.value)">' + esc(step.deviation) + '</textarea></div>' +
     '</div>';
   }).join('');
+  var groupLabel = rs.group_name + (rs.subgroup ? ' / ' + rs.subgroup : '');
   el.innerHTML =
     '<div style="padding:0 0 24px">' +
       '<div class="sp-run-header">' +
         '<div>' +
           '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) + '</div>' +
           '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;&#183;&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '</div>' +
-          '<span class="sp-run-group-badge">&#128193; ' + esc(rs.group_name) + '</span>' +
+          '<span class="sp-run-group-badge">&#128193; ' + esc(groupLabel) + '</span>' +
         '</div>' +
         '<div style="display:flex;gap:6px">' +
           '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
@@ -278,7 +419,7 @@ function spSaveAndExit() {
   if (_scratchProtoRun) _saveRun(_scratchProtoRun);
   _scratchProtoRun = null;
   if (typeof setView === 'function') setView('protocols'); else loadView();
-  toast('Run saved \u2014 resume from the Protocols page');
+  toast('Run saved \u2014 resume from any machine via the Protocols page');
 }
 
 function spAbandonRun() {
@@ -333,19 +474,29 @@ function spShowSummary() {
   wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
-// ── save to entry + record run ─────────────────────────────────────────────────
+// ── save to entry + record completed run ──────────────────────────────────────
 async function spSaveRunToEntry(runId) {
-  var rs = runId ? _getRunById(runId) : _scratchProtoRun;
+  var rs = null;
+  if (runId) {
+    // fetch from DB first
+    try {
+      var data = await api('GET', '/api/active-runs');
+      var dbRun = (data.runs || []).find(function(r) { return r.run_id === runId; });
+      if (dbRun) rs = { runId: dbRun.run_id, protocol: JSON.parse(dbRun.protocol_json), steps: JSON.parse(dbRun.steps_json || '[]'), recipe: JSON.parse(dbRun.recipe_json || 'null') || _parseRecipeRun(null), scaling: !!dbRun.scaling, scaleFactor: dbRun.scale_factor || 1.0, group_name: dbRun.group_name || 'Protocols', subgroup: dbRun.subgroup || '', startedAt: dbRun.started_at };
+    } catch(e) {}
+    if (!rs) rs = _getRunByIdLocal(runId);
+  } else {
+    rs = _scratchProtoRun;
+  }
   if (!rs) { toast('Run not found', true); return; }
+
   var done  = rs.steps.filter(function(s) { return s.done; }).length;
   var devs  = rs.steps.filter(function(s) { return s.deviation.trim(); });
   var inc   = rs.steps.filter(function(s) { return !s.done; });
   var today = new Date().toISOString().split('T')[0];
   var volCol = _volColIndex(rs.recipe.columns);
 
-  var lines = ['## Protocol Run: ' + rs.protocol.title, '',
-    '**Date:** ' + new Date(rs.startedAt).toLocaleString(),
-    '**Progress:** ' + done + ' / ' + rs.steps.length + ' steps completed', ''];
+  var lines = ['## Protocol Run: ' + rs.protocol.title, '', '**Date:** ' + new Date(rs.startedAt).toLocaleString(), '**Progress:** ' + done + ' / ' + rs.steps.length + ' steps completed', ''];
 
   if (rs.recipe.rows.length) {
     lines.push('### Reaction Recipe');
@@ -372,34 +523,27 @@ async function spSaveRunToEntry(runId) {
   if (inc.length) { lines.push('', '### Not completed'); inc.forEach(function(s) { lines.push('- ' + s.text); }); }
 
   try {
-    // 1. save notebook entry
     var entry = await api('POST', '/api/entries', {
-      title:      'Protocol Run: ' + rs.protocol.title,
-      date:       today,
-      group_name: rs.group_name,
-      subgroup:   '',
-      notes:      lines.join('\n'),
-      summary:    ''
+      title: 'Protocol Run: ' + rs.protocol.title,
+      date: today, group_name: rs.group_name, subgroup: rs.subgroup || '',
+      notes: lines.join('\n'), summary: ''
     });
-
-    // 2. record in protocol_runs for history
     await api('POST', '/api/protocol-runs', {
-      protocol_id: rs.protocol.id,
-      date:        today,
-      group_name:  rs.group_name,
-      steps_json:  JSON.stringify(rs.steps),
-      recipe_json: JSON.stringify(rs.recipe),
-      entry_id:    entry.id || null
+      protocol_id: rs.protocol.id, date: today, group_name: rs.group_name,
+      steps_json: JSON.stringify(rs.steps), recipe_json: JSON.stringify(rs.recipe),
+      entry_id: entry.id || null
     });
-
     toast('Saved to ' + rs.group_name + ' \u2713');
-    _removeRun(rs.runId);
+    await _removeRun(rs.runId);
     if (_scratchProtoRun && _scratchProtoRun.runId === rs.runId) _scratchProtoRun = null;
     if (typeof setView === 'function') setView('protocols'); else loadView();
   } catch(e) { toast('Save failed: ' + e.message, true); }
 }
 
 function spSaveToEntry() { spSaveRunToEntry(null); }
+
+// expose for protocols.js active runs section
+async function spGetActiveRuns() { return await _getAllRuns(); }
 
 // ── original scratch functions ────────────────────────────────────────────────
 async function addScratchQuick() {

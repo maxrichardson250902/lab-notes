@@ -54,6 +54,12 @@
     '.active-run-meta{font-size:12px;color:#8a7f72;margin-top:2px}',
     '.active-run-bar{height:4px;background:#e8e2d8;border-radius:2px;margin-top:6px}',
     '.active-run-fill{height:100%;background:#5b7a5e;border-radius:2px}',
+    '.proto-link-badge{display:inline-flex;align-items:center;gap:4px;background:#e8f0e8;color:#5b7a5e;border:1px solid #c8d8c8;border-radius:3px;padding:1px 7px;font-size:11px;cursor:pointer;font-weight:600;vertical-align:middle;margin:0 2px}',
+    '.proto-link-badge:hover{background:#d0e4d0}',
+    '.proto-edit-step{display:flex;gap:6px;align-items:center;margin-bottom:6px}',
+    '.proto-edit-step input{flex:1;font-size:13px}',
+    '.proto-edit-step .link-btn{font-size:11px;color:#5b7a5e;background:none;border:1px solid #c8d8c8;border-radius:3px;padding:2px 7px;cursor:pointer;white-space:nowrap}',
+    '.proto-edit-step .link-btn:hover{background:#e8f0e8}',
     /* run history inside card */
     '.run-history-section{margin-top:18px;border-top:1px solid #e8e2d8;padding-top:14px}',
     '.run-history-head{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:8px}',
@@ -169,6 +175,45 @@ function _recipeEditHTML(pid, recipe) {
 // ── active runs helpers ───────────────────────────────────────────────────────
 function _getActiveRuns() { try { return JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(e) { return []; } }
 
+function _getActiveRuns() {
+  // kept for sync fallback only - protocols.js uses _activeRunsHTMLAsync
+  try { return JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(e) { return []; }
+}
+
+async function _loadAndRenderActiveRuns() {
+  var container = document.getElementById('active-runs-container');
+  if (!container) return;
+  try {
+    var runs = typeof spGetActiveRuns === 'function' ? await spGetActiveRuns() : _getActiveRuns();
+    container.innerHTML = runs.length ? _buildActiveRunsHTML(runs) : '';
+  } catch(e) {
+    container.innerHTML = '';
+  }
+}
+
+function _buildActiveRunsHTML(runs) {
+  if (!runs.length) return '';
+  var html = '<div style="margin-bottom:20px"><div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Active Runs</div>';
+  runs.forEach(function(run) {
+    var done = run.steps.filter(function(s) { return s.done; }).length;
+    var pct  = Math.round((done / run.steps.length) * 100);
+    var devs = run.steps.filter(function(s) { return s.deviation && s.deviation.trim(); }).length;
+    html += '<div class="active-run-card">' +
+      '<div class="active-run-info">' +
+        '<div class="active-run-title">&#9654; ' + esc(run.protocol.title) + '</div>' +
+        '<div class="active-run-meta">' + done + '/' + run.steps.length + ' steps' + (devs ? ' &nbsp;&#183;&nbsp; ' + devs + ' deviation' + (devs > 1 ? 's' : '') : '') + ' &nbsp;&#183;&nbsp; &#128193; ' + esc(run.group_name) + (run.subgroup ? ' / ' + esc(run.subgroup) : '') + '</div>' +
+        '<div class="active-run-bar"><div class="active-run-fill" style="width:' + pct + '%"></div></div>' +
+      '</div>' +
+      '<div style="display:flex;gap:6px;flex-shrink:0">' +
+        '<button class="btn primary" style="font-size:12px" data-runid="' + esc(run.runId) + '" onclick="spResumeRunById(this.dataset.runid)">&#9654; Resume</button>' +
+        '<button class="btn" style="font-size:12px" data-runid="' + esc(run.runId) + '" onclick="spSaveRunToEntry(this.dataset.runid)">Save to Entry</button>' +
+        '<button class="btn" style="font-size:12px;color:#c0392b" data-runid="' + esc(run.runId) + '" onclick="spDiscardRunById(this.dataset.runid)">Discard</button>' +
+      '</div>' +
+    '</div>';
+  });
+  return html + '</div>';
+}
+
 function _activeRunsHTML() {
   var runs = _getActiveRuns(); if (!runs.length) return '';
   var html = '<div style="margin-bottom:20px"><div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Active Runs</div>';
@@ -263,7 +308,7 @@ async function renderProtocols(el) {
   var data = await api('GET', '/api/protocols');
   S.protocols = data.protocols || [];
 
-  var html = _activeRunsHTML();
+  var html = '<div id="active-runs-container"><div style="font-size:12px;color:#8a7f72;margin-bottom:12px">Loading active runs...</div></div>';
   html += '<div class="proto-import-box">' + _buildImportUI() + '</div>';
   if (!S.protocols.length) {
     html += '<div class="empty"><big>&#128196;</big>No protocols yet.</div>';
@@ -272,6 +317,7 @@ async function renderProtocols(el) {
     html += '<div id="proto-list">' + S.protocols.map(_protoCard).join('') + '</div>';
   }
   el.innerHTML = html;
+  _loadAndRenderActiveRuns();
 }
 
 function _buildImportUI() {
@@ -299,7 +345,10 @@ function _buildImportUI() {
     '<div id="pt-manual" style="display:none"><div class="proto-import-col">' +
       '<input type="text" id="proto-title-manual" placeholder="Protocol name" spellcheck="false"/>' +
       '<div id="manual-steps-list"></div>' +
-      '<div><button class="btn" onclick="manualAddStep()">+ Step</button></div>' +
+      '<div style="display:flex;gap:6px">' +
+        '<button class="btn" onclick="manualAddStep()">+ Step</button>' +
+        '<button class="btn" style="color:#5b7a5e" onclick="manualLinkProtocol()">&#8599; Link protocol</button>' +
+      '</div>' +
       '<div class="manual-recipe-section">' +
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
           '<div class="manual-recipe-label">Reaction Tables <span style="font-weight:400;text-transform:none;font-size:11px">(optional)</span></div>' +
@@ -338,7 +387,7 @@ function _protoCard(p) {
   if (!p.steps || p.steps === '[]') {
     stepsHtml = '<div style="color:#8a7f72;font-size:13px;font-style:italic">No steps yet — click Extract steps to pull from source.</div>';
   } else if (isStructured) {
-    stepsHtml = '<ol class="steps-list">' + steps.map(function(s) { return '<li>' + esc(s.text) + '</li>'; }).join('') + '</ol>';
+    stepsHtml = '<ol class="steps-list">' + steps.map(function(s) { return '<li>' + _renderStepText(s.text) + '</li>'; }).join('') + '</ol>';
   } else {
     stepsHtml = '<div class="steps-text">' + esc(p.steps) + '</div>';
   }
@@ -356,6 +405,7 @@ function _protoCard(p) {
       '</div>' +
       '<div class="proto-card-actions">' +
         '<button class="btn" style="color:#5b7a5e" onclick="event.stopPropagation();protoOpenRun(' + p.id + ')">&#9654; Run</button>' +
+        '<button class="btn" onclick="event.stopPropagation();protoEdit(' + p.id + ')">&#9998; Edit</button>' +
         (p.source_type !== 'manual' ? '<button class="btn" style="color:#5b7a5e" onclick="event.stopPropagation();protoReExtract(' + p.id + ')">&#10227; Extract steps</button>' : '') +
         (p.url ? '<a class="btn" href="' + esc(p.url) + '" target="_blank" onclick="event.stopPropagation()">&#8599;</a>' : '') +
         '<button class="btn" style="color:#c0392b" onclick="event.stopPropagation();protoDelete(' + p.id + ')">&#128465; Delete</button>' +
@@ -534,8 +584,8 @@ function _manualStepRowHTML(idx, value) {
   return '<div class="manual-step-row" id="msr-' + idx + '">' +
     '<span class="manual-step-num">' + (idx + 1) + '.</span>' +
     '<input type="text" value="' + esc(value || '') + '" placeholder="Describe this step..." spellcheck="false" ' +
-      'oninput="manualStepUpdate(' + idx + ',this.value)" ' +
-      'onkeydown="if(event.key==\'Enter\'){event.preventDefault();manualAddStep();}" />' +
+      'data-stepidx="' + idx + '" ' +
+      'oninput="manualStepUpdate(' + idx + ',this.value)"/>' +
     '<button class="manual-del-step" onclick="manualDelStep(' + idx + ')">&#215;</button>' +
   '</div>';
 }
@@ -565,9 +615,19 @@ function _manualRecipeHTML() {
   return html;
 }
 
+function _attachManualStepListeners() {
+  var list = document.getElementById('manual-steps-list'); if (!list) return;
+  list.querySelectorAll('input[data-stepidx]').forEach(function(inp) {
+    inp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); manualAddStep(); }
+    });
+  });
+}
+
 function _refreshManualSteps() {
   var list = document.getElementById('manual-steps-list'); if (!list) return;
   list.innerHTML = _manualSteps.map(function(v, i) { return _manualStepRowHTML(i, v); }).join('');
+  _attachManualStepListeners();
   var last = document.querySelector('#msr-' + (_manualSteps.length - 1) + ' input');
   if (last) last.focus();
 }
@@ -580,7 +640,13 @@ function manualAddStep() {
   var idx = _manualSteps.length - 1;
   var wrap = document.createElement('div'); wrap.innerHTML = _manualStepRowHTML(idx, '');
   list.appendChild(wrap.firstChild);
-  var inp = document.querySelector('#msr-' + idx + ' input'); if (inp) inp.focus();
+  var inp = document.querySelector('#msr-' + idx + ' input');
+  if (inp) {
+    inp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); manualAddStep(); }
+    });
+    inp.focus();
+  }
 }
 function manualDelStep(idx) { if (_manualSteps.length <= 1) { _manualSteps[0] = ''; _refreshManualSteps(); return; } _manualSteps.splice(idx, 1); _refreshManualSteps(); }
 // single-table compat shims now in multi-table section above
@@ -673,6 +739,245 @@ function protoOpenRun(protocolId) {
   if (!steps.length) { toast('No structured steps yet \u2014 extract them first', true); return; }
   if (typeof spLaunchRunDirect === 'function') spLaunchRunDirect(p, null);
   else toast('Open the Scratch pad to run protocols', true);
+}
+
+
+// ── protocol link rendering ───────────────────────────────────────────────────
+function _renderStepText(text) {
+  // render [@Title](proto:ID) as clickable badges, escape everything else
+  var parts = text.split(/(\[@[^\]]+\]\(proto:\d+\))/g);
+  return parts.map(function(part) {
+    var m = part.match(/^\[@([^\]]+)\]\(proto:(\d+)\)$/);
+    if (m) {
+      return '<span class="proto-link-badge" onclick="protoJumpTo(' + m[2] + ')" title="Open ' + esc(m[1]) + '">&#8599; ' + esc(m[1]) + '</span>';
+    }
+    return esc(part);
+  }).join('');
+}
+
+function protoJumpTo(id) {
+  // open the card and scroll to it
+  var card = document.getElementById('pc-' + id);
+  if (!card) return;
+  if (!card.classList.contains('open')) protoToggle(id);
+  setTimeout(function() { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 100);
+}
+
+// ── insert protocol link into manual step ─────────────────────────────────────
+function manualLinkProtocol() {
+  var protos = (S.protocols || []);
+  if (!protos.length) { toast('No protocols to link to yet', true); return; }
+  // find which step input is focused, or use last
+  var focused = document.querySelector('#manual-steps-list input:focus');
+  var targetInput = focused || document.querySelector('#manual-steps-list input:last-of-type');
+  var targetIdx = targetInput ? parseInt((targetInput.closest('[id^=msr-]') || {}).id?.replace('msr-','') || '0') : 0;
+
+  // build a simple picker
+  var opts = protos.map(function(p) { return '<option value="' + p.id + '">' + esc(p.title) + '</option>'; }).join('');
+  var div = document.createElement('div');
+  div.id = 'proto-link-picker';
+  div.style.cssText = 'position:fixed;inset:0;background:rgba(60,52,42,.35);display:flex;align-items:center;justify-content:center;z-index:2000';
+  div.innerHTML = '<div style="background:#faf8f4;border:1px solid #d5cec0;border-radius:8px;padding:20px;min-width:320px;max-width:440px;width:100%">' +
+    '<div style="font-weight:600;font-size:14px;margin-bottom:10px">Link to protocol</div>' +
+    '<input type="text" id="plp-q" placeholder="Search..." spellcheck="false" style="width:100%;margin-bottom:8px" oninput="plpFilter()"/>' +
+    '<select id="plp-sel" size="6" style="width:100%;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-family:inherit;font-size:13px">' + opts + '</select>' +
+    '<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">' +
+      '<button class="btn" onclick="document.getElementById(\x27proto-link-picker\x27).remove()">Cancel</button>' +
+      '<button class="btn primary" onclick="plpInsert(' + targetIdx + ')">Insert link</button>' +
+    '</div></div>';
+  document.body.appendChild(div);
+  document.getElementById('plp-q')?.focus();
+}
+
+function plpFilter() {
+  var q = (document.getElementById('plp-q')?.value || '').toLowerCase();
+  document.querySelectorAll('#plp-sel option').forEach(function(o) { o.style.display = (!q || o.textContent.toLowerCase().includes(q)) ? '' : 'none'; });
+}
+
+function plpInsert(stepIdx) {
+  var sel = document.getElementById('plp-sel');
+  if (!sel || !sel.value) { toast('Select a protocol', true); return; }
+  var p = (S.protocols || []).find(function(x) { return x.id === parseInt(sel.value); });
+  if (!p) return;
+  document.getElementById('proto-link-picker')?.remove();
+  var link = '[@' + p.title + '](proto:' + p.id + ')';
+  // append link to the target step
+  var inp = document.querySelector('#msr-' + stepIdx + ' input');
+  if (inp) {
+    var cur = inp.value;
+    inp.value = cur ? cur + ' ' + link : link;
+    manualStepUpdate(stepIdx, inp.value);
+  } else {
+    // add as new step
+    _manualSteps.push(link);
+    _refreshManualSteps();
+  }
+}
+
+// ── inline edit mode ──────────────────────────────────────────────────────────
+var _editState = {}; // pid -> {title, steps}
+
+function protoEdit(pid) {
+  var p = (S.protocols || []).find(function(x) { return x.id === pid; });
+  if (!p) return;
+  var card = document.getElementById('pc-' + pid);
+  if (!card) return;
+  if (!card.classList.contains('open')) protoToggle(pid);
+
+  var steps = [];
+  try {
+    var parsed = JSON.parse(p.steps || '[]');
+    if (Array.isArray(parsed) && parsed.length && typeof parsed[0].text !== 'undefined') steps = parsed;
+  } catch(e) {}
+
+  _editState[pid] = { title: p.title, steps: steps.map(function(s) { return s.text; }) };
+
+  var body = document.getElementById('pb-' + pid); if (!body) return;
+
+  // replace title
+  var titleEl = card.querySelector('.protocol-title');
+  if (titleEl) titleEl.outerHTML = '<input id="pe-title-' + pid + '" type="text" value="' + esc(p.title) + '" ' +
+    'style="font-weight:600;font-size:14px;color:#4a4139;border:none;border-bottom:1px solid #5b7a5e;background:transparent;outline:none;width:100%;margin-bottom:4px" ' +
+    'oninput="_editState[' + pid + '].title=this.value"/>';
+
+  // replace steps
+  var stepsContainer = body.querySelector('ol.steps-list, div.steps-text');
+  if (!stepsContainer && !steps.length) {
+    // no steps area, insert before recipe section
+    var recipeSection = body.querySelector('.recipe-section');
+    var placeholder = document.createElement('div');
+    placeholder.id = 'pe-steps-' + pid;
+    body.insertBefore(placeholder, recipeSection);
+  }
+
+  var stepsTarget = stepsContainer || document.getElementById('pe-steps-' + pid);
+  if (stepsTarget) {
+    var stepsHtml = '<div id="pe-steps-' + pid + '">';
+    (_editState[pid].steps.length ? _editState[pid].steps : ['']).forEach(function(text, i) {
+      stepsHtml += '<div class="proto-edit-step" id="pes-' + pid + '-' + i + '">' +
+        '<span style="font-size:12px;color:#8a7f72;min-width:20px;text-align:right">' + (i+1) + '.</span>' +
+        '<input type="text" value="' + esc(text) + '" spellcheck="false" ' +
+          'oninput="_editState[' + pid + '].steps[' + i + ']=this.value" ' +
+          'data-editpid="' + pid + '" data-editidx="' + i + '"/>' +
+        '<button class="link-btn" onclick="protoEditLinkStep(' + pid + ',' + i + ')">&#8599; Link</button>' +
+        '<button style="background:none;border:none;cursor:pointer;color:#c0b8b0;font-size:16px;padding:0 4px" onclick="protoEditDelStep(' + pid + ',' + i + ')">&#215;</button>' +
+      '</div>';
+    });
+    stepsHtml += '<div style="margin-top:6px;display:flex;gap:6px">' +
+      '<button class="btn" onclick="protoEditAddStep(' + pid + ',-1)">+ Step</button>' +
+      '<button class="btn" style="color:#5b7a5e" onclick="protoEditLinkStep(' + pid + ',-1)">&#8599; Link protocol</button>' +
+    '</div></div>';
+    stepsTarget.outerHTML = stepsHtml;
+    _attachEditStepListeners(pid);
+  }
+
+  // swap card action buttons
+  var actions = card.querySelector('.proto-card-actions');
+  if (actions) actions.innerHTML =
+    '<button class="btn primary" onclick="event.stopPropagation();protoSaveEdit(' + pid + ')">&#10003; Save</button>' +
+    '<button class="btn" onclick="event.stopPropagation();protoCancelEdit(' + pid + ')">Cancel</button>';
+}
+
+function protoEditAddStep(pid, afterIdx) {
+  var es = _editState[pid]; if (!es) return;
+  if (afterIdx < 0) es.steps.push('');
+  else es.steps.splice(afterIdx + 1, 0, '');
+  _refreshEditSteps(pid);
+  setTimeout(function() {
+    var idx = afterIdx < 0 ? es.steps.length - 1 : afterIdx + 1;
+    document.querySelector('#pes-' + pid + '-' + idx + ' input')?.focus();
+  }, 50);
+}
+
+function protoEditDelStep(pid, idx) {
+  var es = _editState[pid]; if (!es) return;
+  if (es.steps.length <= 1) { es.steps[0] = ''; _refreshEditSteps(pid); return; }
+  es.steps.splice(idx, 1);
+  _refreshEditSteps(pid);
+}
+
+function protoEditLinkStep(pid, afterIdx) {
+  var protos = (S.protocols || []).filter(function(x) { return x.id !== pid; });
+  if (!protos.length) { toast('No other protocols to link to', true); return; }
+  var opts = protos.map(function(p) { return '<option value="' + p.id + '">' + esc(p.title) + '</option>'; }).join('');
+  var div = document.createElement('div');
+  div.id = 'proto-link-picker';
+  div.style.cssText = 'position:fixed;inset:0;background:rgba(60,52,42,.35);display:flex;align-items:center;justify-content:center;z-index:2000';
+  div.innerHTML = '<div style="background:#faf8f4;border:1px solid #d5cec0;border-radius:8px;padding:20px;min-width:320px;max-width:440px;width:100%">' +
+    '<div style="font-weight:600;font-size:14px;margin-bottom:10px">Link to protocol</div>' +
+    '<input type="text" id="plp-q" placeholder="Search..." spellcheck="false" style="width:100%;margin-bottom:8px" oninput="plpFilter()"/>' +
+    '<select id="plp-sel" size="6" style="width:100%;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-family:inherit;font-size:13px">' + opts + '</select>' +
+    '<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">' +
+      '<button class="btn" onclick="document.getElementById(\x27proto-link-picker\x27).remove()">Cancel</button>' +
+      '<button class="btn primary" onclick="plpEditInsert(' + pid + ',' + afterIdx + ')">Insert link</button>' +
+    '</div></div>';
+  document.body.appendChild(div);
+  document.getElementById('plp-q')?.focus();
+}
+
+function plpEditInsert(pid, afterIdx) {
+  var sel = document.getElementById('plp-sel');
+  if (!sel || !sel.value) { toast('Select a protocol', true); return; }
+  var p = (S.protocols || []).find(function(x) { return x.id === parseInt(sel.value); });
+  if (!p) return;
+  document.getElementById('proto-link-picker')?.remove();
+  var link = '[@' + p.title + '](proto:' + p.id + ')';
+  var es = _editState[pid]; if (!es) return;
+  if (afterIdx < 0) es.steps.push(link);
+  else es.steps.splice(afterIdx + 1, 0, link);
+  _refreshEditSteps(pid);
+}
+
+function _attachEditStepListeners(pid) {
+  var container = document.getElementById('pe-steps-' + pid); if (!container) return;
+  container.querySelectorAll('input[data-editpid]').forEach(function(inp) {
+    inp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); protoEditAddStep(parseInt(inp.dataset.editpid), parseInt(inp.dataset.editidx)); }
+    });
+  });
+}
+
+function _refreshEditSteps(pid) {
+  var es = _editState[pid]; if (!es) return;
+  var container = document.getElementById('pe-steps-' + pid); if (!container) return;
+  var stepsHtml = '';
+  (es.steps.length ? es.steps : ['']).forEach(function(text, i) {
+    stepsHtml += '<div class="proto-edit-step" id="pes-' + pid + '-' + i + '">' +
+      '<span style="font-size:12px;color:#8a7f72;min-width:20px;text-align:right">' + (i+1) + '.</span>' +
+      '<input type="text" value="' + esc(text) + '" spellcheck="false" ' +
+        'oninput="_editState[' + pid + '].steps[' + i + ']=this.value" ' +
+        'data-editpid="' + pid + '" data-editidx="' + i + '"/>' +
+      '<button class="link-btn" onclick="protoEditLinkStep(' + pid + ',' + i + ')">&#8599; Link</button>' +
+      '<button style="background:none;border:none;cursor:pointer;color:#c0b8b0;font-size:16px;padding:0 4px" onclick="protoEditDelStep(' + pid + ',' + i + ')">&#215;</button>' +
+    '</div>';
+  });
+  stepsHtml += '<div style="margin-top:6px;display:flex;gap:6px">' +
+    '<button class="btn" onclick="protoEditAddStep(' + pid + ',-1)">+ Step</button>' +
+    '<button class="btn" style="color:#5b7a5e" onclick="protoEditLinkStep(' + pid + ',-1)">&#8599; Link protocol</button>' +
+  '</div>';
+  container.innerHTML = stepsHtml;
+  _attachEditStepListeners(pid);
+}
+
+async function protoSaveEdit(pid) {
+  var es = _editState[pid]; if (!es) return;
+  var steps = es.steps.filter(function(s) { return s.trim(); });
+  var stepsJson = JSON.stringify(steps.map(function(s) { return { text: s }; }));
+  var titleInput = document.getElementById('pe-title-' + pid);
+  var title = titleInput ? titleInput.value.trim() : es.title;
+  if (!title) { toast('Title cannot be empty', true); return; }
+  await api('PUT', '/api/protocols/' + pid, { title: title, steps: stepsJson });
+  // update local cache
+  var p = (S.protocols || []).find(function(x) { return x.id === pid; });
+  if (p) { p.title = title; p.steps = stepsJson; }
+  delete _editState[pid];
+  await loadView();
+  toast('Protocol updated');
+}
+
+async function protoCancelEdit(pid) {
+  delete _editState[pid];
+  await loadView();
 }
 
 registerView('protocols', renderProtocols);

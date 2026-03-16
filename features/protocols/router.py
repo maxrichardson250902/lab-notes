@@ -3,7 +3,10 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-import json, re, io
+import json, re, io, asyncio
+
+# Only one LLM extraction at a time to prevent OOM from concurrent SSH+LLM calls
+_llm_semaphore = asyncio.Semaphore(1)
 
 from core.database import register_table, get_db
 from core.llm import llm, fetch_url_text
@@ -21,6 +24,19 @@ register_table("protocols", """CREATE TABLE IF NOT EXISTS protocols (
     tags        TEXT NOT NULL DEFAULT '[]',
     created     TEXT NOT NULL,
     updated     TEXT NOT NULL)""")
+
+register_table("active_runs", """CREATE TABLE IF NOT EXISTS active_runs (
+    run_id       TEXT PRIMARY KEY,
+    protocol_id  INTEGER NOT NULL,
+    protocol_json TEXT NOT NULL,
+    steps_json   TEXT NOT NULL DEFAULT '[]',
+    recipe_json  TEXT DEFAULT NULL,
+    group_name   TEXT NOT NULL DEFAULT '',
+    subgroup     TEXT NOT NULL DEFAULT '',
+    scaling      INTEGER NOT NULL DEFAULT 0,
+    scale_factor REAL NOT NULL DEFAULT 1.0,
+    started_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL)""")
 
 register_table("protocol_runs", """CREATE TABLE IF NOT EXISTS protocol_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,32 +68,48 @@ _migrate()
 #  LLM helpers
 # --------------------------------------------------------------------------- #
 _EXTRACT_SYSTEM = (
-    "You are a lab protocol parser. Extract every step from the provided protocol text. "
-    "Return ONLY a valid JSON array - no markdown fences, no explanation, nothing else. "
-    "Each element must be a JSON object with a single key 'text' containing one step. "
-    "Include reagents, volumes, temperatures, and timings in the step text. "
-    'Example: [{"text":"Add 50 uL Buffer EB to spin column"},{"text":"Incubate 1 min at RT"}]'
+    "You are a lab notebook assistant. Extract the procedural steps from the protocol below. "
+    "Return a JSON array of objects, each with a single key 'text'. "
+    "Rules: "
+    "- Include every action step with volumes, temperatures, times, and speeds. "
+    "- Skip steps that only list ingredients or describe how to make a buffer/solution - those are captured separately. "
+    "- Be concise but complete - preserve all numerical values. "
+    "- Return ONLY the JSON array, no markdown fences, no commentary. "
+    'Example: [{"text":"Add 1 uL template DNA to PCR tube"},{"text":"Thermocycle: 98C 30s, 35x(98C 10s/60C 30s/72C 20s/kb), 72C 2min"}]'
 )
 
-_EXTRACT_RECIPE_SYSTEM = (
-    "You are a lab protocol parser. Extract the reaction setup / reagent table from this protocol. "
-    "Return a JSON object with two keys: 'columns' (array of column name strings) and "
-    "'rows' (array of arrays, one per reagent). "
-    "Use columns: Component, Stock conc., Volume (uL), Final conc. where applicable. "
-    "Include every reagent, buffer, enzyme, and control. "
-    "If no clear recipe table exists, return an object with empty rows array. "
-    "Output the JSON then place /// on its own line to mark the end. "
-    "No other text before the JSON."
+# Pass 1: enumerate all tables in the document
+_ENUMERATE_TABLES_SYSTEM = (
+    "You are a lab notebook assistant. Read this protocol and list every distinct reaction mixture, "
+    "buffer, solution, or reagent setup it describes. "
+    "Return ONLY a JSON array of short descriptive names, one per table. "
+    'Example: ["50x TAE buffer", "PCR master mix", "SDS-PAGE running buffer", "Western transfer buffer"] '
+    "If there are no component lists at all, return []. "
+    "JSON array only, no markdown."
 )
 
-def _clean_source_text(text: str) -> str:
+# Pass 2: extract one specific named table
+_EXTRACT_ONE_TABLE_SYSTEM = (
+    "You are a lab notebook assistant. Extract the complete component list for the table named below from this protocol. "
+    "Return a JSON object with: "
+    "  'columns': array of column header strings (use relevant subset of: Component, Stock conc., Volume (uL), Final conc., Weight, Notes) "
+    "  'rows': array of arrays, one per component, matching the columns order. "
+    "Include every component, reagent, and chemical mentioned for this specific table. "
+    "Then output /// on its own line to signal completion. "
+    "Output the JSON object first, then ///, nothing else."
+)
+
+def _clean_source_text(text: str, truncate: int = 0) -> str:
+    """Strip HTML/entities. Pass truncate>0 to limit length for LLM calls."""
+    if not text:
+        return ""
     text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL)
     text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.DOTALL)
     text = re.sub(r'<[^>]+>', ' ', text)
     text = re.sub(r'&nbsp;', ' ', text)
     text = re.sub(r'&[a-z]+;', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    return text[:4000]
+    return text[:truncate] if truncate else text
 
 def _parse_steps_raw(raw: str) -> str:
     cleaned = re.sub(r"^```[a-z]*\n?", "", raw.strip())
@@ -119,34 +151,97 @@ def _parse_recipe_raw(raw: str):
         pass
     return None
 
+async def _run_3090(system: str, prompt: str, max_tokens: int) -> str:
+    """Run a 3090 LLM call in a thread pool, serialised via semaphore to prevent OOM."""
+    loop = asyncio.get_event_loop()
+    def _call():
+        try:
+            if ensure_pc_online() and start_llm():
+                return call_llm_3090(system, prompt, max_tokens=max_tokens) or ""
+        except Exception:
+            pass
+        return ""
+    async with _llm_semaphore:
+        return await loop.run_in_executor(None, _call)
+
 async def extract_steps(title: str, source_text: str) -> str:
-    clean_text = _clean_source_text(source_text)
+    clean_text = _clean_source_text(source_text, truncate=5000)
     prompt = "Protocol: " + title + "\n\nText:\n" + clean_text
+    raw = await _run_3090(_EXTRACT_SYSTEM, prompt, max_tokens=2000)
+    if raw:
+        result = _parse_steps_raw(raw)
+        if result != "[]":
+            return result
+    async with _llm_semaphore:
+        raw = await llm(prompt, _EXTRACT_SYSTEM, max_tokens=2000)
+    return _parse_steps_raw(raw)
+
+def _llm_call_sync(system: str, prompt: str, max_tokens: int) -> str:
+    """Try 3090 synchronously, return empty string on failure."""
     try:
         if ensure_pc_online() and start_llm():
-            raw = call_llm_3090(_EXTRACT_SYSTEM, prompt, max_tokens=1500)
-            if raw:
-                result = _parse_steps_raw(raw)
-                if result != "[]":
-                    return result
+            return call_llm_3090(system, prompt, max_tokens=max_tokens) or ""
     except Exception:
         pass
-    raw = await llm(prompt, _EXTRACT_SYSTEM, max_tokens=1500)
-    return _parse_steps_raw(raw)
+    return ""
 
 async def extract_recipe(title: str, source_text: str) -> str:
     clean_text = _clean_source_text(source_text)
-    prompt = "Protocol: " + title + "\n\nText:\n" + clean_text
-    raw = None
+    # ── Pass 1: enumerate table names ────────────────────────────────────────
+    enum_prompt = "Protocol: " + title + "\n\nText:\n" + clean_text
+    raw_names = await _run_3090(_ENUMERATE_TABLES_SYSTEM, enum_prompt, max_tokens=400)
+    if not raw_names:
+        raw_names = await llm(enum_prompt, _ENUMERATE_TABLES_SYSTEM, max_tokens=400)
+
+    # parse the table name list
+    table_names = []
     try:
-        if ensure_pc_online() and start_llm():
-            raw = call_llm_3090(_EXTRACT_RECIPE_SYSTEM, prompt, max_tokens=800)
+        cleaned = re.sub(r"^```[a-z]*\n?", "", raw_names.strip())
+        cleaned = re.sub(r"\n?```$", "", cleaned.strip())
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            table_names = [str(n).strip() for n in parsed if str(n).strip()]
     except Exception:
         pass
-    if not raw:
-        raw = await llm(prompt, _EXTRACT_RECIPE_SYSTEM, max_tokens=800)
-    result = _parse_recipe_raw(raw)
-    return result if result else json.dumps(DEFAULT_RECIPE)
+
+    if not table_names:
+        # fallback: single-table extraction
+        single_prompt = "Protocol: " + title + "\n\nText:\n" + clean_text
+        raw = await _run_3090(
+            "Extract the reaction/reagent table as JSON {columns:[...], rows:[[...],...]} then ///.",
+            single_prompt, max_tokens=600)
+        if not raw:
+            raw = await llm(single_prompt,
+                "Extract the reaction/reagent table as JSON {columns:[...], rows:[[...],...]} then ///.",
+                max_tokens=600)
+        result = _parse_recipe_raw(raw)
+        return result if result else json.dumps(DEFAULT_RECIPE)
+
+    # ── Pass 2: extract each table individually ───────────────────────────────
+    tables = []
+    for name in table_names[:10]:  # 8B model can handle up to 10 tables
+        tbl_prompt = (
+            "Table to extract: " + name + "\n\n"
+            "Protocol: " + title + "\n\nText:\n" + clean_text
+        )
+        raw = await _run_3090(_EXTRACT_ONE_TABLE_SYSTEM, tbl_prompt, max_tokens=1200)
+        if not raw:
+            raw = await llm(tbl_prompt, _EXTRACT_ONE_TABLE_SYSTEM, max_tokens=1200)
+        result = _parse_recipe_raw(raw)
+        if result:
+            try:
+                tbl = json.loads(result)
+                if tbl.get("rows"):  # only include tables with actual data
+                    tbl["name"] = name
+                    tables.append(tbl)
+            except Exception:
+                pass
+
+    if not tables:
+        return json.dumps(DEFAULT_RECIPE)
+    if len(tables) == 1:
+        return json.dumps(tables[0])  # single table — store without array wrapper
+    return json.dumps(tables)  # multi-table array
 
 async def _text_from_upload(file: UploadFile) -> str:
     content = await file.read()
@@ -155,7 +250,7 @@ async def _text_from_upload(file: UploadFile) -> str:
         try:
             import pypdf
             reader = pypdf.PdfReader(io.BytesIO(content))
-            return " ".join(page.extract_text() or "" for page in reader.pages)[:6000]
+            return " ".join(page.extract_text() or "" for page in reader.pages)
         except ImportError:
             raise HTTPException(400, "pypdf not installed")
     if fname.endswith(".docx"):
@@ -182,14 +277,14 @@ async def _text_from_upload(file: UploadFile) -> str:
             extracted = "\n".join(lines).strip()
             if not extracted:
                 raise HTTPException(400, "Could not extract text from this .docx")
-            return extracted[:6000]
+            return extracted
         except HTTPException:
             raise
         except ImportError:
             raise HTTPException(400, "python-docx not installed")
         except Exception as e:
             raise HTTPException(400, "Failed to read .docx: " + str(e))
-    return content.decode("utf-8", errors="ignore")[:6000]
+    return content.decode("utf-8", errors="ignore")
 
 DEFAULT_RECIPE = {
     "columns": ["Component", "Stock conc.", "Volume (uL)", "Final conc."],
@@ -224,6 +319,24 @@ class UpdateProtocol(BaseModel):
     tags:   Optional[List[str]] = None
     steps:  Optional[str] = None
     recipe: Optional[str] = None
+
+class ActiveRunCreate(BaseModel):
+    run_id:       str
+    protocol_id:  int
+    protocol_json: str
+    steps_json:   str = '[]'
+    recipe_json:  Optional[str] = None
+    group_name:   str = ''
+    subgroup:     str = ''
+    scaling:      bool = False
+    scale_factor: float = 1.0
+    started_at:   str
+
+class ActiveRunUpdate(BaseModel):
+    steps_json:   Optional[str] = None
+    recipe_json:  Optional[str] = None
+    scaling:      Optional[bool] = None
+    scale_factor: Optional[float] = None
 
 class SaveRun(BaseModel):
     protocol_id: int
@@ -278,6 +391,55 @@ def save_protocol_run(body: SaveRun):
         conn.commit()
         return dict(conn.execute("SELECT * FROM protocol_runs WHERE id=?", (cur.lastrowid,)).fetchone())
 
+@router.get("/active-runs")
+def list_active_runs():
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM active_runs ORDER BY updated_at DESC").fetchall()
+    return {"runs": [dict(r) for r in rows]}
+
+@router.post("/active-runs")
+def create_active_run(body: ActiveRunCreate):
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        conn.execute("""INSERT OR REPLACE INTO active_runs
+            (run_id,protocol_id,protocol_json,steps_json,recipe_json,
+             group_name,subgroup,scaling,scale_factor,started_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (body.run_id, body.protocol_id, body.protocol_json, body.steps_json,
+             body.recipe_json, body.group_name, body.subgroup,
+             1 if body.scaling else 0, body.scale_factor, body.started_at, now))
+        conn.commit()
+    return {"run_id": body.run_id}
+
+@router.put("/active-runs/{run_id}")
+def update_active_run(run_id: str, body: ActiveRunUpdate):
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM active_runs WHERE run_id=?", (run_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Active run not found")
+        r = dict(row)
+        if body.steps_json   is not None: r["steps_json"]   = body.steps_json
+        if body.recipe_json  is not None: r["recipe_json"]  = body.recipe_json
+        if body.scaling      is not None: r["scaling"]      = 1 if body.scaling else 0
+        if body.scale_factor is not None: r["scale_factor"] = body.scale_factor
+        conn.execute("""UPDATE active_runs SET
+            steps_json=?, recipe_json=?, scaling=?, scale_factor=?, updated_at=?
+            WHERE run_id=?""",
+            (r["steps_json"], r["recipe_json"], r["scaling"],
+             r["scale_factor"], now, run_id))
+        conn.commit()
+    return {"run_id": run_id}
+
+@router.delete("/active-runs/{run_id}")
+def delete_active_run(run_id: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM active_runs WHERE run_id=?", (run_id,))
+        conn.commit()
+    return {"deleted": run_id}
+
 @router.post("/protocols")
 async def create_from_url(body: CreateProtocol):
     now = datetime.utcnow().isoformat()
@@ -303,7 +465,7 @@ async def create_from_paste(body: PasteProtocol):
     with get_db() as conn:
         cur = conn.execute(
             "INSERT INTO protocols (title,source_type,url,source_text,steps,recipe,notes,tags,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (body.title, "paste", None, body.text, steps, recipe, body.notes, json.dumps(body.tags), now, now))
+            (body.title, "paste", None, body.text[:50000], steps, recipe, body.notes, json.dumps(body.tags), now, now))
         conn.commit()
         return dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -321,7 +483,7 @@ async def create_from_file(
     with get_db() as conn:
         cur = conn.execute(
             "INSERT INTO protocols (title,source_type,url,source_text,steps,recipe,notes,tags,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (title, "file", None, source_text, steps, recipe, notes, tags, now, now))
+            (title, "file", None, source_text[:50000], steps, recipe, notes, tags, now, now))
         conn.commit()
         return dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -370,11 +532,21 @@ async def re_extract_steps(protocol_id: int):
     if not row:
         raise HTTPException(404, "Not found")
     p = dict(row)
-    if not p["source_text"]:
+    # use source_text if available, otherwise reconstruct from existing steps as plain text
+    source = p.get("source_text") or ""
+    if not source:
+        try:
+            existing = json.loads(p.get("steps") or "[]")
+            if existing:
+                source = " ".join(s.get("text","") for s in existing if s.get("text"))
+        except Exception:
+            pass
+    if not source:
         raise HTTPException(400, "No source text stored - re-import the protocol")
-    steps = await extract_steps(p["title"], p["source_text"])
+    steps  = await extract_steps(p["title"], source)
+    recipe = await extract_recipe(p["title"], source)
     with get_db() as conn:
-        conn.execute("UPDATE protocols SET steps=?, updated=? WHERE id=?",
-                     (steps, datetime.utcnow().isoformat(), protocol_id))
+        conn.execute("UPDATE protocols SET steps=?, recipe=?, updated=? WHERE id=?",
+                     (steps, recipe, datetime.utcnow().isoformat(), protocol_id))
         conn.commit()
-    return {"steps": steps}
+    return {"steps": steps, "recipe": recipe}

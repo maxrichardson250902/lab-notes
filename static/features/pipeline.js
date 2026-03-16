@@ -722,4 +722,19 @@ async function renderPipeline(el) {
 
 registerView('pipeline', renderPipeline);
 
+window.plShowNew    = plShowNew;
+window.plHideNew    = plHideNew;
+window.plCreate     = plCreate;
+window.plOpen       = plOpen;
+window.plClose      = plClose;
+window.plDelPipeline= plDelPipeline;
+window.plSaveTitle  = plSaveTitle;
+window.plSelStep    = plSelStep;
+window.plAddStep    = plAddStep;
+window.plEditStep   = plEditStep;
+window.plCancelEdit = plCancelEdit;
+window.plSaveStep   = plSaveStep;
+window.plDelStep    = plDelStep;
+window.plTogConn    = plTogConn;
+
 })(); /* end IIFE */

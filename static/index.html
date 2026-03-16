@@ -365,6 +365,9 @@ header{display:flex;align-items:center;gap:10px;padding:16px 24px;border-bottom:
     <div class="nav-item" id="nav-cloning" onclick="setView('cloning')">
       <span>&#129516;</span><span>Cloning</span>
     </div>
+    <div class="nav-item" id="nav-sanger" onclick="setView('sanger')">
+      <span>&#7784;</span><span>Sanger</span>
+    </div>
     <div class="nav-item" id="nav-dilution" onclick="setView('dilution')">
       <span>&#9874;</span><span>Dilution Calc</span>
     </div>
@@ -452,7 +455,7 @@ async function api(method, path, body) {
 async function boot() {
   buildSidebarNav();
   await load();
-  setInterval(load, 30000);
+  setInterval(load, 600000);
 }
 
 function buildSidebarNav() {
@@ -556,7 +559,7 @@ function setGroup(g) {
 
 async function loadView() {
   const el = document.getElementById('content');
-  if ((S.view === 'notebook' && S.nbBook) || S.view === 'cloning' || S.view === 'pipeline') {
+  if ((S.view === 'notebook' && S.nbBook) || S.view === 'cloning' || S.view === 'pipeline' || S.view === 'sanger') {
     el.style.maxWidth = 'none'; el.style.padding = '0';
   } else {
     el.style.maxWidth = ''; el.style.padding = '';
@@ -972,11 +975,32 @@ registerView('notebook', renderNotebook);
 // ── workflow.js ──
 // ── DAILY WORKFLOW ───────────────────────────────────────────────────────────
 var _workflowDate = new Date().toISOString().slice(0, 10);
+var _wfNotebookGroups = [];    // cached from /api/entries
+var _wfSubgroupMap = {};       // {group: {subgroup: true}}
+
+async function _loadWfNotebookGroups() {
+  try {
+    var data = await api('GET', '/api/entries');
+    var seen = {}, subMap = {};
+    (data.entries || []).forEach(function(e) {
+      if (e.group_name) {
+        seen[e.group_name] = true;
+        if (e.subgroup) {
+          if (!subMap[e.group_name]) subMap[e.group_name] = {};
+          subMap[e.group_name][e.subgroup] = true;
+        }
+      }
+    });
+    _wfNotebookGroups = Object.keys(seen).sort();
+    _wfSubgroupMap = subMap;
+  } catch(ex) { _wfNotebookGroups = []; _wfSubgroupMap = {}; }
+}
 
 async function renderWorkflow(el) {
   var data    = await api('GET', '/api/workflow/' + _workflowDate);
   var entries = data.entries || [];
   var today   = new Date().toISOString().slice(0, 10);
+  await _loadWfNotebookGroups();
 
   var html = '<div class="day-nav">' +
     '<button onclick="shiftDay(-1)">&#8592; Prev</button>' +
@@ -987,17 +1011,47 @@ async function renderWorkflow(el) {
     '<button class="btn" onclick="processWorkflowDay()" title="Send this day\'s notes to the 3090 to format into notebook entries" style="margin-left:10px">&#9881; Process day</button>' +
   '</div>';
 
-  if (data.summary) {
-    html += '<div class="day-summary">' + esc(data.summary) + '</div>';
-  }
+  if (data.summary) html += '<div class="day-summary">' + esc(data.summary) + '</div>';
 
   html += '<div class="timeline" id="workflow-timeline">';
   if (!entries.length) {
     html += '<div style="padding:32px 0 32px 82px;color:var(--muted);font-size:14px;font-style:italic">No entries yet — jot notes below, they get processed into formatted notebook entries.</div>';
   } else {
+    // snapshot active runs from localStorage for cross-referencing
+    var _activeRunsNow = [];
+    try { _activeRunsNow = JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(_e) {}
+
     html += entries.map(function(e) {
-      var isTask = e.type === 'task_done';
+      var isTask  = e.type === 'task_done';
       var isProto = e.type === 'protocol_run';
+
+      // for protocol_run entries, extract protocol title from content and find active run
+      var protoActions = '';
+      if (isProto) {
+        // content is "Running protocol: <title>" — extract title
+        var protoTitle = e.content.replace(/^Running protocol:\s*/i, '').trim();
+        // find matching active run by protocol title
+        var activeRun = _activeRunsNow.find(function(r) {
+          return r.protocol && r.protocol.title === protoTitle;
+        });
+        if (activeRun) {
+          var done = activeRun.steps.filter(function(s) { return s.done; }).length;
+          var pct  = Math.round((done / activeRun.steps.length) * 100);
+          protoActions = '<div style="margin-top:6px;padding:6px 8px;background:#e8f0e8;border-radius:4px;display:flex;align-items:center;gap:8px">' +
+            '<div style="flex:1">' +
+              '<div style="font-size:11px;font-weight:600;color:#5b7a5e">&#9654; In progress &nbsp;&#183;&nbsp; ' + done + '/' + activeRun.steps.length + ' steps (' + pct + '%)</div>' +
+              '<div style="height:3px;background:#c8d8c8;border-radius:2px;margin-top:3px"><div style="height:100%;width:' + pct + '%;background:#5b7a5e;border-radius:2px"></div></div>' +
+            '</div>' +
+            '<button class="btn primary" style="font-size:11px;padding:3px 10px" onclick="wfResumeRun(\x27' + activeRun.runId + '\x27)">Resume</button>' +
+          '</div>';
+        } else {
+          // run completed or not started yet — link to protocol history
+          protoActions = '<div style="margin-top:6px">' +
+            '<button class="btn" style="font-size:11px;color:#5b7a5e" onclick="wfViewProtocolHistory(\x27' + esc(protoTitle) + '\x27)">&#128196; View protocol history</button>' +
+          '</div>';
+        }
+      }
+
       return '<div class="timeline-entry" id="we-' + e.id + '">' +
         '<div class="timeline-time">' + esc(e.time || '') + '</div>' +
         '<div class="timeline-dot ' + (isTask ? 'task' : isProto ? 'protocol' : 'note') + '"></div>' +
@@ -1005,6 +1059,7 @@ async function renderWorkflow(el) {
           '<div class="timeline-card ' + (isTask ? 'task-card' : isProto ? 'protocol-card-tl' : 'note-card') + '">' +
             (e.group_name ? '<div class="timeline-card-group">' + esc(e.group_name) + '</div>' : '') +
             '<div class="timeline-card-text" id="wt-' + e.id + '">' + esc(e.content) + '</div>' +
+            protoActions +
             '<div class="timeline-actions">' +
               '<button class="btn" onclick="editWorkflowEntry(' + e.id + ')">Edit</button>' +
               '<button class="btn" onclick="tagWorkflowEntry(' + e.id + ')" title="Set project group">Tag</button>' +
@@ -1017,18 +1072,25 @@ async function renderWorkflow(el) {
   }
   html += '</div>';
 
-  // ── input area ──────────────────────────────────────────────────────────────
+  // ── group input — dropdown if groups exist, text if not ───────────────────
+  var groupControl;
+  if (_wfNotebookGroups.length) {
+    var groupOpts = '<option value="">Project (optional)</option>' +
+      _wfNotebookGroups.map(function(g) { return '<option value="' + esc(g) + '">' + esc(g) + '</option>'; }).join('');
+    groupControl = '<select id="wf-group" ' +
+      'style="background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:4px;outline:none">' +
+      groupOpts + '</select>';
+  } else {
+    groupControl = '<input type="text" id="wf-group" placeholder="Project (optional)" spellcheck="false" ' +
+      'style="width:140px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:4px;outline:none"/>';
+  }
+
   html += '<div style="margin-top:8px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 14px">' +
-    '<div style="display:flex;gap:8px;margin-bottom:8px">' +
-      '<input type="text" id="wf-group" placeholder="Project (optional)" spellcheck="false" ' +
-        'style="width:140px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:4px;outline:none"/>' +
-    '</div>' +
+    '<div style="display:flex;gap:8px;margin-bottom:8px">' + groupControl + '</div>' +
     '<div class="add-inline" style="padding:0">' +
       '<input type="text" id="wf-input" placeholder="Jot down what you\'re doing..." spellcheck="false"/>' +
       '<button onclick="addWorkflowNote()">Add</button>' +
     '</div>' +
-
-    // ── protocol runner section ──
     '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">' +
       '<div id="wf-proto-picker-wrap">' +
         '<button class="btn" style="color:#5b7a5e;font-size:12px" onclick="wfShowProtoPicker()">&#9654; Run a protocol</button>' +
@@ -1037,7 +1099,6 @@ async function renderWorkflow(el) {
   '</div>';
 
   el.innerHTML = html;
-
   setTimeout(function() {
     var wfInp = document.getElementById('wf-input');
     if (wfInp) {
@@ -1047,61 +1108,57 @@ async function renderWorkflow(el) {
   }, 50);
 }
 
-// ── protocol picker (workflow) ────────────────────────────────────────────────
+// ── protocol picker ───────────────────────────────────────────────────────────
 async function wfShowProtoPicker() {
   var wrap = document.getElementById('wf-proto-picker-wrap'); if (!wrap) return;
   wrap.innerHTML = '<div style="color:var(--muted);font-size:13px">Loading...</div>';
 
   var data = await api('GET', '/api/protocols');
   S.protocols = data.protocols || [];
-
   if (!S.protocols.length) {
     wrap.innerHTML = '<div style="color:var(--muted);font-size:13px;font-style:italic">No protocols saved yet — add one in the Protocols page first.</div>';
     return;
   }
 
-  // collect existing groups from today's workflow for quick-select
-  var data2     = await api('GET', '/api/workflow/' + _workflowDate);
-  var seenGroups = [];
-  (data2.entries || []).forEach(function(e) {
-    if (e.group_name && seenGroups.indexOf(e.group_name) === -1) seenGroups.push(e.group_name);
-  });
-  // also grab the current group input value
-  var currentGroup = document.getElementById('wf-group')?.value.trim();
-  if (currentGroup && seenGroups.indexOf(currentGroup) === -1) seenGroups.unshift(currentGroup);
+  var currentGroup = document.getElementById('wf-group')?.value.trim() || '';
+  var opts = S.protocols.map(function(p) { return '<option value="' + p.id + '">' + esc(p.title) + '</option>'; }).join('');
 
-  var opts = S.protocols.map(function(p) {
-    return '<option value="' + p.id + '">' + esc(p.title) + '</option>';
-  }).join('');
-
-  var groupSuggestions = seenGroups.length
-    ? '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">' +
-        seenGroups.map(function(g) {
-          return '<button class="btn" style="font-size:11px;padding:2px 8px" onclick="document.getElementById(\'wf-pk-group\').value=\'' + esc(g) + '\'">' + esc(g) + '</button>';
-        }).join('') +
-      '</div>'
-    : '';
+  // group dropdown for the picker
+  var groupOpts = '<option value="">Select group...</option>' +
+    _wfNotebookGroups.map(function(g) {
+      return '<option value="' + esc(g) + '"' + (g === currentGroup ? ' selected' : '') + '>' + esc(g) + '</option>';
+    }).join('');
 
   wrap.innerHTML =
     '<div style="background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:12px;margin-top:6px">' +
       '<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">' +
-        '<input type="text" id="wf-pk-q" placeholder="Search protocols..." spellcheck="false" ' +
-          'style="flex:1" oninput="wfPickerFilter()"/>' +
+        '<input type="text" id="wf-pk-q" placeholder="Search protocols..." spellcheck="false" style="flex:1" oninput="wfPickerFilter()"/>' +
         '<button class="btn" onclick="wfHideProtoPicker()">Cancel</button>' +
       '</div>' +
-      '<select id="wf-pk-sel" size="4" style="width:100%;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-family:inherit;font-size:13px;margin-bottom:8px">' +
+      '<select id="wf-pk-sel" size="4" style="width:100%;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-family:inherit;font-size:13px;margin-bottom:10px">' +
         opts +
       '</select>' +
-      '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin-bottom:4px">Save entry to group</div>' +
-      groupSuggestions +
-      '<input type="text" id="wf-pk-group" placeholder="e.g. Cloning, Gibson, Western..." spellcheck="false" ' +
-        'style="width:100%;margin-bottom:8px" value="' + esc(currentGroup) + '"/>' +
+      '<div style="display:flex;gap:8px;margin-bottom:8px">' +
+        '<div style="flex:1">' +
+          '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin-bottom:4px">Notebook group</div>' +
+          '<select id="wf-pk-group" style="width:100%;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-family:inherit;font-size:13px;padding:5px 8px" onchange="wfPickerGroupChanged()">' +
+            groupOpts +
+          '</select>' +
+        '</div>' +
+        '<div style="flex:1">' +
+          '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin-bottom:4px">Subgroup <span style="font-weight:400;text-transform:none;font-size:10px">(optional)</span></div>' +
+          '<input type="text" id="wf-pk-subgroup" placeholder="e.g. protein expression testing" spellcheck="false" style="width:100%" list="wf-pk-subgroup-dl"/>' +
+          '<datalist id="wf-pk-subgroup-dl"></datalist>' +
+        '</div>' +
+      '</div>' +
       '<div style="text-align:right">' +
         '<button class="btn primary" onclick="wfLaunchProtoRun()">&#9654; Start run</button>' +
       '</div>' +
     '</div>';
 
   document.getElementById('wf-pk-q')?.focus();
+  // pre-populate subgroup suggestions if group already selected
+  if (currentGroup) wfPickerGroupChanged();
 }
 
 function wfHideProtoPicker() {
@@ -1111,30 +1168,35 @@ function wfHideProtoPicker() {
 
 function wfPickerFilter() {
   var q = (document.getElementById('wf-pk-q')?.value || '').toLowerCase();
-  document.querySelectorAll('#wf-pk-sel option').forEach(function(o) {
-    o.style.display = (!q || o.textContent.toLowerCase().includes(q)) ? '' : 'none';
-  });
+  document.querySelectorAll('#wf-pk-sel option').forEach(function(o) { o.style.display = (!q || o.textContent.toLowerCase().includes(q)) ? '' : 'none'; });
+}
+
+function wfPickerGroupChanged() {
+  var group    = document.getElementById('wf-pk-group')?.value || '';
+  var datalist = document.getElementById('wf-pk-subgroup-dl'); if (!datalist) return;
+  var subs = Object.keys(_wfSubgroupMap[group] || {});
+  datalist.innerHTML = subs.map(function(s) { return '<option value="' + esc(s) + '">'; }).join('');
 }
 
 function wfLaunchProtoRun() {
-  var sel   = document.getElementById('wf-pk-sel');
-  var group = (document.getElementById('wf-pk-group')?.value || '').trim();
+  var sel      = document.getElementById('wf-pk-sel');
+  var group    = (document.getElementById('wf-pk-group')?.value || '').trim();
+  var subgroup = (document.getElementById('wf-pk-subgroup')?.value || '').trim();
   if (!sel || !sel.value) { toast('Select a protocol first', true); return; }
-  if (!group) { toast('Enter a group name to file the entry under', true); document.getElementById('wf-pk-group')?.focus(); return; }
+  if (!group) { toast('Select a notebook group', true); document.getElementById('wf-pk-group')?.focus(); return; }
 
   var p = (S.protocols || []).find(function(x) { return x.id === parseInt(sel.value); });
   if (!p) return;
 
-  // log a marker in today's workflow timeline
+  // log in timeline
   api('POST', '/api/workflow', {
     content:    'Running protocol: ' + p.title,
     type:       'protocol_run',
     group_name: group
   });
 
-  // launch via scratch.js runner with the chosen group
   if (typeof spLaunchRunDirect === 'function') {
-    spLaunchRunDirect(p, group);
+    spLaunchRunDirect(p, group, subgroup);
   } else {
     toast('scratch.js not loaded', true);
   }
@@ -1187,7 +1249,7 @@ function editWorkflowEntry(id) {
 }
 
 async function saveWorkflowEntry(id, content) {
-  await api('PUT', '/api/workflow/' + id, { content });
+  await api('PUT', '/api/workflow/' + id, { content: content });
   await loadView(); toast('Saved');
 }
 
@@ -1196,7 +1258,41 @@ async function deleteWorkflowEntry(id) {
   await loadView();
 }
 
+function wfResumeRun(runId) {
+  if (typeof spResumeRunById === 'function') spResumeRunById(runId);
+  else toast('Could not resume', true);
+}
+
+function wfViewProtocolHistory(protoTitle) {
+  // navigate to protocols page and open the matching card
+  if (!S.protocols || !S.protocols.length) {
+    api('GET', '/api/protocols').then(function(data) {
+      S.protocols = data.protocols || [];
+      _wfJumpToProtocol(protoTitle);
+    });
+  } else {
+    _wfJumpToProtocol(protoTitle);
+  }
+}
+
+function _wfJumpToProtocol(title) {
+  var p = (S.protocols || []).find(function(x) { return x.title === title; });
+  if (!p) { toast('Protocol not found', true); return; }
+  if (typeof setView === 'function') {
+    setView('protocols');
+    // open the card after render
+    setTimeout(function() {
+      var card = document.getElementById('pc-' + p.id);
+      if (card) {
+        if (!card.classList.contains('open') && typeof protoToggle === 'function') protoToggle(p.id);
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 300);
+  }
+}
+
 registerView('workflow', renderWorkflow);
+window.processWorkflowDay = processWorkflowDay;
 
 
 // ── protocols.js ──
@@ -1206,115 +1302,303 @@ registerView('workflow', renderWorkflow);
   if (document.getElementById('proto-styles')) return;
   var s = document.createElement('style');
   s.id = 'proto-styles';
-  s.textContent = `
-    .proto-import-box{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:16px;margin-bottom:20px}
-    .proto-import-tabs{display:flex;gap:6px;margin-bottom:14px}
-    .proto-tab{background:none;border:1px solid #d5cec0;border-radius:5px;padding:5px 14px;font-size:12px;cursor:pointer;color:#8a7f72;font-family:inherit}
-    .proto-tab.active{background:#faf8f4;color:#4a4139;border-color:#b0a898;font-weight:600}
-    .proto-import-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-    .proto-import-row input[type=text]{flex:1;min-width:160px}
-    .proto-import-col{display:flex;flex-direction:column;gap:8px}
-    .proto-import-col input[type=text]{width:100%}
-    .proto-import-col textarea{width:100%;min-height:100px;font-family:"SF Mono",Monaco,Consolas,monospace;font-size:12px;resize:vertical}
-    .proto-search-bar{margin-bottom:12px}
-    .proto-search-bar input{width:100%;max-width:360px}
-
-    /* cards */
-    .protocol-card{border:1px solid #d5cec0;border-radius:8px;background:#faf8f4;margin-bottom:10px;overflow:hidden}
-    .protocol-header{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;cursor:pointer;user-select:none}
-    .protocol-header:hover{background:#f0ebe3}
-    .protocol-title{font-weight:600;font-size:14px;color:#4a4139;margin-bottom:2px}
-    .protocol-url{font-size:11px;color:#8a7f72;margin-bottom:4px;word-break:break-all}
-    .protocol-body{display:none;padding:0 16px 16px;border-top:1px solid #e8e2d8}
-    .protocol-card.open .protocol-body{display:block}
-    .steps-list{margin:12px 0 0;padding-left:22px;color:#4a4139;font-size:13px;line-height:1.7}
-    .steps-list li{margin-bottom:2px}
-    .steps-text{font-family:"SF Mono",Monaco,Consolas,monospace;font-size:12px;background:#f0ebe3;border-radius:5px;padding:10px 12px;white-space:pre-wrap;color:#4a4139;margin-top:12px}
-
-    /* recipe table */
-    .recipe-section{margin-top:18px}
-    .recipe-section-head{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between}
-    .recipe-wrap{overflow-x:auto}
-    .recipe-table{border-collapse:collapse;font-size:13px;color:#4a4139;min-width:100%}
-    .recipe-table th{background:#f0ebe3;border:1px solid #d5cec0;padding:6px 10px;text-align:left;font-weight:600;font-size:12px;white-space:nowrap;position:relative}
-    .recipe-table td{border:1px solid #e8e2d8;padding:0}
-    .recipe-table td input{width:100%;border:none;background:transparent;padding:6px 10px;font-size:13px;font-family:inherit;color:#4a4139;outline:none;min-width:80px}
-    .recipe-table td input:focus{background:#fff8f0}
-    .recipe-table th .del-col{position:absolute;top:2px;right:3px;background:none;border:none;cursor:pointer;font-size:10px;color:#c0b8b0;padding:0;line-height:1}
-    .recipe-table th .del-col:hover{color:#c0392b}
-    .recipe-table .del-row{background:none;border:none;cursor:pointer;font-size:13px;color:#c0b8b0;padding:4px 8px;width:100%;height:100%}
-    .recipe-table .del-row:hover{color:#c0392b;background:#fff0f0}
-    .recipe-add-row{display:flex;gap:8px;margin-top:8px;align-items:center}
-    .recipe-edit-actions{display:flex;gap:6px;align-items:center}
-  `;
+  s.textContent = [
+    '.proto-import-box{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:16px;margin-bottom:20px}',
+    '.proto-import-tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}',
+    '.proto-tab{background:none;border:1px solid #d5cec0;border-radius:5px;padding:5px 14px;font-size:12px;cursor:pointer;color:#8a7f72;font-family:inherit}',
+    '.proto-tab.active{background:#faf8f4;color:#4a4139;border-color:#b0a898;font-weight:600}',
+    '.proto-import-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}',
+    '.proto-import-row input[type=text]{flex:1;min-width:160px}',
+    '.proto-import-col{display:flex;flex-direction:column;gap:8px}',
+    '.proto-import-col input[type=text]{width:100%}',
+    '.proto-import-col textarea{width:100%;min-height:100px;font-family:"SF Mono",Monaco,Consolas,monospace;font-size:12px;resize:vertical}',
+    '.proto-search-bar{margin-bottom:12px}',
+    '.proto-search-bar input{width:100%;max-width:360px}',
+    '.protocol-card{border:1px solid #d5cec0;border-radius:8px;background:#faf8f4;margin-bottom:10px;overflow:hidden}',
+    '.protocol-header{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;cursor:pointer;user-select:none}',
+    '.protocol-header:hover{background:#f0ebe3}',
+    '.protocol-title{font-weight:600;font-size:14px;color:#4a4139;margin-bottom:2px}',
+    '.protocol-url{font-size:11px;color:#8a7f72;margin-bottom:4px;word-break:break-all}',
+    '.protocol-body{display:none;padding:0 16px 16px;border-top:1px solid #e8e2d8}',
+    '.protocol-card.open .protocol-body{display:block}',
+    '.steps-list{margin:12px 0 0;padding-left:22px;color:#4a4139;font-size:13px;line-height:1.7}',
+    '.steps-list li{margin-bottom:2px}',
+    '.steps-text{font-family:"SF Mono",Monaco,Consolas,monospace;font-size:12px;background:#f0ebe3;border-radius:5px;padding:10px 12px;white-space:pre-wrap;color:#4a4139;margin-top:12px}',
+    '.recipe-section{margin-top:18px}',
+    '.recipe-section-head{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between}',
+    '.recipe-wrap{overflow-x:auto}',
+    '.recipe-table{border-collapse:collapse;font-size:13px;color:#4a4139;min-width:100%}',
+    '.recipe-table th{background:#f0ebe3;border:1px solid #d5cec0;padding:6px 10px;text-align:left;font-weight:600;font-size:12px;white-space:nowrap;position:relative}',
+    '.recipe-table td{border:1px solid #e8e2d8;padding:0}',
+    '.recipe-table td input{width:100%;border:none;background:transparent;padding:6px 10px;font-size:13px;font-family:inherit;color:#4a4139;outline:none;min-width:80px}',
+    '.recipe-table td input:focus{background:#fff8f0}',
+    '.recipe-table th .del-col{position:absolute;top:2px;right:3px;background:none;border:none;cursor:pointer;font-size:10px;color:#c0b8b0;padding:0;line-height:1}',
+    '.recipe-table th .del-col:hover{color:#c0392b}',
+    '.recipe-table .del-row{background:none;border:none;cursor:pointer;font-size:13px;color:#c0b8b0;padding:4px 8px;width:100%;height:100%}',
+    '.recipe-table .del-row:hover{color:#c0392b;background:#fff0f0}',
+    '.recipe-add-row{display:flex;gap:8px;margin-top:8px;align-items:center}',
+    '.recipe-edit-actions{display:flex;gap:6px;align-items:center}',
+    '.proto-card-actions{display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap}',
+    '.manual-step-row{display:flex;gap:6px;align-items:center;margin-bottom:6px}',
+    '.manual-step-row input{flex:1;font-size:13px}',
+    '.manual-step-num{font-size:12px;color:#8a7f72;min-width:20px;text-align:right;flex-shrink:0}',
+    '.manual-del-step{background:none;border:none;cursor:pointer;color:#c0b8b0;font-size:16px;padding:0 4px;flex-shrink:0;line-height:1}',
+    '.manual-del-step:hover{color:#c0392b}',
+    '.manual-recipe-section{margin-top:14px;border-top:1px solid #d5cec0;padding-top:14px}',
+    '.manual-recipe-label{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:8px}',
+    '.active-run-card{background:#fff8e8;border:1px solid #e8d8a0;border-radius:8px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}',
+    '.active-run-info{flex:1;min-width:180px}',
+    '.active-run-title{font-weight:600;font-size:13px;color:#4a4139}',
+    '.active-run-meta{font-size:12px;color:#8a7f72;margin-top:2px}',
+    '.active-run-bar{height:4px;background:#e8e2d8;border-radius:2px;margin-top:6px}',
+    '.active-run-fill{height:100%;background:#5b7a5e;border-radius:2px}',
+    '.proto-link-badge{display:inline-flex;align-items:center;gap:4px;background:#e8f0e8;color:#5b7a5e;border:1px solid #c8d8c8;border-radius:3px;padding:1px 7px;font-size:11px;cursor:pointer;font-weight:600;vertical-align:middle;margin:0 2px}',
+    '.proto-link-badge:hover{background:#d0e4d0}',
+    '.proto-edit-step{display:flex;gap:6px;align-items:center;margin-bottom:6px}',
+    '.proto-edit-step input{flex:1;font-size:13px}',
+    '.proto-edit-step .link-btn{font-size:11px;color:#5b7a5e;background:none;border:1px solid #c8d8c8;border-radius:3px;padding:2px 7px;cursor:pointer;white-space:nowrap}',
+    '.proto-edit-step .link-btn:hover{background:#e8f0e8}',
+    /* run history inside card */
+    '.run-history-section{margin-top:18px;border-top:1px solid #e8e2d8;padding-top:14px}',
+    '.run-history-head{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:8px}',
+    '.run-history-row{border:1px solid #e8e2d8;border-radius:6px;margin-bottom:6px;overflow:hidden;background:#fff}',
+    '.run-history-summary{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;user-select:none}',
+    '.run-history-summary:hover{background:#f8f6f2}',
+    '.run-history-date{font-size:12px;font-weight:600;color:#4a4139;min-width:80px}',
+    '.run-history-pct{font-size:12px;color:#5b7a5e;min-width:60px}',
+    '.run-history-devs{font-size:12px;color:#c97b3c}',
+    '.run-history-group{font-size:11px;color:#8a7f72;flex:1}',
+    '.run-history-detail{display:none;padding:10px 14px 12px;border-top:1px solid #e8e2d8;background:#faf8f4}',
+    '.run-history-row.open .run-history-detail{display:block}',
+    '.run-detail-steps{margin:0;padding-left:18px;font-size:12px;color:#4a4139;line-height:1.7}',
+    '.run-detail-steps li{margin-bottom:2px}',
+    '.run-detail-steps li.done{color:#8a7f72}',
+    '.run-detail-steps li.done::marker{content:"\\2713  "}',
+    '.run-detail-deviation{font-size:11px;color:#c97b3c;margin-left:4px}'
+  ].join('');
   document.head.appendChild(s);
 })();
 
-// ── recipe helpers ────────────────────────────────────────────────────────────
-var DEFAULT_RECIPE = {
-  columns: ['Component', 'Stock conc.', 'Volume (µL)', 'Final conc.'],
-  rows: []
-};
+// ── state ─────────────────────────────────────────────────────────────────────
+var DEFAULT_RECIPE = { columns: ['Component', 'Stock conc.', 'Volume (uL)', 'Final conc.'], rows: [] };
+var _recipeState = {};
+var _manualSteps = [''];
+var _manualRecipes = []; // array of {name, columns, rows}
+var _UNITS = ['uL', 'mL', 'L', 'ng', 'ug', 'mg', 'g', 'nM', 'uM', 'mM', 'M', 'U', 'x', '%', 'units'];
 
 function _parseRecipe(raw) {
   if (!raw) return JSON.parse(JSON.stringify(DEFAULT_RECIPE));
   try {
     var r = JSON.parse(raw);
+    // new format: array of tables
+    if (Array.isArray(r) && r.length && r[0].columns) return r[0]; // return first for compat
+    // old format: single object
     if (r && Array.isArray(r.columns) && Array.isArray(r.rows)) return r;
   } catch(e) {}
   return JSON.parse(JSON.stringify(DEFAULT_RECIPE));
 }
 
-// render a read-only recipe table (for protocol card display)
+function _parseAllRecipes(raw) {
+  if (!raw) return null;
+  try {
+    var r = JSON.parse(raw);
+    if (Array.isArray(r) && r.length && r[0].columns) return r;
+    if (r && Array.isArray(r.columns)) return null; // single table, use old display
+  } catch(e) {}
+  return null;
+}
+
+function _isUnitCol(n) { return /vol|amount|conc|stock|final|mass|weight/i.test(n); }
+
+function _parseAmountUnit(val) {
+  val = (val || '').trim();
+  var m = val.match(/^([\d.,]*)\s*(.*)$/);
+  return { num: m ? m[1] : '', unit: m ? m[2].trim() : '' };
+}
+
+function _manualUnitCellHTML(ri, ci, val) {
+  var p = _parseAmountUnit(val);
+  var unitOpts = _UNITS.map(function(u) { return '<option value="' + u + '"' + (p.unit === u ? ' selected' : '') + '>' + u + '</option>'; }).join('');
+  return '<td style="padding:0"><div style="display:flex;align-items:center">' +
+    '<input type="number" value="' + esc(p.num) + '" min="0" step="any" placeholder="0" ' +
+      'style="width:68px;border:none;background:transparent;padding:6px 4px 6px 8px;font-size:13px;font-family:inherit;color:#4a4139;outline:none" ' +
+      'oninput="manualRecipeCellUnit(' + ri + ',' + ci + ',this.value,this.nextElementSibling.value)"/>' +
+    '<select style="border:none;background:transparent;font-size:12px;color:#8a7f72;font-family:inherit;padding:0 4px 0 0;cursor:pointer;outline:none" ' +
+      'onchange="manualRecipeCellUnit(' + ri + ',' + ci + ',this.previousElementSibling.value,this.value)">' +
+      '<option value="">-</option>' + unitOpts +
+    '</select></div></td>';
+}
+
+function _recipeDisplayHTML(raw) {
+  var tables = _parseAllRecipes(raw);
+  if (tables) {
+    // multi-table display
+    return tables.map(function(t) {
+      return '<div style="margin-bottom:10px">' +
+        (t.name ? '<div style="font-size:11px;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">' + esc(t.name) + '</div>' : '') +
+        _recipeReadHTML(t) +
+      '</div>';
+    }).join('');
+  }
+  return _recipeReadHTML(_parseRecipe(raw));
+}
+
 function _recipeReadHTML(recipe) {
-  if (!recipe.rows.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components yet — click Edit to add rows.</div>';
+  if (!recipe.rows.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components yet.</div>';
   var html = '<div class="recipe-wrap"><table class="recipe-table"><thead><tr>';
   recipe.columns.forEach(function(c) { html += '<th>' + esc(c) + '</th>'; });
   html += '</tr></thead><tbody>';
   recipe.rows.forEach(function(row) {
     html += '<tr>';
-    recipe.columns.forEach(function(_, ci) {
-      html += '<td style="padding:6px 10px">' + esc(row[ci] || '') + '</td>';
-    });
+    recipe.columns.forEach(function(_, ci) { html += '<td style="padding:6px 10px">' + esc(row[ci] || '') + '</td>'; });
     html += '</tr>';
   });
-  html += '</tbody></table></div>';
-  return html;
+  return html + '</tbody></table></div>';
 }
 
-// render an editable recipe table (for protocol card edit mode)
 function _recipeEditHTML(pid, recipe) {
   var html = '<div class="recipe-wrap"><table class="recipe-table" id="rtbl-' + pid + '"><thead><tr>';
-  recipe.columns.forEach(function(c, ci) {
-    html += '<th>' + esc(c) +
-      '<button class="del-col" title="Remove column" onclick="protoDelCol(' + pid + ',' + ci + ')">&#215;</button>' +
-    '</th>';
-  });
+  recipe.columns.forEach(function(c, ci) { html += '<th>' + esc(c) + '<button class="del-col" onclick="protoDelCol(' + pid + ',' + ci + ')">&#215;</button></th>'; });
   html += '<th style="width:32px"></th></tr></thead><tbody>';
-
   recipe.rows.forEach(function(row, ri) {
     html += '<tr id="rrow-' + pid + '-' + ri + '">';
-    recipe.columns.forEach(function(_, ci) {
-      html += '<td><input type="text" value="' + esc(row[ci] || '') +
-        '" oninput="protoRecipeCell(' + pid + ',' + ri + ',' + ci + ',this.value)"/></td>';
-    });
-    html += '<td><button class="del-row" onclick="protoDelRow(' + pid + ',' + ri + ')" title="Remove row">&#215;</button></td>';
-    html += '</tr>';
+    recipe.columns.forEach(function(_, ci) { html += '<td><input type="text" value="' + esc(row[ci] || '') + '" oninput="protoRecipeCell(' + pid + ',' + ri + ',' + ci + ',this.value)"/></td>'; });
+    html += '<td><button class="del-row" onclick="protoDelRow(' + pid + ',' + ri + ')">&#215;</button></td></tr>';
   });
-
   html += '</tbody></table></div>';
-  html += '<div class="recipe-add-row">' +
-    '<button class="btn" onclick="protoAddRow(' + pid + ')">+ Row</button>' +
-    '<button class="btn" onclick="protoAddCol(' + pid + ')">+ Column</button>' +
-  '</div>';
+  html += '<div class="recipe-add-row"><button class="btn" onclick="protoAddRow(' + pid + ')">+ Row</button><button class="btn" onclick="protoAddCol(' + pid + ')">+ Column</button></div>';
   return html;
 }
 
-// per-protocol in-memory recipe state while editing
-var _recipeState = {}; // pid -> {columns, rows}
+// ── active runs helpers ───────────────────────────────────────────────────────
+function _getActiveRuns() { try { return JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(e) { return []; } }
 
-function _getRecipeState(pid) {
-  return _recipeState[pid];
+function _getActiveRuns() {
+  // kept for sync fallback only - protocols.js uses _activeRunsHTMLAsync
+  try { return JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(e) { return []; }
+}
+
+async function _loadAndRenderActiveRuns() {
+  var container = document.getElementById('active-runs-container');
+  if (!container) return;
+  try {
+    var runs = typeof spGetActiveRuns === 'function' ? await spGetActiveRuns() : _getActiveRuns();
+    container.innerHTML = runs.length ? _buildActiveRunsHTML(runs) : '';
+  } catch(e) {
+    container.innerHTML = '';
+  }
+}
+
+function _buildActiveRunsHTML(runs) {
+  if (!runs.length) return '';
+  var html = '<div style="margin-bottom:20px"><div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Active Runs</div>';
+  runs.forEach(function(run) {
+    var done = run.steps.filter(function(s) { return s.done; }).length;
+    var pct  = Math.round((done / run.steps.length) * 100);
+    var devs = run.steps.filter(function(s) { return s.deviation && s.deviation.trim(); }).length;
+    html += '<div class="active-run-card">' +
+      '<div class="active-run-info">' +
+        '<div class="active-run-title">&#9654; ' + esc(run.protocol.title) + '</div>' +
+        '<div class="active-run-meta">' + done + '/' + run.steps.length + ' steps' + (devs ? ' &nbsp;&#183;&nbsp; ' + devs + ' deviation' + (devs > 1 ? 's' : '') : '') + ' &nbsp;&#183;&nbsp; &#128193; ' + esc(run.group_name) + (run.subgroup ? ' / ' + esc(run.subgroup) : '') + '</div>' +
+        '<div class="active-run-bar"><div class="active-run-fill" style="width:' + pct + '%"></div></div>' +
+      '</div>' +
+      '<div style="display:flex;gap:6px;flex-shrink:0">' +
+        '<button class="btn primary" style="font-size:12px" data-runid="' + esc(run.runId) + '" onclick="spResumeRunById(this.dataset.runid)">&#9654; Resume</button>' +
+        '<button class="btn" style="font-size:12px" data-runid="' + esc(run.runId) + '" onclick="spSaveRunToEntry(this.dataset.runid)">Save to Entry</button>' +
+        '<button class="btn" style="font-size:12px;color:#c0392b" data-runid="' + esc(run.runId) + '" onclick="spDiscardRunById(this.dataset.runid)">Discard</button>' +
+      '</div>' +
+    '</div>';
+  });
+  return html + '</div>';
+}
+
+function _activeRunsHTML() {
+  var runs = _getActiveRuns(); if (!runs.length) return '';
+  var html = '<div style="margin-bottom:20px"><div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Active Runs</div>';
+  runs.forEach(function(run) {
+    var done = run.steps.filter(function(s) { return s.done; }).length;
+    var pct  = Math.round((done / run.steps.length) * 100);
+    var devs = run.steps.filter(function(s) { return s.deviation && s.deviation.trim(); }).length;
+    html += '<div class="active-run-card">' +
+      '<div class="active-run-info">' +
+        '<div class="active-run-title">&#9654; ' + esc(run.protocol.title) + '</div>' +
+        '<div class="active-run-meta">' + done + '/' + run.steps.length + ' steps' + (devs ? ' &nbsp;&#183;&nbsp; ' + devs + ' deviation' + (devs > 1 ? 's' : '') : '') + ' &nbsp;&#183;&nbsp; &#128193; ' + esc(run.group_name) + '</div>' +
+        '<div class="active-run-bar"><div class="active-run-fill" style="width:' + pct + '%"></div></div>' +
+      '</div>' +
+      '<div style="display:flex;gap:6px;flex-shrink:0">' +
+        '<button class="btn primary" style="font-size:12px" onclick="spResumeRunById(\'' + run.runId + '\')">&#9654; Resume</button>' +
+        '<button class="btn" style="font-size:12px" onclick="spSaveRunToEntry(\'' + run.runId + '\')">Save to Entry</button>' +
+        '<button class="btn" style="font-size:12px;color:#c0392b" onclick="spDiscardRunById(\'' + run.runId + '\')">Discard</button>' +
+      '</div>' +
+    '</div>';
+  });
+  return html + '</div>';
+}
+
+// ── run history helpers ───────────────────────────────────────────────────────
+function _runHistoryRowHTML(run) {
+  var pct  = run.steps_total ? Math.round((run.steps_done / run.steps_total) * 100) : 0;
+  var date = run.date || run.created.split('T')[0];
+
+  // build step-by-step detail
+  var steps = [];
+  try { steps = JSON.parse(run.steps_json || '[]'); } catch(e) {}
+  var stepsHtml = '';
+  if (steps.length) {
+    stepsHtml = '<ol class="run-detail-steps">';
+    steps.forEach(function(step) {
+      stepsHtml += '<li class="' + (step.done ? 'done' : '') + '">' + esc(step.text);
+      if (step.deviation && step.deviation.trim()) {
+        stepsHtml += ' <span class="run-detail-deviation">&#8594; ' + esc(step.deviation) + '</span>';
+      }
+      stepsHtml += '</li>';
+    });
+    stepsHtml += '</ol>';
+  }
+
+  // recipe if present
+  var recipeHtml = '';
+  try {
+    var recipe = JSON.parse(run.recipe_json || 'null');
+    if (recipe && recipe.rows && recipe.rows.length) {
+      recipeHtml = '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin:10px 0 6px">Recipe used</div>';
+      recipeHtml += '<div style="overflow-x:auto"><table class="recipe-table"><thead><tr>';
+      recipe.columns.forEach(function(c) { recipeHtml += '<th>' + esc(c) + '</th>'; });
+      recipeHtml += '</tr></thead><tbody>';
+      recipe.rows.forEach(function(row) {
+        recipeHtml += '<tr>';
+        recipe.columns.forEach(function(_, ci) { recipeHtml += '<td style="padding:5px 10px;font-size:12px">' + esc(row[ci] || '') + '</td>'; });
+        recipeHtml += '</tr>';
+      });
+      recipeHtml += '</tbody></table></div>';
+    }
+  } catch(e) {}
+
+  return '<div class="run-history-row" id="rhr-' + run.id + '">' +
+    '<div class="run-history-summary" onclick="protoToggleRunDetail(' + run.id + ')">' +
+      '<div class="run-history-date">' + esc(date) + '</div>' +
+      '<div class="run-history-pct">' + pct + '% done</div>' +
+      (run.deviations ? '<div class="run-history-devs">' + run.deviations + ' deviation' + (run.deviations > 1 ? 's' : '') + '</div>' : '') +
+      '<div class="run-history-group">&#128193; ' + esc(run.group_name) + '</div>' +
+      '<div style="font-size:11px;color:#b0a898">&#9660;</div>' +
+    '</div>' +
+    '<div class="run-history-detail">' +
+      stepsHtml + recipeHtml +
+      (run.entry_id ? '<div style="margin-top:10px"><button class="btn" style="font-size:12px" onclick="protoViewEntry(' + run.entry_id + ')">&#128196; View notebook entry</button></div>' : '') +
+    '</div>' +
+  '</div>';
+}
+
+function protoToggleRunDetail(runId) {
+  document.getElementById('rhr-' + runId)?.classList.toggle('open');
+}
+
+function protoViewEntry(entryId) {
+  // navigate to notebook and highlight the entry
+  if (typeof setView === 'function') {
+    S._jumpToEntry = entryId;
+    setView('notebook');
+  }
 }
 
 // ── main view ─────────────────────────────────────────────────────────────────
@@ -1322,14 +1606,16 @@ async function renderProtocols(el) {
   var data = await api('GET', '/api/protocols');
   S.protocols = data.protocols || [];
 
-  var html = '<div class="proto-import-box">' + _buildImportUI() + '</div>';
+  var html = '<div id="active-runs-container"><div style="font-size:12px;color:#8a7f72;margin-bottom:12px">Loading active runs...</div></div>';
+  html += '<div class="proto-import-box">' + _buildImportUI() + '</div>';
   if (!S.protocols.length) {
-    html += '<div class="empty"><big>&#128196;</big>No protocols yet — import one above.</div>';
+    html += '<div class="empty"><big>&#128196;</big>No protocols yet.</div>';
   } else {
     html += '<div class="proto-search-bar"><input type="text" id="proto-search" placeholder="Search protocols..." oninput="protoFilter()" spellcheck="false"/></div>';
     html += '<div id="proto-list">' + S.protocols.map(_protoCard).join('') + '</div>';
   }
   el.innerHTML = html;
+  _loadAndRenderActiveRuns();
 }
 
 function _buildImportUI() {
@@ -1337,6 +1623,7 @@ function _buildImportUI() {
     '<button class="proto-tab active" onclick="protoTab(\'url\',this)">URL</button>' +
     '<button class="proto-tab" onclick="protoTab(\'paste\',this)">Paste text</button>' +
     '<button class="proto-tab" onclick="protoTab(\'file\',this)">Upload file</button>' +
+    '<button class="proto-tab" onclick="protoTab(\'manual\',this)">Write manually</button>' +
     '</div>' +
     '<div id="pt-url"><div class="proto-import-row">' +
       '<input type="text" id="proto-url" placeholder="https://www.protocols.io/..." spellcheck="false"/>' +
@@ -1352,45 +1639,58 @@ function _buildImportUI() {
       '<input type="text" id="proto-title-file" placeholder="Protocol name" spellcheck="false"/>' +
       '<input type="file" id="proto-file" accept=".txt,.md,.pdf,.docx"/>' +
       '<button class="btn primary" onclick="protoAddFile()">Upload + Extract</button>' +
+    '</div></div>' +
+    '<div id="pt-manual" style="display:none"><div class="proto-import-col">' +
+      '<input type="text" id="proto-title-manual" placeholder="Protocol name" spellcheck="false"/>' +
+      '<div id="manual-steps-list"></div>' +
+      '<div style="display:flex;gap:6px">' +
+        '<button class="btn" onclick="manualAddStep()">+ Step</button>' +
+        '<button class="btn" style="color:#5b7a5e" onclick="manualLinkProtocol()">&#8599; Link protocol</button>' +
+      '</div>' +
+      '<div class="manual-recipe-section">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">' +
+          '<div class="manual-recipe-label">Reaction Tables <span style="font-weight:400;text-transform:none;font-size:11px">(optional)</span></div>' +
+          '<button class="btn" onclick="manualAddTable()">+ Add table</button>' +
+        '</div>' +
+        '<div id="manual-recipe-body"></div>' +
+      '</div>' +
+      '<div style="text-align:right;margin-top:10px"><button class="btn primary" onclick="protoAddManual()">Save Protocol</button></div>' +
     '</div></div>';
 }
 
 function protoTab(name, btn) {
   document.querySelectorAll('.proto-tab').forEach(function(t) { t.classList.remove('active'); });
   btn.classList.add('active');
-  ['url','paste','file'].forEach(function(t) {
+  ['url', 'paste', 'file', 'manual'].forEach(function(t) {
     var el = document.getElementById('pt-' + t);
     if (el) el.style.display = (t === name) ? '' : 'none';
   });
+  if (name === 'manual') { _manualSteps = ['']; _manualRecipes = []; _refreshManualSteps(); _refreshManualRecipe(); }
 }
 
 function protoFilter() {
   var q = (document.getElementById('proto-search')?.value || '').toLowerCase();
-  document.querySelectorAll('.protocol-card').forEach(function(c) {
-    c.style.display = (!q || c.textContent.toLowerCase().includes(q)) ? '' : 'none';
-  });
+  document.querySelectorAll('.protocol-card').forEach(function(c) { c.style.display = (!q || c.textContent.toLowerCase().includes(q)) ? '' : 'none'; });
 }
 
 function _protoCard(p) {
   var tags = JSON.parse(p.tags || '[]');
-  var steps = [];
-  var isStructured = false;
+  var steps = [], isStructured = false;
   try {
     var parsed = JSON.parse(p.steps || '[]');
-    if (Array.isArray(parsed) && parsed.length && parsed[0].text) { steps = parsed; isStructured = true; }
+    if (Array.isArray(parsed) && parsed.length && typeof parsed[0].text !== 'undefined') { steps = parsed; isStructured = true; }
   } catch(e) {}
 
   var stepsHtml = '';
-  if (!p.steps) {
-    stepsHtml = '<div style="color:#8a7f72;font-size:13px;font-style:italic">No steps yet — click &#10227; to extract.</div>';
+  if (!p.steps || p.steps === '[]') {
+    stepsHtml = '<div style="color:#8a7f72;font-size:13px;font-style:italic">No steps yet — click Extract steps to pull from source.</div>';
   } else if (isStructured) {
-    stepsHtml = '<ol class="steps-list">' + steps.map(function(s) { return '<li>' + esc(s.text) + '</li>'; }).join('') + '</ol>';
+    stepsHtml = '<ol class="steps-list">' + steps.map(function(s) { return '<li>' + _renderStepText(s.text) + '</li>'; }).join('') + '</ol>';
   } else {
     stepsHtml = '<div class="steps-text">' + esc(p.steps) + '</div>';
   }
 
   var recipe = _parseRecipe(p.recipe);
-  // initialise state so edits work immediately
   _recipeState[p.id] = JSON.parse(JSON.stringify(recipe));
 
   return '<div class="protocol-card" id="pc-' + p.id + '">' +
@@ -1398,140 +1698,285 @@ function _protoCard(p) {
       '<div style="flex:1">' +
         '<div class="protocol-title">' + esc(p.title) + '</div>' +
         (p.url ? '<div class="protocol-url">' + esc(p.url) + '</div>' : '') +
+        (p.source_type === 'manual' ? '<div style="font-size:11px;color:#8a7f72">manually entered</div>' : '') +
         (tags.length ? '<div class="tags">' + tags.map(function(t) { return '<span class="tag">' + esc(t) + '</span>'; }).join('') + '</div>' : '') +
       '</div>' +
-      '<div class="entry-actions" style="flex-shrink:0">' +
-        '<button class="btn" style="color:#5b7a5e" title="Run protocol" onclick="event.stopPropagation();protoOpenRun(' + p.id + ')">&#9654; Run</button>' +
-        '<button class="btn" title="Re-extract steps" onclick="event.stopPropagation();protoReExtract(' + p.id + ')">&#10227;</button>' +
+      '<div class="proto-card-actions">' +
+        '<button class="btn" style="color:#5b7a5e" onclick="event.stopPropagation();protoOpenRun(' + p.id + ')">&#9654; Run</button>' +
+        '<button class="btn" onclick="event.stopPropagation();protoEdit(' + p.id + ')">&#9998; Edit</button>' +
+        (p.source_type !== 'manual' ? '<button class="btn" style="color:#5b7a5e" onclick="event.stopPropagation();protoReExtract(' + p.id + ')">&#10227; Extract steps</button>' : '') +
         (p.url ? '<a class="btn" href="' + esc(p.url) + '" target="_blank" onclick="event.stopPropagation()">&#8599;</a>' : '') +
-        '<button class="btn" style="color:var(--red,#c0392b)" onclick="event.stopPropagation();protoDelete(' + p.id + ')">&#215;</button>' +
+        '<button class="btn" style="color:#c0392b" onclick="event.stopPropagation();protoDelete(' + p.id + ')">&#128465; Delete</button>' +
       '</div>' +
     '</div>' +
     '<div class="protocol-body" id="pb-' + p.id + '">' +
       stepsHtml +
-
-      // ── recipe section ──
       '<div class="recipe-section">' +
-        '<div class="recipe-section-head">' +
-          '<span>Reaction Recipe</span>' +
+        '<div class="recipe-section-head"><span>Reaction Recipe</span>' +
           '<div class="recipe-edit-actions" id="recipe-actions-' + p.id + '">' +
             '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + p.id + ')">Edit</button>' +
           '</div>' +
         '</div>' +
-        '<div id="recipe-body-' + p.id + '">' + _recipeReadHTML(recipe) + '</div>' +
+        '<div id="recipe-body-' + p.id + '">' + _recipeDisplayHTML(p.recipe) + '</div>' +
       '</div>' +
-
+      '<div class="run-history-section">' +
+        '<div class="run-history-head">Run History</div>' +
+        '<div id="run-history-' + p.id + '"><div style="color:#8a7f72;font-size:13px;font-style:italic">Loading...</div></div>' +
+      '</div>' +
       '<div class="field" style="margin-top:14px">' +
         '<label>Notes / modifications</label>' +
         '<textarea id="pn-' + p.id + '" placeholder="Your modifications, tips, observations...">' + esc(p.notes) + '</textarea>' +
       '</div>' +
-      '<div class="save-row">' +
-        '<button class="btn primary" onclick="event.stopPropagation();protoSave(' + p.id + ')">Save notes</button>' +
-      '</div>' +
+      '<div class="save-row"><button class="btn primary" onclick="event.stopPropagation();protoSave(' + p.id + ')">Save notes</button></div>' +
     '</div>' +
   '</div>';
 }
 
-function protoToggle(id) { document.getElementById('pc-' + id)?.classList.toggle('open'); }
+function protoToggle(id) {
+  var card = document.getElementById('pc-' + id);
+  if (!card) return;
+  card.classList.toggle('open');
+  // load run history when card opens
+  if (card.classList.contains('open')) protoLoadRunHistory(id);
+}
+
+async function protoLoadRunHistory(pid) {
+  var container = document.getElementById('run-history-' + pid); if (!container) return;
+  try {
+    var data = await api('GET', '/api/protocols/' + pid + '/runs');
+    var runs = data.runs || [];
+    if (!runs.length) {
+      container.innerHTML = '<div style="color:#8a7f72;font-size:13px;font-style:italic">No runs recorded yet.</div>';
+    } else {
+      container.innerHTML = runs.map(_runHistoryRowHTML).join('');
+    }
+  } catch(e) {
+    container.innerHTML = '<div style="color:#8a7f72;font-size:13px;font-style:italic">Could not load run history.</div>';
+  }
+}
 
 // ── recipe editing ─────────────────────────────────────────────────────────────
 function protoRecipeEdit(pid) {
-  var bodyEl    = document.getElementById('recipe-body-' + pid);
-  var actionsEl = document.getElementById('recipe-actions-' + pid);
-  if (!bodyEl) return;
   var recipe = _recipeState[pid] || JSON.parse(JSON.stringify(DEFAULT_RECIPE));
   _recipeState[pid] = recipe;
-  bodyEl.innerHTML = _recipeEditHTML(pid, recipe);
-  actionsEl.innerHTML =
+  document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, recipe);
+  document.getElementById('recipe-actions-' + pid).innerHTML =
     '<button class="btn primary" onclick="event.stopPropagation();protoRecipeSave(' + pid + ')">Save recipe</button>' +
     '<button class="btn" onclick="event.stopPropagation();protoRecipeCancel(' + pid + ')">Cancel</button>';
 }
 
 function protoRecipeCancel(pid) {
-  var p = (S.protocols || []).find(function(x) { return x.id === pid; });
-  if (!p) return;
+  var p = (S.protocols || []).find(function(x) { return x.id === pid; }); if (!p) return;
   var recipe = _parseRecipe(p.recipe);
   _recipeState[pid] = JSON.parse(JSON.stringify(recipe));
   document.getElementById('recipe-body-' + pid).innerHTML = _recipeReadHTML(recipe);
-  document.getElementById('recipe-actions-' + pid).innerHTML =
-    '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + pid + ')">Edit</button>';
+  document.getElementById('recipe-actions-' + pid).innerHTML = '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + pid + ')">Edit</button>';
 }
 
 async function protoRecipeSave(pid) {
-  var recipe = _recipeState[pid];
-  if (!recipe) return;
+  var recipe = _recipeState[pid]; if (!recipe) return;
   await api('PUT', '/api/protocols/' + pid, { recipe: JSON.stringify(recipe) });
-  // update local cache
   var p = (S.protocols || []).find(function(x) { return x.id === pid; });
   if (p) p.recipe = JSON.stringify(recipe);
   document.getElementById('recipe-body-' + pid).innerHTML = _recipeReadHTML(recipe);
-  document.getElementById('recipe-actions-' + pid).innerHTML =
-    '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + pid + ')">Edit</button>';
-  toast('Recipe saved ✓');
+  document.getElementById('recipe-actions-' + pid).innerHTML = '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + pid + ')">Edit</button>';
+  toast('Recipe saved');
 }
 
-function protoRecipeCell(pid, ri, ci, value) {
-  var r = _recipeState[pid];
-  if (!r || !r.rows[ri]) return;
-  r.rows[ri][ci] = value;
-}
+function protoRecipeCell(pid, ri, ci, value) { if (_recipeState[pid] && _recipeState[pid].rows[ri]) _recipeState[pid].rows[ri][ci] = value; }
 
 function protoAddRow(pid) {
-  var r = _recipeState[pid];
-  if (!r) return;
+  var r = _recipeState[pid]; if (!r) return;
   r.rows.push(r.columns.map(function() { return ''; }));
   var ri = r.rows.length - 1;
-  var tbody = document.querySelector('#rtbl-' + pid + ' tbody');
-  if (!tbody) return;
-  var tr = document.createElement('tr');
-  tr.id = 'rrow-' + pid + '-' + ri;
+  var tbody = document.querySelector('#rtbl-' + pid + ' tbody'); if (!tbody) return;
+  var tr = document.createElement('tr'); tr.id = 'rrow-' + pid + '-' + ri;
   var inner = '';
-  r.columns.forEach(function(_, ci) {
-    inner += '<td><input type="text" value="" oninput="protoRecipeCell(' + pid + ',' + ri + ',' + ci + ',this.value)"/></td>';
+  r.columns.forEach(function(_, ci) { inner += '<td><input type="text" value="" oninput="protoRecipeCell(' + pid + ',' + ri + ',' + ci + ',this.value)"/></td>'; });
+  inner += '<td><button class="del-row" onclick="protoDelRow(' + pid + ',' + ri + ')">&#215;</button></td>';
+  tr.innerHTML = inner; tbody.appendChild(tr);
+}
+
+function protoDelRow(pid, ri) { var r = _recipeState[pid]; if (!r) return; r.rows.splice(ri, 1); document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r); }
+function protoAddCol(pid) { var name = prompt('Column name:'); if (!name) return; var r = _recipeState[pid]; if (!r) return; r.columns.push(name); r.rows.forEach(function(row) { row.push(''); }); document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r); }
+function protoDelCol(pid, ci) { var r = _recipeState[pid]; if (!r || r.columns.length <= 1) { toast('Need at least one column', true); return; } r.columns.splice(ci, 1); r.rows.forEach(function(row) { row.splice(ci, 1); }); document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r); }
+
+// ── manual entry helpers ──────────────────────────────────────────────────────
+function _manualTableHTML(ti) {
+  var t = _manualRecipes[ti];
+  var html = '<div class="manual-table-wrap" id="mtw-' + ti + '" style="margin-bottom:14px;border:1px solid #d5cec0;border-radius:6px;overflow:hidden">';
+  html += '<div style="display:flex;align-items:center;background:#f0ebe3;padding:6px 10px;gap:8px">';
+  html += '<input type="text" value="' + esc(t.name) + '" placeholder="Table name (e.g. PCR Mix)" spellcheck="false" ' +
+    'style="flex:1;font-size:12px;font-weight:600;border:none;background:transparent;color:#4a4139;outline:none" ' +
+    'oninput="manualTableRename(' + ti + ',this.value)"/>';
+  html += '<button class="btn" style="font-size:11px;color:#c0392b" onclick="manualDelTable(' + ti + ')">&#215; Remove table</button>';
+  html += '</div>';
+  html += '<div style="padding:8px 10px">';
+  if (!t.rows.length) {
+    html += '<div style="color:#8a7f72;font-size:13px;font-style:italic;margin-bottom:6px">No components yet</div>';
+  } else {
+    html += '<div style="overflow-x:auto"><table class="recipe-table" style="margin-bottom:6px"><thead><tr>';
+    t.columns.forEach(function(c, ci) {
+      html += '<th>' + esc(c) + '<button class="del-col" onclick="manualTableDelCol(' + ti + ',' + ci + ')">&#215;</button></th>';
+    });
+    html += '<th style="width:28px"></th></tr></thead><tbody>';
+    t.rows.forEach(function(row, ri) {
+      html += '<tr>';
+      t.columns.forEach(function(col, ci) {
+        if (_isUnitCol(col)) { html += _manualUnitCellHTMLT(ti, ri, ci, row[ci] || ''); }
+        else { html += '<td><input type="text" value="' + esc(row[ci] || '') + '" oninput="manualTableCell(' + ti + ',' + ri + ',' + ci + ',this.value)"/></td>'; }
+      });
+      html += '<td><button class="del-row" onclick="manualTableDelRow(' + ti + ',' + ri + ')">&#215;</button></td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+  html += '<div class="recipe-add-row">' +
+    '<button class="btn" onclick="manualTableAddRow(' + ti + ')">+ Row</button>' +
+    '<button class="btn" onclick="manualTableAddCol(' + ti + ')">+ Column</button>' +
+  '</div></div></div>';
+  return html;
+}
+
+function _manualUnitCellHTMLT(ti, ri, ci, val) {
+  var p = _parseAmountUnit(val);
+  var unitOpts = _UNITS.map(function(u) { return '<option value="' + u + '"' + (p.unit === u ? ' selected' : '') + '>' + u + '</option>'; }).join('');
+  return '<td style="padding:0"><div style="display:flex;align-items:center">' +
+    '<input type="number" value="' + esc(p.num) + '" min="0" step="any" placeholder="0" ' +
+      'style="width:68px;border:none;background:transparent;padding:6px 4px 6px 8px;font-size:13px;font-family:inherit;color:#4a4139;outline:none" ' +
+      'oninput="manualTableCellUnit(' + ti + ',' + ri + ',' + ci + ',this.value,this.nextElementSibling.value)"/>' +
+    '<select style="border:none;background:transparent;font-size:12px;color:#8a7f72;font-family:inherit;padding:0 4px 0 0;cursor:pointer;outline:none" ' +
+      'onchange="manualTableCellUnit(' + ti + ',' + ri + ',' + ci + ',this.previousElementSibling.value,this.value)">' +
+      '<option value="">-</option>' + unitOpts +
+    '</select></div></td>';
+}
+
+function _refreshManualRecipe() {
+  var el = document.getElementById('manual-recipe-body'); if (!el) return;
+  if (!_manualRecipes.length) { el.innerHTML = '<div style="color:#8a7f72;font-size:13px;font-style:italic">No tables yet — click + Add table above.</div>'; return; }
+  el.innerHTML = _manualRecipes.map(function(_, ti) { return _manualTableHTML(ti); }).join('');
+}
+
+function manualAddTable() {
+  _manualRecipes.push({ name: 'Table ' + (_manualRecipes.length + 1), columns: ['Component', 'Stock conc.', 'Volume (uL)', 'Final conc.'], rows: [] });
+  _refreshManualRecipe();
+}
+function manualDelTable(ti) { _manualRecipes.splice(ti, 1); _refreshManualRecipe(); }
+function manualTableRename(ti, name) { if (_manualRecipes[ti]) _manualRecipes[ti].name = name; }
+function manualTableCell(ti, ri, ci, value) { if (_manualRecipes[ti] && _manualRecipes[ti].rows[ri]) _manualRecipes[ti].rows[ri][ci] = value; }
+function manualTableCellUnit(ti, ri, ci, num, unit) { var v = (num || '').trim() + (unit ? ' ' + unit : ''); if (_manualRecipes[ti] && _manualRecipes[ti].rows[ri]) _manualRecipes[ti].rows[ri][ci] = v.trim(); }
+function manualTableAddRow(ti) { var t = _manualRecipes[ti]; if (!t) return; t.rows.push(t.columns.map(function() { return ''; })); _refreshManualRecipe(); }
+function manualTableDelRow(ti, ri) { var t = _manualRecipes[ti]; if (!t) return; t.rows.splice(ri, 1); _refreshManualRecipe(); }
+function manualTableAddCol(ti) { var name = prompt('Column name:'); if (!name) return; var t = _manualRecipes[ti]; if (!t) return; t.columns.push(name); t.rows.forEach(function(r) { r.push(''); }); _refreshManualRecipe(); }
+function manualTableDelCol(ti, ci) { var t = _manualRecipes[ti]; if (!t || t.columns.length <= 1) { toast('Need at least one column', true); return; } t.columns.splice(ci, 1); t.rows.forEach(function(r) { r.splice(ci, 1); }); _refreshManualRecipe(); }
+
+// keep old single-table functions as no-ops for compatibility
+function _manualRecipeState() { return _manualRecipes[0] || JSON.parse(JSON.stringify(DEFAULT_RECIPE)); }
+function manualRecipeCell(ri, ci, value) { manualTableCell(0, ri, ci, value); }
+function manualRecipeCellUnit(ri, ci, num, unit) { manualTableCellUnit(0, ri, ci, num, unit); }
+function manualRecipeAddRow() { manualTableAddRow(0); }
+function manualRecipeDelRow(ri) { manualTableDelRow(0, ri); }
+function manualRecipeAddCol() { manualTableAddCol(0); }
+function manualRecipeDelCol(ci) { manualTableDelCol(0, ci); }
+
+function _manualStepRowHTML(idx, value) {
+  return '<div class="manual-step-row" id="msr-' + idx + '">' +
+    '<span class="manual-step-num">' + (idx + 1) + '.</span>' +
+    '<input type="text" value="' + esc(value || '') + '" placeholder="Describe this step..." spellcheck="false" ' +
+      'data-stepidx="' + idx + '" ' +
+      'oninput="manualStepUpdate(' + idx + ',this.value)"/>' +
+    '<button class="manual-del-step" onclick="manualDelStep(' + idx + ')">&#215;</button>' +
+  '</div>';
+}
+
+function _manualRecipeHTML() {
+  var r = _manualRecipeState();
+  if (!r.rows.length) {
+    return '<div style="display:flex;gap:6px;align-items:center">' +
+      '<span style="color:#8a7f72;font-size:13px;font-style:italic">No components yet</span>' +
+      '<button class="btn" onclick="manualRecipeAddRow()">+ Add component</button>' +
+      '<button class="btn" onclick="manualRecipeAddCol()">+ Column</button>' +
+    '</div>';
+  }
+  var html = '<div style="overflow-x:auto"><table class="recipe-table" style="margin-bottom:6px"><thead><tr>';
+  r.columns.forEach(function(c, ci) { html += '<th>' + esc(c) + '<button class="del-col" onclick="manualRecipeDelCol(' + ci + ')">&#215;</button></th>'; });
+  html += '<th style="width:28px"></th></tr></thead><tbody>';
+  r.rows.forEach(function(row, ri) {
+    html += '<tr>';
+    r.columns.forEach(function(col, ci) {
+      if (_isUnitCol(col)) { html += _manualUnitCellHTML(ri, ci, row[ci] || ''); }
+      else { html += '<td><input type="text" value="' + esc(row[ci] || '') + '" oninput="manualRecipeCell(' + ri + ',' + ci + ',this.value)"/></td>'; }
+    });
+    html += '<td><button class="del-row" onclick="manualRecipeDelRow(' + ri + ')">&#215;</button></td></tr>';
   });
-  inner += '<td><button class="del-row" onclick="protoDelRow(' + pid + ',' + ri + ')" title="Remove row">&#215;</button></td>';
-  tr.innerHTML = inner;
-  tbody.appendChild(tr);
+  html += '</tbody></table></div>';
+  html += '<div class="recipe-add-row"><button class="btn" onclick="manualRecipeAddRow()">+ Row</button><button class="btn" onclick="manualRecipeAddCol()">+ Column</button></div>';
+  return html;
 }
 
-function protoDelRow(pid, ri) {
-  var r = _recipeState[pid];
-  if (!r) return;
-  r.rows.splice(ri, 1);
-  document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r);
+function _attachManualStepListeners() {
+  var list = document.getElementById('manual-steps-list'); if (!list) return;
+  list.querySelectorAll('input[data-stepidx]').forEach(function(inp) {
+    inp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); manualAddStep(); }
+    });
+  });
 }
 
-function protoAddCol(pid) {
-  var name = prompt('Column name:');
-  if (!name) return;
-  var r = _recipeState[pid];
-  if (!r) return;
-  r.columns.push(name);
-  r.rows.forEach(function(row) { row.push(''); });
-  document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r);
+function _refreshManualSteps() {
+  var list = document.getElementById('manual-steps-list'); if (!list) return;
+  list.innerHTML = _manualSteps.map(function(v, i) { return _manualStepRowHTML(i, v); }).join('');
+  _attachManualStepListeners();
+  var last = document.querySelector('#msr-' + (_manualSteps.length - 1) + ' input');
+  if (last) last.focus();
 }
 
-function protoDelCol(pid, ci) {
-  var r = _recipeState[pid];
-  if (!r || r.columns.length <= 1) { toast('Need at least one column', true); return; }
-  r.columns.splice(ci, 1);
-  r.rows.forEach(function(row) { row.splice(ci, 1); });
-  document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r);
+
+function manualStepUpdate(idx, value) { _manualSteps[idx] = value; }
+function manualAddStep() {
+  _manualSteps.push('');
+  var list = document.getElementById('manual-steps-list'); if (!list) return;
+  var idx = _manualSteps.length - 1;
+  var wrap = document.createElement('div'); wrap.innerHTML = _manualStepRowHTML(idx, '');
+  list.appendChild(wrap.firstChild);
+  var inp = document.querySelector('#msr-' + idx + ' input');
+  if (inp) {
+    inp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); manualAddStep(); }
+    });
+    inp.focus();
+  }
+}
+function manualDelStep(idx) { if (_manualSteps.length <= 1) { _manualSteps[0] = ''; _refreshManualSteps(); return; } _manualSteps.splice(idx, 1); _refreshManualSteps(); }
+// single-table compat shims now in multi-table section above
+
+async function protoAddManual() {
+  var title = (document.getElementById('proto-title-manual')?.value || '').trim();
+  if (!title) { toast('Add a title', true); return; }
+  var steps = _manualSteps.filter(function(s) { return s.trim(); });
+  if (!steps.length) { toast('Add at least one step', true); return; }
+  var recipe = _manualRecipes.length ? JSON.stringify(_manualRecipes) : null;
+  var btn = document.querySelector('#pt-manual .btn.primary');
+  if (btn) { btn.textContent = 'Saving...'; btn.disabled = true; }
+  try {
+    await api('POST', '/api/protocols/from-manual', { title: title, steps: steps, recipe: recipe, tags: [] });
+    _manualSteps = ['']; _manualRecipes = [];
+    await loadView(); toast('Protocol saved');
+  } catch(e) { toast('Failed: ' + e.message, true); }
+  finally { if (btn) { btn.textContent = 'Save Protocol'; btn.disabled = false; } }
 }
 
 // ── import actions ─────────────────────────────────────────────────────────────
 async function protoAddUrl() {
-  var url   = document.getElementById('proto-url')?.value.trim();
+  var url = document.getElementById('proto-url')?.value.trim();
   var title = document.getElementById('proto-title-url')?.value.trim();
-  if (!url)   { toast('Paste a URL first', true); return; }
+  if (!url) { toast('Paste a URL first', true); return; }
   if (!title) { toast('Add a title', true); return; }
   var btn = document.querySelector('#pt-url .btn.primary');
   if (btn) { btn.textContent = 'Fetching...'; btn.disabled = true; }
   try {
-    await api('POST', '/api/protocols', { title, url, tags: [] });
-    document.getElementById('proto-url').value = '';
-    document.getElementById('proto-title-url').value = '';
-    await loadView(); toast('Protocol saved ✓');
+    await api('POST', '/api/protocols', { title: title, url: url, tags: [] });
+    document.getElementById('proto-url').value = ''; document.getElementById('proto-title-url').value = '';
+    await loadView(); toast('Protocol saved');
   } catch(e) { toast('Failed: ' + e.message, true); }
   finally { if (btn) { btn.textContent = 'Fetch + Extract'; btn.disabled = false; } }
 }
@@ -1544,68 +1989,293 @@ async function protoAddPaste() {
   var btn = document.querySelector('#pt-paste .btn.primary');
   if (btn) { btn.textContent = 'Extracting...'; btn.disabled = true; }
   try {
-    await api('POST', '/api/protocols/from-paste', { title, text, tags: [] });
-    document.getElementById('proto-title-paste').value = '';
-    document.getElementById('proto-paste-text').value = '';
-    await loadView(); toast('Protocol saved ✓');
+    await api('POST', '/api/protocols/from-paste', { title: title, text: text, tags: [] });
+    document.getElementById('proto-title-paste').value = ''; document.getElementById('proto-paste-text').value = '';
+    await loadView(); toast('Protocol saved');
   } catch(e) { toast('Failed: ' + e.message, true); }
   finally { if (btn) { btn.textContent = 'Extract Steps'; btn.disabled = false; } }
 }
 
 async function protoAddFile() {
-  var title     = document.getElementById('proto-title-file')?.value.trim();
+  var title = document.getElementById('proto-title-file')?.value.trim();
   var fileInput = document.getElementById('proto-file');
-  var file      = fileInput?.files[0];
+  var file = fileInput?.files[0];
   if (!title) { toast('Add a title', true); return; }
   if (!file)  { toast('Choose a file first', true); return; }
   var btn = document.querySelector('#pt-file .btn.primary');
   if (btn) { btn.textContent = 'Uploading...'; btn.disabled = true; }
   try {
-    var fd = new FormData();
-    fd.append('title', title); fd.append('file', file); fd.append('tags', '[]');
+    var fd = new FormData(); fd.append('title', title); fd.append('file', file); fd.append('tags', '[]');
     var resp = await fetch('/api/protocols/from-file', { method: 'POST', body: fd });
     if (!resp.ok) throw new Error(await resp.text());
-    document.getElementById('proto-title-file').value = '';
-    fileInput.value = '';
-    await loadView(); toast('Protocol saved ✓');
+    document.getElementById('proto-title-file').value = ''; fileInput.value = '';
+    await loadView(); toast('Protocol saved');
   } catch(e) { toast('Failed: ' + e.message, true); }
   finally { if (btn) { btn.textContent = 'Upload + Extract'; btn.disabled = false; } }
 }
 
 async function protoReExtract(id) {
-  toast('Re-extracting steps...');
-  try { await api('POST', '/api/protocols/' + id + '/re-extract'); await loadView(); toast('Steps updated ✓'); }
+  toast('Re-extracting steps \u2014 waking 3090...');
+  try { await api('POST', '/api/protocols/' + id + '/re-extract'); await loadView(); toast('Steps updated'); }
   catch(e) { toast('Re-extract failed: ' + e.message, true); }
 }
 
 async function protoSave(id) {
   var notes = document.getElementById('pn-' + id)?.value || '';
-  await api('PUT', '/api/protocols/' + id, { notes });
-  toast('Saved ✓');
+  await api('PUT', '/api/protocols/' + id, { notes: notes }); toast('Saved');
 }
 
 async function protoDelete(id) {
   if (!confirm('Delete this protocol?')) return;
-  await api('DELETE', '/api/protocols/' + id);
-  await loadView(); toast('Deleted');
+  await api('DELETE', '/api/protocols/' + id); await loadView(); toast('Deleted');
 }
 
-// ── run modal (kept for openProtocolPicker global compat) ─────────────────────
 function protoOpenRun(protocolId) {
-  var p = (S.protocols || []).find(function(x) { return x.id === protocolId; });
+  var p = (S.protocols || []).find(function(x) { return x.id === protocolId; }); if (!p) return;
+  var steps = [];
+  try { var parsed = JSON.parse(p.steps || '[]'); if (Array.isArray(parsed) && parsed.length && typeof parsed[0].text !== 'undefined') steps = parsed; } catch(e) {}
+  if (!steps.length) { toast('No structured steps yet \u2014 extract them first', true); return; }
+  if (typeof spLaunchRunDirect === 'function') spLaunchRunDirect(p, null);
+  else toast('Open the Scratch pad to run protocols', true);
+}
+
+
+// ── protocol link rendering ───────────────────────────────────────────────────
+function _renderStepText(text) {
+  // render [@Title](proto:ID) as clickable badges, escape everything else
+  var parts = text.split(/(\[@[^\]]+\]\(proto:\d+\))/g);
+  return parts.map(function(part) {
+    var m = part.match(/^\[@([^\]]+)\]\(proto:(\d+)\)$/);
+    if (m) {
+      return '<span class="proto-link-badge" onclick="protoJumpTo(' + m[2] + ')" title="Open ' + esc(m[1]) + '">&#8599; ' + esc(m[1]) + '</span>';
+    }
+    return esc(part);
+  }).join('');
+}
+
+function protoJumpTo(id) {
+  // open the card and scroll to it
+  var card = document.getElementById('pc-' + id);
+  if (!card) return;
+  if (!card.classList.contains('open')) protoToggle(id);
+  setTimeout(function() { card.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 100);
+}
+
+// ── insert protocol link into manual step ─────────────────────────────────────
+function manualLinkProtocol() {
+  var protos = (S.protocols || []);
+  if (!protos.length) { toast('No protocols to link to yet', true); return; }
+  // find which step input is focused, or use last
+  var focused = document.querySelector('#manual-steps-list input:focus');
+  var targetInput = focused || document.querySelector('#manual-steps-list input:last-of-type');
+  var targetIdx = targetInput ? parseInt((targetInput.closest('[id^=msr-]') || {}).id?.replace('msr-','') || '0') : 0;
+
+  // build a simple picker
+  var opts = protos.map(function(p) { return '<option value="' + p.id + '">' + esc(p.title) + '</option>'; }).join('');
+  var div = document.createElement('div');
+  div.id = 'proto-link-picker';
+  div.style.cssText = 'position:fixed;inset:0;background:rgba(60,52,42,.35);display:flex;align-items:center;justify-content:center;z-index:2000';
+  div.innerHTML = '<div style="background:#faf8f4;border:1px solid #d5cec0;border-radius:8px;padding:20px;min-width:320px;max-width:440px;width:100%">' +
+    '<div style="font-weight:600;font-size:14px;margin-bottom:10px">Link to protocol</div>' +
+    '<input type="text" id="plp-q" placeholder="Search..." spellcheck="false" style="width:100%;margin-bottom:8px" oninput="plpFilter()"/>' +
+    '<select id="plp-sel" size="6" style="width:100%;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-family:inherit;font-size:13px">' + opts + '</select>' +
+    '<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">' +
+      '<button class="btn" onclick="document.getElementById('proto-link-picker').remove()">Cancel</button>' +
+      '<button class="btn primary" onclick="plpInsert(' + targetIdx + ')">Insert link</button>' +
+    '</div></div>';
+  document.body.appendChild(div);
+  document.getElementById('plp-q')?.focus();
+}
+
+function plpFilter() {
+  var q = (document.getElementById('plp-q')?.value || '').toLowerCase();
+  document.querySelectorAll('#plp-sel option').forEach(function(o) { o.style.display = (!q || o.textContent.toLowerCase().includes(q)) ? '' : 'none'; });
+}
+
+function plpInsert(stepIdx) {
+  var sel = document.getElementById('plp-sel');
+  if (!sel || !sel.value) { toast('Select a protocol', true); return; }
+  var p = (S.protocols || []).find(function(x) { return x.id === parseInt(sel.value); });
   if (!p) return;
+  document.getElementById('proto-link-picker')?.remove();
+  var link = '[@' + p.title + '](proto:' + p.id + ')';
+  // append link to the target step
+  var inp = document.querySelector('#msr-' + stepIdx + ' input');
+  if (inp) {
+    var cur = inp.value;
+    inp.value = cur ? cur + ' ' + link : link;
+    manualStepUpdate(stepIdx, inp.value);
+  } else {
+    // add as new step
+    _manualSteps.push(link);
+    _refreshManualSteps();
+  }
+}
+
+// ── inline edit mode ──────────────────────────────────────────────────────────
+var _editState = {}; // pid -> {title, steps}
+
+function protoEdit(pid) {
+  var p = (S.protocols || []).find(function(x) { return x.id === pid; });
+  if (!p) return;
+  var card = document.getElementById('pc-' + pid);
+  if (!card) return;
+  if (!card.classList.contains('open')) protoToggle(pid);
+
   var steps = [];
   try {
     var parsed = JSON.parse(p.steps || '[]');
-    if (Array.isArray(parsed) && parsed.length && parsed[0].text) steps = parsed;
+    if (Array.isArray(parsed) && parsed.length && typeof parsed[0].text !== 'undefined') steps = parsed;
   } catch(e) {}
-  if (!steps.length) { toast('No structured steps yet — click &#10227; to extract first', true); return; }
-  // delegate to scratch runner
-  if (typeof spLaunchRunDirect === 'function') {
-    spLaunchRunDirect(p);
-  } else {
-    toast('Open the Scratch pad to run protocols', true);
+
+  _editState[pid] = { title: p.title, steps: steps.map(function(s) { return s.text; }) };
+
+  var body = document.getElementById('pb-' + pid); if (!body) return;
+
+  // replace title
+  var titleEl = card.querySelector('.protocol-title');
+  if (titleEl) titleEl.outerHTML = '<input id="pe-title-' + pid + '" type="text" value="' + esc(p.title) + '" ' +
+    'style="font-weight:600;font-size:14px;color:#4a4139;border:none;border-bottom:1px solid #5b7a5e;background:transparent;outline:none;width:100%;margin-bottom:4px" ' +
+    'oninput="_editState[' + pid + '].title=this.value"/>';
+
+  // replace steps
+  var stepsContainer = body.querySelector('ol.steps-list, div.steps-text');
+  if (!stepsContainer && !steps.length) {
+    // no steps area, insert before recipe section
+    var recipeSection = body.querySelector('.recipe-section');
+    var placeholder = document.createElement('div');
+    placeholder.id = 'pe-steps-' + pid;
+    body.insertBefore(placeholder, recipeSection);
   }
+
+  var stepsTarget = stepsContainer || document.getElementById('pe-steps-' + pid);
+  if (stepsTarget) {
+    var stepsHtml = '<div id="pe-steps-' + pid + '">';
+    (_editState[pid].steps.length ? _editState[pid].steps : ['']).forEach(function(text, i) {
+      stepsHtml += '<div class="proto-edit-step" id="pes-' + pid + '-' + i + '">' +
+        '<span style="font-size:12px;color:#8a7f72;min-width:20px;text-align:right">' + (i+1) + '.</span>' +
+        '<input type="text" value="' + esc(text) + '" spellcheck="false" ' +
+          'oninput="_editState[' + pid + '].steps[' + i + ']=this.value" ' +
+          'data-editpid="' + pid + '" data-editidx="' + i + '"/>' +
+        '<button class="link-btn" onclick="protoEditLinkStep(' + pid + ',' + i + ')">&#8599; Link</button>' +
+        '<button style="background:none;border:none;cursor:pointer;color:#c0b8b0;font-size:16px;padding:0 4px" onclick="protoEditDelStep(' + pid + ',' + i + ')">&#215;</button>' +
+      '</div>';
+    });
+    stepsHtml += '<div style="margin-top:6px;display:flex;gap:6px">' +
+      '<button class="btn" onclick="protoEditAddStep(' + pid + ',-1)">+ Step</button>' +
+      '<button class="btn" style="color:#5b7a5e" onclick="protoEditLinkStep(' + pid + ',-1)">&#8599; Link protocol</button>' +
+    '</div></div>';
+    stepsTarget.outerHTML = stepsHtml;
+    _attachEditStepListeners(pid);
+  }
+
+  // swap card action buttons
+  var actions = card.querySelector('.proto-card-actions');
+  if (actions) actions.innerHTML =
+    '<button class="btn primary" onclick="event.stopPropagation();protoSaveEdit(' + pid + ')">&#10003; Save</button>' +
+    '<button class="btn" onclick="event.stopPropagation();protoCancelEdit(' + pid + ')">Cancel</button>';
+}
+
+function protoEditAddStep(pid, afterIdx) {
+  var es = _editState[pid]; if (!es) return;
+  if (afterIdx < 0) es.steps.push('');
+  else es.steps.splice(afterIdx + 1, 0, '');
+  _refreshEditSteps(pid);
+  setTimeout(function() {
+    var idx = afterIdx < 0 ? es.steps.length - 1 : afterIdx + 1;
+    document.querySelector('#pes-' + pid + '-' + idx + ' input')?.focus();
+  }, 50);
+}
+
+function protoEditDelStep(pid, idx) {
+  var es = _editState[pid]; if (!es) return;
+  if (es.steps.length <= 1) { es.steps[0] = ''; _refreshEditSteps(pid); return; }
+  es.steps.splice(idx, 1);
+  _refreshEditSteps(pid);
+}
+
+function protoEditLinkStep(pid, afterIdx) {
+  var protos = (S.protocols || []).filter(function(x) { return x.id !== pid; });
+  if (!protos.length) { toast('No other protocols to link to', true); return; }
+  var opts = protos.map(function(p) { return '<option value="' + p.id + '">' + esc(p.title) + '</option>'; }).join('');
+  var div = document.createElement('div');
+  div.id = 'proto-link-picker';
+  div.style.cssText = 'position:fixed;inset:0;background:rgba(60,52,42,.35);display:flex;align-items:center;justify-content:center;z-index:2000';
+  div.innerHTML = '<div style="background:#faf8f4;border:1px solid #d5cec0;border-radius:8px;padding:20px;min-width:320px;max-width:440px;width:100%">' +
+    '<div style="font-weight:600;font-size:14px;margin-bottom:10px">Link to protocol</div>' +
+    '<input type="text" id="plp-q" placeholder="Search..." spellcheck="false" style="width:100%;margin-bottom:8px" oninput="plpFilter()"/>' +
+    '<select id="plp-sel" size="6" style="width:100%;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-family:inherit;font-size:13px">' + opts + '</select>' +
+    '<div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">' +
+      '<button class="btn" onclick="document.getElementById('proto-link-picker').remove()">Cancel</button>' +
+      '<button class="btn primary" onclick="plpEditInsert(' + pid + ',' + afterIdx + ')">Insert link</button>' +
+    '</div></div>';
+  document.body.appendChild(div);
+  document.getElementById('plp-q')?.focus();
+}
+
+function plpEditInsert(pid, afterIdx) {
+  var sel = document.getElementById('plp-sel');
+  if (!sel || !sel.value) { toast('Select a protocol', true); return; }
+  var p = (S.protocols || []).find(function(x) { return x.id === parseInt(sel.value); });
+  if (!p) return;
+  document.getElementById('proto-link-picker')?.remove();
+  var link = '[@' + p.title + '](proto:' + p.id + ')';
+  var es = _editState[pid]; if (!es) return;
+  if (afterIdx < 0) es.steps.push(link);
+  else es.steps.splice(afterIdx + 1, 0, link);
+  _refreshEditSteps(pid);
+}
+
+function _attachEditStepListeners(pid) {
+  var container = document.getElementById('pe-steps-' + pid); if (!container) return;
+  container.querySelectorAll('input[data-editpid]').forEach(function(inp) {
+    inp.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); protoEditAddStep(parseInt(inp.dataset.editpid), parseInt(inp.dataset.editidx)); }
+    });
+  });
+}
+
+function _refreshEditSteps(pid) {
+  var es = _editState[pid]; if (!es) return;
+  var container = document.getElementById('pe-steps-' + pid); if (!container) return;
+  var stepsHtml = '';
+  (es.steps.length ? es.steps : ['']).forEach(function(text, i) {
+    stepsHtml += '<div class="proto-edit-step" id="pes-' + pid + '-' + i + '">' +
+      '<span style="font-size:12px;color:#8a7f72;min-width:20px;text-align:right">' + (i+1) + '.</span>' +
+      '<input type="text" value="' + esc(text) + '" spellcheck="false" ' +
+        'oninput="_editState[' + pid + '].steps[' + i + ']=this.value" ' +
+        'data-editpid="' + pid + '" data-editidx="' + i + '"/>' +
+      '<button class="link-btn" onclick="protoEditLinkStep(' + pid + ',' + i + ')">&#8599; Link</button>' +
+      '<button style="background:none;border:none;cursor:pointer;color:#c0b8b0;font-size:16px;padding:0 4px" onclick="protoEditDelStep(' + pid + ',' + i + ')">&#215;</button>' +
+    '</div>';
+  });
+  stepsHtml += '<div style="margin-top:6px;display:flex;gap:6px">' +
+    '<button class="btn" onclick="protoEditAddStep(' + pid + ',-1)">+ Step</button>' +
+    '<button class="btn" style="color:#5b7a5e" onclick="protoEditLinkStep(' + pid + ',-1)">&#8599; Link protocol</button>' +
+  '</div>';
+  container.innerHTML = stepsHtml;
+  _attachEditStepListeners(pid);
+}
+
+async function protoSaveEdit(pid) {
+  var es = _editState[pid]; if (!es) return;
+  var steps = es.steps.filter(function(s) { return s.trim(); });
+  var stepsJson = JSON.stringify(steps.map(function(s) { return { text: s }; }));
+  var titleInput = document.getElementById('pe-title-' + pid);
+  var title = titleInput ? titleInput.value.trim() : es.title;
+  if (!title) { toast('Title cannot be empty', true); return; }
+  await api('PUT', '/api/protocols/' + pid, { title: title, steps: stepsJson });
+  // update local cache
+  var p = (S.protocols || []).find(function(x) { return x.id === pid; });
+  if (p) { p.title = title; p.steps = stepsJson; }
+  delete _editState[pid];
+  await loadView();
+  toast('Protocol updated');
+}
+
+async function protoCancelEdit(pid) {
+  delete _editState[pid];
+  await loadView();
 }
 
 registerView('protocols', renderProtocols);
@@ -2358,6 +3028,21 @@ async function renderPipeline(el) {
 
 registerView('pipeline', renderPipeline);
 
+window.plShowNew    = plShowNew;
+window.plHideNew    = plHideNew;
+window.plCreate     = plCreate;
+window.plOpen       = plOpen;
+window.plClose      = plClose;
+window.plDelPipeline= plDelPipeline;
+window.plSaveTitle  = plSaveTitle;
+window.plSelStep    = plSelStep;
+window.plAddStep    = plAddStep;
+window.plEditStep   = plEditStep;
+window.plCancelEdit = plCancelEdit;
+window.plSaveStep   = plSaveStep;
+window.plDelStep    = plDelStep;
+window.plTogConn    = plTogConn;
+
 })(); /* end IIFE */
 
 
@@ -2413,118 +3098,230 @@ async function submitNewEntry(){
 // ── SCRATCH PAD ───────────────────────────────────────────────────────────────
 
 var _scratchProtoRun = null;
+var _RUNS_KEY = 'lab_proto_runs'; // localStorage cache key
+var _dbSaveTimer = null;          // debounce timer for DB writes
+
+// ── run persistence: localStorage (fast) + DB (cross-machine) ────────────────
+
+function _getAllRunsLocal() {
+  try { return JSON.parse(localStorage.getItem(_RUNS_KEY) || '[]'); } catch(e) { return []; }
+}
+
+function _saveLocalOnly(run) {
+  if (!run || !run.runId) return;
+  var runs = _getAllRunsLocal();
+  var idx = -1; runs.forEach(function(r, i) { if (r.runId === run.runId) idx = i; });
+  if (idx >= 0) runs[idx] = run; else runs.push(run);
+  try { localStorage.setItem(_RUNS_KEY, JSON.stringify(runs)); } catch(e) {}
+}
+
+function _removeLocal(runId) {
+  try { localStorage.setItem(_RUNS_KEY, JSON.stringify(_getAllRunsLocal().filter(function(r) { return r.runId !== runId; }))); } catch(e) {}
+}
+
+function _getRunByIdLocal(runId) {
+  return _getAllRunsLocal().find(function(r) { return r.runId === runId; }) || null;
+}
+
+// save to localStorage immediately + debounced DB write 800ms later
+function _saveRun(run) {
+  if (!run || !run.runId) return;
+  _saveLocalOnly(run);
+  if (_dbSaveTimer) clearTimeout(_dbSaveTimer);
+  _dbSaveTimer = setTimeout(function() { _saveRunToDb(run); }, 800);
+}
+
+async function _saveRunToDb(run) {
+  try {
+    await api('PUT', '/api/active-runs/' + encodeURIComponent(run.runId), {
+      steps_json:   JSON.stringify(run.steps),
+      recipe_json:  JSON.stringify(run.recipe),
+      scaling:      run.scaling || false,
+      scale_factor: run.scaleFactor || 1.0
+    });
+  } catch(e) {
+    // record may not exist yet - create it
+    try {
+      await api('POST', '/api/active-runs', {
+        run_id:        run.runId,
+        protocol_id:   run.protocol.id,
+        protocol_json: JSON.stringify(run.protocol),
+        steps_json:    JSON.stringify(run.steps),
+        recipe_json:   JSON.stringify(run.recipe),
+        group_name:    run.group_name || '',
+        subgroup:      run.subgroup || '',
+        scaling:       run.scaling || false,
+        scale_factor:  run.scaleFactor || 1.0,
+        started_at:    run.startedAt
+      });
+    } catch(e2) {}
+  }
+}
+
+async function _removeRun(runId) {
+  _removeLocal(runId);
+  try { await api('DELETE', '/api/active-runs/' + encodeURIComponent(runId)); } catch(e) {}
+}
+
+// fetch from DB (source of truth), fall back to localStorage
+async function _getAllRuns() {
+  try {
+    var data = await api('GET', '/api/active-runs');
+    var dbRuns = (data.runs || []).map(function(r) {
+      return {
+        runId:       r.run_id,
+        protocol:    JSON.parse(r.protocol_json),
+        steps:       JSON.parse(r.steps_json || '[]'),
+        recipe:      JSON.parse(r.recipe_json || 'null') || _parseRecipeRun(null),
+        scaling:     !!r.scaling,
+        scaleFactor: r.scale_factor || 1.0,
+        group_name:  r.group_name || 'Protocols',
+        subgroup:    r.subgroup || '',
+        startedAt:   r.started_at
+      };
+    });
+    try { localStorage.setItem(_RUNS_KEY, JSON.stringify(dbRuns)); } catch(e) {}
+    return dbRuns;
+  } catch(e) {
+    return _getAllRunsLocal();
+  }
+}
 
 (function injectScratchProtoStyles() {
   if (document.getElementById('scratch-proto-styles')) return;
   var s = document.createElement('style');
   s.id = 'scratch-proto-styles';
-  s.textContent = `
-    .sp-picker{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:14px;margin-top:14px}
-    .sp-picker-row{display:flex;gap:8px;align-items:center}
-    .sp-picker-row input{flex:1}
-    .sp-picker select{width:100%;margin-top:8px;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-family:inherit;font-size:13px;padding:4px;color:#4a4139}
-    .sp-run-header{display:flex;align-items:flex-start;justify-content:space-between;padding-bottom:12px;border-bottom:1px solid #e8e2d8;margin-bottom:14px}
-    .sp-run-title{font-weight:700;font-size:15px;color:#4a4139}
-    .sp-run-meta{font-size:12px;color:#8a7f72;margin-top:2px}
-    .sp-run-group-badge{display:inline-block;font-size:11px;background:#e8f0e8;color:#5b7a5e;border:1px solid #c8d8c8;border-radius:3px;padding:1px 7px;margin-top:4px;font-weight:600}
-    .sp-progress{height:4px;background:#e8e2d8;border-radius:2px;margin-bottom:18px}
-    .sp-progress-fill{height:100%;background:#5b7a5e;border-radius:2px;transition:width .25s ease}
-    .sp-recipe-section{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:14px;margin-bottom:18px}
-    .sp-recipe-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-    .sp-recipe-label{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72}
-    .sp-scale-row{display:flex;align-items:center;gap:8px;font-size:13px;color:#4a4139}
-    .sp-scale-row input[type=checkbox]{accent-color:#5b7a5e;width:14px;height:14px}
-    .sp-scale-row input[type=number]{width:70px;padding:3px 6px;border:1px solid #d5cec0;border-radius:4px;font-size:13px;font-family:inherit}
-    .sp-recipe-wrap{overflow-x:auto}
-    .sp-recipe-table{border-collapse:collapse;font-size:13px;color:#4a4139;min-width:100%;background:#faf8f4;border-radius:6px;overflow:hidden}
-    .sp-recipe-table th{background:#e8e2d8;border:1px solid #d5cec0;padding:6px 10px;text-align:left;font-weight:600;font-size:12px;white-space:nowrap}
-    .sp-recipe-table td{border:1px solid #e8e2d8;padding:0}
-    .sp-recipe-table td input{width:100%;border:none;background:transparent;padding:6px 10px;font-size:13px;font-family:inherit;color:#4a4139;outline:none;min-width:70px}
-    .sp-recipe-table td input:focus{background:#fff8f0}
-    .sp-recipe-table td.vol-cell input{font-weight:600;color:#5b7a5e}
-    .sp-recipe-table td.vol-cell input[readonly]{color:#8a7f72;background:#f0f4f0}
-    .sp-recipe-add{margin-top:7px;display:flex;gap:6px}
-    .sp-step{border:1px solid #e8e2d8;border-radius:6px;padding:10px 12px;margin-bottom:7px;background:#fff;transition:background .15s,border-color .15s}
-    .sp-step.done{background:#f0f4f0;border-color:#c8d8c8}
-    .sp-step.has-dev{border-left:3px solid #c97b3c}
-    .sp-step-check{display:flex;gap:10px;align-items:flex-start;cursor:pointer}
-    .sp-step-check input[type=checkbox]{margin-top:3px;flex-shrink:0;accent-color:#5b7a5e;width:15px;height:15px}
-    .sp-step-text{font-size:13px;color:#4a4139;line-height:1.55;flex:1}
-    .sp-step.done .sp-step-text{color:#8a7f72}
-    .sp-dev-btn{background:none;border:none;font-size:11px;color:#8a7f72;cursor:pointer;padding:4px 0 0 25px;text-decoration:underline dotted;display:block}
-    .sp-dev-btn:hover{color:#4a4139}
-    .sp-dev-note{display:none;margin-top:7px;padding-left:25px}
-    .sp-dev-note.open{display:block}
-    .sp-dev-note textarea{width:100%;font-size:12px;font-family:inherit;border:1px solid #d5cec0;border-radius:4px;padding:6px 8px;background:#fdf6ee;color:#4a4139;resize:vertical;min-height:44px}
-    .sp-dev-note textarea::placeholder{color:#b0a898}
-    .sp-summary{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:16px;margin-top:18px}
-    .sp-summary-head{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px}
-    .sp-summary-list{margin:0 0 10px 16px;padding:0;font-size:13px;color:#4a4139;line-height:1.6}
-    .sp-summary-list li{margin-bottom:6px}
-    .sp-dev-orig{color:#8a7f72;font-size:12px}
-    .sp-dev-orig s{text-decoration:line-through}
-    .sp-dev-new{color:#b85c1a;font-size:12px;margin-top:1px}
-    .sp-summary-clean{font-size:13px;color:#5b7a5e;font-style:italic}
-    .sp-run-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
-  `;
+  s.textContent = [
+    '.sp-picker{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:14px;margin-top:14px}',
+    '.sp-picker-row{display:flex;gap:8px;align-items:center}',
+    '.sp-picker-row input{flex:1}',
+    '.sp-picker select{width:100%;margin-top:8px;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-family:inherit;font-size:13px;padding:4px;color:#4a4139}',
+    '.sp-run-header{display:flex;align-items:flex-start;justify-content:space-between;padding-bottom:12px;border-bottom:1px solid #e8e2d8;margin-bottom:14px}',
+    '.sp-run-title{font-weight:700;font-size:15px;color:#4a4139}',
+    '.sp-run-meta{font-size:12px;color:#8a7f72;margin-top:2px}',
+    '.sp-run-group-badge{display:inline-block;font-size:11px;background:#e8f0e8;color:#5b7a5e;border:1px solid #c8d8c8;border-radius:3px;padding:1px 7px;margin-top:4px;font-weight:600}',
+    '.sp-progress{height:4px;background:#e8e2d8;border-radius:2px;margin-bottom:18px}',
+    '.sp-progress-fill{height:100%;background:#5b7a5e;border-radius:2px;transition:width .25s ease}',
+    '.sp-recipe-section{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:14px;margin-bottom:18px}',
+    '.sp-recipe-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}',
+    '.sp-recipe-label{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72}',
+    '.sp-scale-row{display:flex;align-items:center;gap:8px;font-size:13px;color:#4a4139}',
+    '.sp-scale-row input[type=checkbox]{accent-color:#5b7a5e;width:14px;height:14px}',
+    '.sp-scale-row input[type=number]{width:70px;padding:3px 6px;border:1px solid #d5cec0;border-radius:4px;font-size:13px;font-family:inherit}',
+    '.sp-recipe-wrap{overflow-x:auto}',
+    '.sp-recipe-table{border-collapse:collapse;font-size:13px;color:#4a4139;min-width:100%;background:#faf8f4}',
+    '.sp-recipe-table th{background:#e8e2d8;border:1px solid #d5cec0;padding:6px 10px;text-align:left;font-weight:600;font-size:12px;white-space:nowrap}',
+    '.sp-recipe-table td{border:1px solid #e8e2d8;padding:0}',
+    '.sp-recipe-table td input{width:100%;border:none;background:transparent;padding:6px 10px;font-size:13px;font-family:inherit;color:#4a4139;outline:none;min-width:70px}',
+    '.sp-recipe-table td input:focus{background:#fff8f0}',
+    '.sp-recipe-table td.vol-cell input{font-weight:600;color:#5b7a5e}',
+    '.sp-recipe-table td.vol-cell input[readonly]{color:#8a7f72;background:#f0f4f0}',
+    '.sp-recipe-add{margin-top:7px;display:flex;gap:6px}',
+    '.sp-step{border:1px solid #e8e2d8;border-radius:6px;padding:10px 12px;margin-bottom:7px;background:#fff;transition:background .15s,border-color .15s}',
+    '.sp-step.done{background:#f0f4f0;border-color:#c8d8c8}',
+    '.sp-step.has-dev{border-left:3px solid #c97b3c}',
+    '.sp-step-check{display:flex;gap:10px;align-items:flex-start;cursor:pointer}',
+    '.sp-step-check input[type=checkbox]{margin-top:3px;flex-shrink:0;accent-color:#5b7a5e;width:15px;height:15px}',
+    '.sp-step-text{font-size:13px;color:#4a4139;line-height:1.55;flex:1}',
+    '.sp-step.done .sp-step-text{color:#8a7f72}',
+    '.sp-dev-btn{background:none;border:none;font-size:11px;color:#8a7f72;cursor:pointer;padding:4px 0 0 25px;text-decoration:underline dotted;display:block}',
+    '.sp-dev-btn:hover{color:#4a4139}',
+    '.sp-dev-note{display:none;margin-top:7px;padding-left:25px}',
+    '.sp-dev-note.open{display:block}',
+    '.sp-dev-note textarea{width:100%;font-size:12px;font-family:inherit;border:1px solid #d5cec0;border-radius:4px;padding:6px 8px;background:#fdf6ee;color:#4a4139;resize:vertical;min-height:44px}',
+    '.sp-dev-note textarea::placeholder{color:#b0a898}',
+    '.sp-summary{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:16px;margin-top:18px}',
+    '.sp-summary-head{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px}',
+    '.sp-summary-list{margin:0 0 10px 16px;padding:0;font-size:13px;color:#4a4139;line-height:1.6}',
+    '.sp-summary-list li{margin-bottom:6px}',
+    '.sp-dev-orig{color:#8a7f72;font-size:12px}',
+    '.sp-dev-orig s{text-decoration:line-through}',
+    '.sp-dev-new{color:#b85c1a;font-size:12px;margin-top:1px}',
+    '.sp-summary-clean{font-size:13px;color:#5b7a5e;font-style:italic}',
+    '.sp-run-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}'
+  ].join('');
   document.head.appendChild(s);
 })();
 
 // ── recipe helpers ────────────────────────────────────────────────────────────
-var _DEFAULT_RECIPE = { columns: ['Component', 'Stock conc.', 'Volume (µL)', 'Final conc.'], rows: [] };
+var _DEFAULT_RECIPE = { columns: ['Component', 'Stock conc.', 'Volume (uL)', 'Final conc.'], rows: [] };
 
 function _parseRecipeRun(raw) {
   if (!raw) return JSON.parse(JSON.stringify(_DEFAULT_RECIPE));
-  try { var r = JSON.parse(raw); if (r && Array.isArray(r.columns) && Array.isArray(r.rows)) return r; } catch(e) {}
+  try {
+    var r = JSON.parse(raw);
+    if (Array.isArray(r) && r.length && r[0].columns) return r[0];
+    if (r && Array.isArray(r.columns) && Array.isArray(r.rows)) return r;
+  } catch(e) {}
   return JSON.parse(JSON.stringify(_DEFAULT_RECIPE));
 }
 
+function _parseAllRecipesRun(raw) {
+  if (!raw) return null;
+  try {
+    var r = JSON.parse(raw);
+    if (Array.isArray(r) && r.length && r[0].columns) return r;
+  } catch(e) {}
+  return null;
+}
+
 function _volColIndex(columns) {
-  for (var i = 0; i < columns.length; i++) {
-    if (/vol|µl|ul/i.test(columns[i])) return i;
-  }
+  for (var i = 0; i < columns.length; i++) { if (/vol|µl|ul/i.test(columns[i])) return i; }
   return -1;
+}
+
+function _renderSingleTable(recipe, scaling, factor) {
+  var volCol = _volColIndex(recipe.columns);
+  if (!recipe.rows.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components defined.</div>';
+  var html = '<div class="sp-recipe-wrap"><table class="sp-recipe-table"><thead><tr>';
+  recipe.columns.forEach(function(c) { html += '<th>' + esc(c) + '</th>'; });
+  html += '</tr></thead><tbody>';
+  recipe.rows.forEach(function(row, ri) {
+    html += '<tr>';
+    recipe.columns.forEach(function(_, ci) {
+      var rawVal = row[ci] || '', isVol = (ci === volCol), displayVal = rawVal;
+      if (isVol && scaling && factor && rawVal) { var num = parseFloat(rawVal); if (!isNaN(num)) displayVal = (num * factor).toFixed(2).replace(/\.00$/, ''); }
+      var cc = isVol ? ' class="vol-cell"' : '';
+      if (isVol && scaling) {
+        html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" readonly/></td>';
+      } else {
+        html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" oninput="spRecipeCell(' + ri + ',' + ci + ',this.value)"/></td>';
+      }
+    });
+    html += '</tr>';
+  });
+  return html + '</tbody></table></div>';
 }
 
 function _renderRunRecipe() {
   var rs = _scratchProtoRun; if (!rs) return '';
-  var recipe = rs.recipe, scaling = rs.scaling, factor = rs.scaleFactor || 1, volCol = _volColIndex(recipe.columns);
+  var scaling = rs.scaling, factor = rs.scaleFactor || 1;
+  var tables = _parseAllRecipesRun(rs.protocol.recipe);
   var html = '<div class="sp-recipe-section"><div class="sp-recipe-head"><span class="sp-recipe-label">Reaction Recipe</span>';
   html += '<div class="sp-scale-row"><input type="checkbox" id="sp-scale-toggle"' + (scaling ? ' checked' : '') +
     ' onchange="spToggleScale(this.checked)"/> <label for="sp-scale-toggle" style="cursor:pointer">Scale</label>';
   if (scaling) html += '&nbsp;&times;&nbsp;<input type="number" id="sp-scale-factor" value="' + factor + '" min="0.01" step="0.1" style="width:65px" oninput="spUpdateScale(this.value)"/>';
   html += '</div></div>';
-  if (!recipe.rows.length) {
-    html += '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components defined — add rows or edit the template in Protocols.</div>';
-  } else {
-    html += '<div class="sp-recipe-wrap"><table class="sp-recipe-table"><thead><tr>';
-    recipe.columns.forEach(function(c) { html += '<th>' + esc(c) + '</th>'; });
-    html += '</tr></thead><tbody>';
-    recipe.rows.forEach(function(row, ri) {
-      html += '<tr>';
-      recipe.columns.forEach(function(_, ci) {
-        var rawVal = row[ci] || '', isVol = (ci === volCol), displayVal = rawVal;
-        if (isVol && scaling && factor && rawVal) { var num = parseFloat(rawVal); if (!isNaN(num)) displayVal = (num * factor).toFixed(2).replace(/\.00$/, ''); }
-        var cc = isVol ? ' class="vol-cell"' : '';
-        if (isVol && scaling) {
-          html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" readonly title="Scaled from ' + esc(rawVal) + ' × ' + factor + '"/></td>';
-        } else {
-          html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" oninput="spRecipeCell(' + ri + ',' + ci + ',this.value)"/></td>';
-        }
-      });
-      html += '</tr>';
+  if (tables && tables.length > 1) {
+    tables.forEach(function(t, ti) {
+      html += '<div style="margin-bottom:12px">';
+      if (t.name) html += '<div style="font-size:11px;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">' + esc(t.name) + '</div>';
+      html += _renderSingleTable(ti === 0 ? rs.recipe : t, scaling, factor);
+      html += '</div>';
     });
-    html += '</tbody></table></div>';
+    html += '<div class="sp-recipe-add"><button class="btn" onclick="spAddRecipeRow()">+ Row (table 1)</button><button class="btn" onclick="spAddRecipeCol()">+ Column</button></div>';
+  } else {
+    html += _renderSingleTable(rs.recipe, scaling, factor);
+    html += '<div class="sp-recipe-add"><button class="btn" onclick="spAddRecipeRow()">+ Row</button><button class="btn" onclick="spAddRecipeCol()">+ Column</button></div>';
   }
-  html += '<div class="sp-recipe-add"><button class="btn" onclick="spAddRecipeRow()">+ Row</button><button class="btn" onclick="spAddRecipeCol()">+ Column</button></div></div>';
-  return html;
+  return html + '</div>';
 }
 
-function spToggleScale(checked) { if (!_scratchProtoRun) return; _scratchProtoRun.scaling = checked; if (checked && !_scratchProtoRun.scaleFactor) _scratchProtoRun.scaleFactor = 1; document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
-function spUpdateScale(val) { if (!_scratchProtoRun) return; var n = parseFloat(val); _scratchProtoRun.scaleFactor = isNaN(n) ? 1 : n; document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
-function spRecipeCell(ri, ci, value) { if (_scratchProtoRun && _scratchProtoRun.recipe.rows[ri]) _scratchProtoRun.recipe.rows[ri][ci] = value; }
-function spAddRecipeRow() { if (!_scratchProtoRun) return; var r = _scratchProtoRun.recipe; r.rows.push(r.columns.map(function() { return ''; })); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
-function spAddRecipeCol() { var name = prompt('Column name:'); if (!name || !_scratchProtoRun) return; var r = _scratchProtoRun.recipe; r.columns.push(name); r.rows.forEach(function(row) { row.push(''); }); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
+function spToggleScale(c) { if (!_scratchProtoRun) return; _scratchProtoRun.scaling = c; if (c && !_scratchProtoRun.scaleFactor) _scratchProtoRun.scaleFactor = 1; _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
+function spUpdateScale(v) { if (!_scratchProtoRun) return; var n = parseFloat(v); _scratchProtoRun.scaleFactor = isNaN(n) ? 1 : n; _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
+function spRecipeCell(ri, ci, value) { if (_scratchProtoRun && _scratchProtoRun.recipe.rows[ri]) { _scratchProtoRun.recipe.rows[ri][ci] = value; _saveRun(_scratchProtoRun); } }
+function spAddRecipeRow() { if (!_scratchProtoRun) return; var r = _scratchProtoRun.recipe; r.rows.push(r.columns.map(function() { return ''; })); _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
+function spAddRecipeCol() { var name = prompt('Column name:'); if (!name || !_scratchProtoRun) return; var r = _scratchProtoRun.recipe; r.columns.push(name); r.rows.forEach(function(row) { row.push(''); }); _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
 
 // ── main render ───────────────────────────────────────────────────────────────
 async function renderScratch(el) {
@@ -2535,18 +3332,17 @@ async function renderScratch(el) {
     '<div class="section-label">Quick note</div>' +
     '<div class="scratch-quick"><input type="text" id="sq-input" placeholder="Type and hit Enter - gets filed overnight" spellcheck="false"/><button onclick="addScratchQuick()">Dump it</button></div>' +
     '<div class="section-label" style="margin-top:14px">Brain dump</div>' +
-    '<textarea class="scratch-big" id="sb-input" placeholder="Dump everything here — rough notes, observations, half-formed ideas. Hit Save and forget it. Gets sorted overnight."></textarea>' +
+    '<textarea class="scratch-big" id="sb-input" placeholder="Dump everything here — rough notes, observations, half-formed ideas."></textarea>' +
     '<div style="display:flex;justify-content:flex-end"><button class="btn primary" onclick="addScratchBig()">Save dump</button></div>' +
     '<div class="section-label" style="margin-top:14px">Run a protocol</div>' +
     '<div id="sp-proto-picker-wrap"><button class="btn" style="color:#5b7a5e" onclick="spShowPicker()">&#9654; Pick &amp; run a protocol</button></div>' +
     '<div class="section-label" style="margin-top:14px">Drop a figure</div>' +
     '<div class="drop-zone" id="drop-zone" onclick="triggerFileInput()" ondrop="handleDrop(event)">' +
       '<input type="file" id="file-input" accept="image/*,.pdf" onchange="handleFileSelect(event)"/>' +
-      '&#128247; Drop a gel, western blot, SEC trace, or any figure here<br>' +
-      '<span style="font-size:12px;color:var(--dim)">Images get analysed by the 3090 overnight and filed to the right project</span>' +
+      '&#128247; Drop a gel, western blot, SEC trace, or any figure here' +
     '</div>';
   if (entries.length) {
-    html += '<div class="section-label" style="margin-top:14px">Pending — awaiting overnight processing (' + entries.length + ')</div><div class="scratch-list">' +
+    html += '<div class="section-label" style="margin-top:14px">Pending (' + entries.length + ')</div><div class="scratch-list">' +
       entries.map(function(e) {
         return '<div class="scratch-item ' + (e.has_image ? 'has-image' : '') + '">' +
           (e.has_image ? '<img class="scratch-thumb" src="/api/scratch/' + e.id + '/image-raw" onerror="this.style.display=\'none\'" onclick="viewScratchImage(' + e.id + ')"/>' : '') +
@@ -2555,21 +3351,21 @@ async function renderScratch(el) {
           '<button class="btn" style="color:var(--red);padding:2px 8px" onclick="deleteScratch(' + e.id + ')">&#215;</button></div></div>';
       }).join('') + '</div>';
   } else {
-    html += '<div style="margin-top:8px;color:var(--muted);font-size:13px;font-style:italic">&#10003; All clear — nothing waiting to be processed.</div>';
+    html += '<div style="margin-top:8px;color:var(--muted);font-size:13px;font-style:italic">&#10003; All clear.</div>';
   }
   html += '</div>';
   el.innerHTML = html;
   setTimeout(function() {
     initDropZone();
-    var sqInp = document.getElementById('sq-input');
-    if (sqInp) sqInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') addScratchQuick(); });
+    var sq = document.getElementById('sq-input');
+    if (sq) sq.addEventListener('keydown', function(e) { if (e.key === 'Enter') addScratchQuick(); });
   }, 50);
 }
 
-// ── scratchpad picker ─────────────────────────────────────────────────────────
+// ── picker ────────────────────────────────────────────────────────────────────
 async function spShowPicker() {
   var wrap = document.getElementById('sp-proto-picker-wrap'); if (!wrap) return;
-  wrap.innerHTML = '<div style="color:var(--muted);font-size:13px">Loading protocols...</div>';
+  wrap.innerHTML = '<div style="color:var(--muted);font-size:13px">Loading...</div>';
   var data = await api('GET', '/api/protocols');
   S.protocols = data.protocols || [];
   if (!S.protocols.length) { wrap.innerHTML = '<div style="color:var(--muted);font-size:13px;font-style:italic">No protocols saved yet.</div>'; return; }
@@ -2596,31 +3392,83 @@ function spLaunchRun() {
   var sel = document.getElementById('sp-pk-sel');
   if (!sel || !sel.value) { toast('Select a protocol first', true); return; }
   var p = (S.protocols || []).find(function(x) { return x.id === parseInt(sel.value); });
-  if (p) spLaunchRunDirect(p, null);
+  if (p) spLaunchRunDirect(p, null, null);
 }
 
-// ── shared launch — called from workflow.js too ───────────────────────────────
-// group: string to save the entry under, or null for default 'Protocols'
-function spLaunchRunDirect(p, group) {
+// ── shared launch ─────────────────────────────────────────────────────────────
+function spLaunchRunDirect(p, group, subgroup) {
   var steps = [];
-  try { var parsed = JSON.parse(p.steps || '[]'); if (Array.isArray(parsed) && parsed.length && parsed[0].text) steps = parsed; } catch(e) {}
-  if (!steps.length) { toast('No structured steps yet — open Protocols and click \u27f3 to extract first', true); return; }
+  try { var parsed = JSON.parse(p.steps || '[]'); if (Array.isArray(parsed) && parsed.length && typeof parsed[0].text !== 'undefined') steps = parsed; } catch(e) {}
+  if (!steps.length) { toast('No structured steps yet', true); return; }
 
   _scratchProtoRun = {
+    runId:       p.id + '_' + Date.now(),
     protocol:    p,
     steps:       steps.map(function(s, i) { return { id: i, text: s.text, done: false, deviation: '' }; }),
     recipe:      JSON.parse(JSON.stringify(_parseRecipeRun(p.recipe))),
     scaling:     false,
     scaleFactor: 1,
     group_name:  group || 'Protocols',
+    subgroup:    subgroup || '',
     startedAt:   new Date().toISOString()
   };
+
+  // create in DB immediately (non-blocking)
+  api('POST', '/api/active-runs', {
+    run_id:        _scratchProtoRun.runId,
+    protocol_id:   p.id,
+    protocol_json: JSON.stringify(p),
+    steps_json:    JSON.stringify(_scratchProtoRun.steps),
+    recipe_json:   JSON.stringify(_scratchProtoRun.recipe),
+    group_name:    _scratchProtoRun.group_name,
+    subgroup:      _scratchProtoRun.subgroup,
+    scaling:       false,
+    scale_factor:  1.0,
+    started_at:    _scratchProtoRun.startedAt
+  }).catch(function() {});
+
+  _saveLocalOnly(_scratchProtoRun);
 
   if (S.view === 'scratch') {
     var el = document.getElementById('content');
     if (el) { _renderProtoRunInScratch(el); return; }
   }
   if (typeof setView === 'function') setView('scratch');
+}
+
+// resume by runId — fetches from DB so works across machines
+async function spResumeRunById(runId) {
+  try {
+    var data = await api('GET', '/api/active-runs');
+    var dbRun = (data.runs || []).find(function(r) { return r.run_id === runId; });
+    if (dbRun) {
+      _scratchProtoRun = {
+        runId:       dbRun.run_id,
+        protocol:    JSON.parse(dbRun.protocol_json),
+        steps:       JSON.parse(dbRun.steps_json || '[]'),
+        recipe:      JSON.parse(dbRun.recipe_json || 'null') || _parseRecipeRun(null),
+        scaling:     !!dbRun.scaling,
+        scaleFactor: dbRun.scale_factor || 1.0,
+        group_name:  dbRun.group_name || 'Protocols',
+        subgroup:    dbRun.subgroup || '',
+        startedAt:   dbRun.started_at
+      };
+      _saveLocalOnly(_scratchProtoRun);
+      if (typeof setView === 'function') setView('scratch');
+      return;
+    }
+  } catch(e) {}
+  // fallback to localStorage
+  var local = _getRunByIdLocal(runId);
+  if (local) { _scratchProtoRun = local; if (typeof setView === 'function') setView('scratch'); return; }
+  toast('Run not found', true);
+}
+
+async function spDiscardRunById(runId) {
+  if (!confirm('Discard this run? Progress will be lost.')) return;
+  await _removeRun(runId);
+  if (_scratchProtoRun && _scratchProtoRun.runId === runId) _scratchProtoRun = null;
+  loadView();
 }
 
 // ── run view ──────────────────────────────────────────────────────────────────
@@ -2634,55 +3482,69 @@ function _renderProtoRunInScratch(el) {
       '<label class="sp-step-check"><input type="checkbox"' + (step.done ? ' checked' : '') + ' onchange="spToggleStep(' + step.id + ',this.checked)"/>' +
       '<span class="sp-step-text">' + esc(step.text) + '</span></label>' +
       '<button class="sp-dev-btn" onclick="spToggleDev(' + step.id + ')">' + (hasDev ? '&#9998; deviation noted' : '+ deviation note') + '</button>' +
-      '<div class="sp-dev-note' + (hasDev ? ' open' : '') + '" id="spd-' + step.id + '"><textarea placeholder="What did you change or observe?" oninput="spUpdateDev(' + step.id + ',this.value)">' + esc(step.deviation) + '</textarea></div>' +
+      '<div class="sp-dev-note' + (hasDev ? ' open' : '') + '" id="spd-' + step.id + '"><textarea placeholder="What did you change?" oninput="spUpdateDev(' + step.id + ',this.value)">' + esc(step.deviation) + '</textarea></div>' +
     '</div>';
   }).join('');
-
-  el.innerHTML = '<div style="padding:0 0 24px">' +
-    '<div class="sp-run-header">' +
-      '<div>' +
-        '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) + '</div>' +
-        '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;·&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '</div>' +
-        '<span class="sp-run-group-badge">&#128193; ' + esc(rs.group_name) + '</span>' +
+  var groupLabel = rs.group_name + (rs.subgroup ? ' / ' + rs.subgroup : '');
+  el.innerHTML =
+    '<div style="padding:0 0 24px">' +
+      '<div class="sp-run-header">' +
+        '<div>' +
+          '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) + '</div>' +
+          '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;&#183;&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '</div>' +
+          '<span class="sp-run-group-badge">&#128193; ' + esc(groupLabel) + '</span>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px">' +
+          '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
+          '<button class="btn" style="color:#c0392b" onclick="spAbandonRun()">&#215; Abandon</button>' +
+        '</div>' +
       '</div>' +
-      '<button class="btn" onclick="spAbandonRun()">&#8592; Back</button>' +
-    '</div>' +
-    '<div class="sp-progress"><div class="sp-progress-fill" id="sp-pfill" style="width:' + pct + '%"></div></div>' +
-    '<div id="sp-recipe-wrap">' + _renderRunRecipe() + '</div>' +
-    '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Steps</div>' +
-    '<div id="sp-steps-list">' + stepsHtml + '</div>' +
-    '<div id="sp-summary-wrap"></div>' +
-    '<div class="sp-run-footer">' +
-      '<button class="btn" onclick="spShowSummary()">View summary</button>' +
-      '<button class="btn primary" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
-    '</div>' +
-  '</div>';
+      '<div class="sp-progress"><div class="sp-progress-fill" id="sp-pfill" style="width:' + pct + '%"></div></div>' +
+      '<div id="sp-recipe-wrap">' + _renderRunRecipe() + '</div>' +
+      '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Steps</div>' +
+      '<div id="sp-steps-list">' + stepsHtml + '</div>' +
+      '<div id="sp-summary-wrap"></div>' +
+      '<div class="sp-run-footer">' +
+        '<button class="btn" onclick="spShowSummary()">View summary</button>' +
+        '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
+        '<button class="btn primary" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
+      '</div>' +
+    '</div>';
+}
+
+function spSaveAndExit() {
+  if (_scratchProtoRun) _saveRun(_scratchProtoRun);
+  _scratchProtoRun = null;
+  if (typeof setView === 'function') setView('protocols'); else loadView();
+  toast('Run saved \u2014 resume from any machine via the Protocols page');
 }
 
 function spAbandonRun() {
-  var rs = _scratchProtoRun;
-  if (rs && rs.steps.some(function(s) { return s.done || s.deviation.trim(); }) && !confirm('Abandon this run? Progress will be lost.')) return;
-  _scratchProtoRun = null; loadView();
+  if (!confirm('Abandon this run? Progress will be lost.')) return;
+  if (_scratchProtoRun) _removeRun(_scratchProtoRun.runId);
+  _scratchProtoRun = null;
+  if (typeof setView === 'function') setView('protocols'); else loadView();
 }
 
 function spToggleStep(id, checked) {
   if (!_scratchProtoRun) return;
   var step = _scratchProtoRun.steps.find(function(s) { return s.id === id; }); if (!step) return;
-  step.done = checked;
+  step.done = checked; _saveRun(_scratchProtoRun);
   document.getElementById('sps-' + id)?.classList.toggle('done', checked);
   var done = _scratchProtoRun.steps.filter(function(s) { return s.done; }).length;
   var fill = document.getElementById('sp-pfill'); if (fill) fill.style.width = Math.round((done / _scratchProtoRun.steps.length) * 100) + '%';
-  var meta = document.getElementById('sp-run-meta'); if (meta) meta.textContent = done + ' / ' + _scratchProtoRun.steps.length + ' steps · started ' + new Date(_scratchProtoRun.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  var meta = document.getElementById('sp-run-meta'); if (meta) meta.textContent = done + ' / ' + _scratchProtoRun.steps.length + ' steps \xb7 started ' + new Date(_scratchProtoRun.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
 }
 
 function spToggleDev(id) {
-  var noteEl = document.getElementById('spd-' + id); if (!noteEl) return;
-  if (noteEl.classList.toggle('open')) noteEl.querySelector('textarea')?.focus();
+  var n = document.getElementById('spd-' + id); if (!n) return;
+  if (n.classList.toggle('open')) n.querySelector('textarea')?.focus();
 }
 
 function spUpdateDev(id, value) {
   if (!_scratchProtoRun) return;
   var step = _scratchProtoRun.steps.find(function(s) { return s.id === id; }); if (step) step.deviation = value;
+  _saveRun(_scratchProtoRun);
   var el = document.getElementById('sps-' + id); if (!el) return;
   el.classList.toggle('has-dev', value.trim().length > 0);
   var btn = el.querySelector('.sp-dev-btn'); if (btn) btn.textContent = value.trim() ? '\u270e deviation noted' : '+ deviation note';
@@ -2698,9 +3560,9 @@ function spShowSummary() {
     html += '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin-bottom:6px">Deviations</div><ul class="sp-summary-list">';
     devs.forEach(function(s) { html += '<li><div class="sp-dev-orig"><s>' + esc(s.text) + '</s></div><div class="sp-dev-new">&#8594; ' + esc(s.deviation) + '</div></li>'; });
     html += '</ul>';
-  } else { html += '<div class="sp-summary-clean">No deviations — ran exactly as written.</div>'; }
+  } else { html += '<div class="sp-summary-clean">No deviations.</div>'; }
   if (inc.length) {
-    html += '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin:12px 0 6px">Incomplete steps</div><ul class="sp-summary-list">';
+    html += '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin:12px 0 6px">Incomplete</div><ul class="sp-summary-list">';
     inc.forEach(function(s) { html += '<li style="color:#8a7f72">' + esc(s.text) + '</li>'; });
     html += '</ul>';
   }
@@ -2709,63 +3571,89 @@ function spShowSummary() {
   wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
-async function spSaveToEntry() {
-  var rs = _scratchProtoRun; if (!rs) return;
+// ── save to entry + record completed run ──────────────────────────────────────
+async function spSaveRunToEntry(runId) {
+  var rs = null;
+  if (runId) {
+    // fetch from DB first
+    try {
+      var data = await api('GET', '/api/active-runs');
+      var dbRun = (data.runs || []).find(function(r) { return r.run_id === runId; });
+      if (dbRun) rs = { runId: dbRun.run_id, protocol: JSON.parse(dbRun.protocol_json), steps: JSON.parse(dbRun.steps_json || '[]'), recipe: JSON.parse(dbRun.recipe_json || 'null') || _parseRecipeRun(null), scaling: !!dbRun.scaling, scaleFactor: dbRun.scale_factor || 1.0, group_name: dbRun.group_name || 'Protocols', subgroup: dbRun.subgroup || '', startedAt: dbRun.started_at };
+    } catch(e) {}
+    if (!rs) rs = _getRunByIdLocal(runId);
+  } else {
+    rs = _scratchProtoRun;
+  }
+  if (!rs) { toast('Run not found', true); return; }
+
   var done  = rs.steps.filter(function(s) { return s.done; }).length;
   var devs  = rs.steps.filter(function(s) { return s.deviation.trim(); });
   var inc   = rs.steps.filter(function(s) { return !s.done; });
   var today = new Date().toISOString().split('T')[0];
   var volCol = _volColIndex(rs.recipe.columns);
+
   var lines = ['## Protocol Run: ' + rs.protocol.title, '', '**Date:** ' + new Date(rs.startedAt).toLocaleString(), '**Progress:** ' + done + ' / ' + rs.steps.length + ' steps completed', ''];
+
   if (rs.recipe.rows.length) {
     lines.push('### Reaction Recipe');
-    if (rs.scaling && rs.scaleFactor !== 1) lines.push('_Scale factor: ×' + rs.scaleFactor + '_');
+    if (rs.scaling && rs.scaleFactor !== 1) lines.push('_Scale factor: x' + rs.scaleFactor + '_');
     lines.push('| ' + rs.recipe.columns.join(' | ') + ' |');
     lines.push('| ' + rs.recipe.columns.map(function() { return '---'; }).join(' | ') + ' |');
     rs.recipe.rows.forEach(function(row) {
       var cells = rs.recipe.columns.map(function(_, ci) {
         var val = row[ci] || '';
-        if (ci === volCol && rs.scaling && rs.scaleFactor && val) { var num = parseFloat(val); if (!isNaN(num)) val = (num * rs.scaleFactor).toFixed(2).replace(/\.00$/, '') + ' (scaled)'; }
+        if (ci === volCol && rs.scaling && rs.scaleFactor && val) { var n = parseFloat(val); if (!isNaN(n)) val = (n * rs.scaleFactor).toFixed(2).replace(/\.00$/, '') + ' (scaled)'; }
         return val;
       });
       lines.push('| ' + cells.join(' | ') + ' |');
     });
     lines.push('');
   }
+
   lines.push('### Steps');
   rs.steps.forEach(function(step, i) {
     lines.push((i + 1) + '. [' + (step.done ? 'x' : ' ') + '] ' + step.text);
-    if (step.deviation) lines.push('   _↳ ' + step.deviation + '_');
+    if (step.deviation) lines.push('   _\u21b3 ' + step.deviation + '_');
   });
-  if (devs.length) { lines.push('', '### Deviation Log'); devs.forEach(function(s) { lines.push('- ~~' + s.text + '~~'); lines.push('  → ' + s.deviation); }); }
+  if (devs.length) { lines.push('', '### Deviation Log'); devs.forEach(function(s) { lines.push('- ~~' + s.text + '~~'); lines.push('  \u2192 ' + s.deviation); }); }
   if (inc.length) { lines.push('', '### Not completed'); inc.forEach(function(s) { lines.push('- ' + s.text); }); }
+
   try {
-    await api('POST', '/api/entries', {
+    var entry = await api('POST', '/api/entries', {
       title: 'Protocol Run: ' + rs.protocol.title,
-      date: today,
-      group_name: rs.group_name,   // ← set at launch time, either from workflow or 'Protocols'
-      subgroup: '',
-      content: lines.join('\n'),
-      summary: ''
+      date: today, group_name: rs.group_name, subgroup: rs.subgroup || '',
+      notes: lines.join('\n'), summary: ''
+    });
+    await api('POST', '/api/protocol-runs', {
+      protocol_id: rs.protocol.id, date: today, group_name: rs.group_name,
+      steps_json: JSON.stringify(rs.steps), recipe_json: JSON.stringify(rs.recipe),
+      entry_id: entry.id || null
     });
     toast('Saved to ' + rs.group_name + ' \u2713');
-    _scratchProtoRun = null;
-    loadView();
+    await _removeRun(rs.runId);
+    if (_scratchProtoRun && _scratchProtoRun.runId === rs.runId) _scratchProtoRun = null;
+    if (typeof setView === 'function') setView('protocols'); else loadView();
   } catch(e) { toast('Save failed: ' + e.message, true); }
 }
+
+function spSaveToEntry() { spSaveRunToEntry(null); }
+
+// expose for protocols.js active runs section
+async function spGetActiveRuns() { return await _getAllRuns(); }
 
 // ── original scratch functions ────────────────────────────────────────────────
 async function addScratchQuick() {
   var inp = document.getElementById('sq-input');
   var text = inp?.value.trim(); if (!text) return;
   await api('POST', '/api/scratch', { type: 'text', content: text });
-  inp.value = ''; await load(); toast('Noted — will be filed overnight');
+  inp.value = ''; await load(); toast('Noted');
 }
 async function addScratchBig() {
   var ta = document.getElementById('sb-input');
   var text = ta?.value.trim(); if (!text) return;
   await api('POST', '/api/scratch', { type: 'text', content: text });
-  ta.value = ''; await load(); toast('Saved — will be sorted overnight');
+  ta.value = ''; await load(); toast('Saved');
 }
 function viewScratchImage(id) { var w = window.open('', '_blank', 'width=800,height=600'); w.document.write('<img src="/api/scratch/' + id + '/image-raw" style="max-width:100%;max-height:100vh"/>'); }
 async function deleteScratch(id) { await api('DELETE', '/api/scratch/' + id); await load(); }
@@ -2782,7 +3670,7 @@ async function uploadScratchFile(file) {
   reader.onload = async function(e) {
     var b64 = e.target.result.split(',')[1];
     await api('POST', '/api/scratch', { type: 'image', content: '', filename: file.name, image_data: b64 });
-    await load(); toast('Figure saved — will be analysed overnight');
+    await load(); toast('Figure saved');
   };
   reader.readAsDataURL(file);
 }
@@ -3610,6 +4498,761 @@ window._clSendToOC = _clSendToOC;
 
 // ── register
 registerView('cloning', renderCloning);
+
+
+// ── sanger.js ──
+/* Sanger Sequencing — AB1 trace alignment and chromatogram viewer */
+
+/* ── state ────────────────────────────────────────────────── */
+var sangerState = {
+  alignments: [],
+  current: null,       // selected alignment row
+  traceData: null,     // parsed AB1 trace JSON
+  view: 'list',        // 'list' | 'new' | 'detail' | 'batch'
+  batchItems: [],      // alignments in current batch
+  batchId: null,
+  batchIdx: 0,         // index within batch for nav
+  plasmids: [],
+  refMode: 'plasmid',  // 'plasmid' | 'upload' | 'raw'
+  traceZoom: 1,
+  traceScroll: 0,
+  dragging: false,
+  dragStart: 0,
+  scrollStart: 0,
+};
+
+/* ── colours (from style guide + bio convention) ──────────── */
+var TRACE_COLORS = { A: '#2e8b40', C: '#2266cc', G: '#222', T: '#cc2222' };
+var QUAL_GOOD = '#5b7a5e';
+var QUAL_MED  = '#c9a84c';
+var QUAL_BAD  = '#c25a4a';
+
+/* ── helpers ──────────────────────────────────────────────── */
+function sangerFmt(d) { return d ? formatDate(d.split('T')[0]) : '—'; }
+
+function qualColor(q) {
+  if (q >= 30) return QUAL_GOOD;
+  if (q >= 20) return QUAL_MED;
+  return QUAL_BAD;
+}
+
+function identityBadge(pct) {
+  var c = pct >= 98 ? QUAL_GOOD : pct >= 90 ? QUAL_MED : QUAL_BAD;
+  return '<span style="background:' + c + ';color:#fff;padding:2px 8px;border-radius:4px;font-size:.78rem;font-weight:600">' + pct.toFixed(1) + '%</span>';
+}
+
+/* ── internal navigation (forces re-render even if already on sanger) ── */
+function sangerNav(subview) {
+  sangerState.view = subview || 'list';
+  S.view = '';
+  setView('sanger');
+}
+
+/* ── main render ─────────────────────────────────────────── */
+async function renderSanger(el) {
+  if (sangerState.view === 'new')    return renderNewAlignment(el);
+  if (sangerState.view === 'detail') return renderDetail(el);
+  if (sangerState.view === 'batch')  return renderBatch(el);
+  return renderList(el);
+}
+
+/* ── LIST VIEW ───────────────────────────────────────────── */
+async function renderList(el) {
+  var data = await api('GET', '/api/sanger/alignments');
+  sangerState.alignments = data.items || [];
+  var items = sangerState.alignments;
+
+  var h = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">';
+  h += '<div style="font-variant:small-caps;font-size:.72rem;letter-spacing:.12em;color:#8a7f72">sanger alignments</div>';
+  h += '<button class="btn-sanger-primary" onclick="sangerNav(\'new\')">+ New Alignment</button>';
+  h += '</div>';
+
+  if (!items.length) {
+    h += '<div class="sanger-empty">';
+    h += '<div style="font-size:1.6rem;margin-bottom:8px">No alignments yet</div>';
+    h += '<div style="color:#8a7f72">Upload one or more AB1 files and align them against a reference sequence.</div>';
+    h += '</div>';
+  } else {
+    // Group by batch_id
+    var batches = {};
+    var singles = [];
+    items.forEach(function(a) {
+      if (a.batch_id) {
+        if (!batches[a.batch_id]) batches[a.batch_id] = [];
+        batches[a.batch_id].push(a);
+      } else {
+        singles.push(a);
+      }
+    });
+
+    h += '<div class="sanger-table-wrap"><table class="sanger-table"><thead><tr>';
+    h += '<th>Name</th><th>Reference</th><th>Identity</th><th>Mismatches</th><th>Gaps</th><th>Date</th><th></th>';
+    h += '</tr></thead><tbody>';
+
+    // Render batches first
+    var batchKeys = Object.keys(batches);
+    batchKeys.forEach(function(bid) {
+      var group = batches[bid];
+      var avgIdent = group.reduce(function(s, a) { return s + a.identity_pct; }, 0) / group.length;
+      if (group.length > 1) {
+        h += '<tr class="sanger-row sanger-batch-row" onclick="sangerOpenBatch(\'' + bid + '\')" style="cursor:pointer">';
+        h += '<td style="font-weight:600"><span class="sanger-batch-badge">' + group.length + ' files</span> ' + esc(group[0].ref_name) + ' batch</td>';
+        h += '<td><span style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.8rem;background:#f0ebe3;padding:2px 6px;border-radius:3px">' + esc(group[0].ref_name) + '</span></td>';
+        h += '<td>' + identityBadge(avgIdent) + ' <span style="font-size:.75rem;color:#8a7f72">avg</span></td>';
+        h += '<td style="text-align:center">' + group.reduce(function(s, a) { return s + a.num_mismatches; }, 0) + '</td>';
+        h += '<td style="text-align:center">' + group.reduce(function(s, a) { return s + a.num_gaps; }, 0) + '</td>';
+        h += '<td style="color:#8a7f72;font-size:.85rem">' + relTime(group[0].created) + '</td>';
+        h += '<td><button class="btn-sanger-icon" onclick="event.stopPropagation();sangerDeleteBatch(\'' + bid + '\')" title="Delete batch">✕</button></td>';
+        h += '</tr>';
+      } else {
+        var a = group[0];
+        h += sangerAlignmentRow(a);
+      }
+    });
+
+    singles.forEach(function(a) {
+      h += sangerAlignmentRow(a);
+    });
+
+    h += '</tbody></table></div>';
+  }
+
+  el.innerHTML = sangerStyles() + h;
+}
+
+function sangerAlignmentRow(a) {
+  var h = '<tr class="sanger-row" onclick="sangerOpenDetail(' + a.id + ')" style="cursor:pointer">';
+  h += '<td style="font-weight:600">' + esc(a.name) + '</td>';
+  h += '<td><span style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.8rem;background:#f0ebe3;padding:2px 6px;border-radius:3px">' + esc(a.ref_name) + '</span></td>';
+  h += '<td>' + identityBadge(a.identity_pct) + '</td>';
+  h += '<td style="text-align:center">' + a.num_mismatches + '</td>';
+  h += '<td style="text-align:center">' + a.num_gaps + '</td>';
+  h += '<td style="color:#8a7f72;font-size:.85rem">' + relTime(a.created) + '</td>';
+  h += '<td><button class="btn-sanger-icon" onclick="event.stopPropagation();sangerDelete(' + a.id + ')" title="Delete">✕</button></td>';
+  h += '</tr>';
+  return h;
+}
+
+/* ── NEW ALIGNMENT VIEW ─────────────────────────────────── */
+async function renderNewAlignment(el) {
+  try {
+    var seqData = await api('GET', '/api/cloning/sequences');
+    sangerState.plasmids = (seqData.items || []).filter(function(s) { return s.type === 'plasmid'; });
+  } catch(e) { sangerState.plasmids = []; }
+
+  var h = '<div style="max-width:720px;margin:0 auto">';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:24px">';
+  h += '<button class="btn-sanger-ghost" onclick="sangerNav(\'list\')">← Back</button>';
+  h += '<div style="font-variant:small-caps;font-size:.72rem;letter-spacing:.12em;color:#8a7f72">new alignment</div>';
+  h += '</div>';
+
+  h += '<label class="sanger-label">Alignment name <span style="font-variant:normal;text-transform:none;letter-spacing:0;color:#b0a89a">(optional — defaults to filename)</span></label>';
+  h += '<input type="text" id="sanger-name" class="sanger-input" placeholder="e.g. Colony 1 fwd">';
+
+  /* AB1 upload — MULTIPLE */
+  h += '<label class="sanger-label" style="margin-top:16px">AB1 files</label>';
+  h += '<div id="sanger-ab1-drop" class="sanger-drop-zone" onclick="document.getElementById(\'sanger-ab1-input\').click()">';
+  h += '<div id="sanger-ab1-label">Drop .ab1 file(s) here or click to browse</div>';
+  h += '<input type="file" id="sanger-ab1-input" accept=".ab1,.abi" multiple style="display:none">';
+  h += '</div>';
+  h += '<div id="sanger-file-list" style="margin-top:6px"></div>';
+
+  /* Reference source tabs */
+  h += '<label class="sanger-label" style="margin-top:16px">Reference sequence</label>';
+  h += '<div class="sanger-tabs">';
+  h += '<button class="sanger-tab' + (sangerState.refMode === 'plasmid' ? ' active' : '') + '" onclick="sangerState.refMode=\'plasmid\';sangerNav(\'new\')">From inventory</button>';
+  h += '<button class="sanger-tab' + (sangerState.refMode === 'upload' ? ' active' : '') + '" onclick="sangerState.refMode=\'upload\';sangerNav(\'new\')">Upload file</button>';
+  h += '<button class="sanger-tab' + (sangerState.refMode === 'raw' ? ' active' : '') + '" onclick="sangerState.refMode=\'raw\';sangerNav(\'new\')">Paste sequence</button>';
+  h += '</div>';
+
+  if (sangerState.refMode === 'plasmid') {
+    h += '<select id="sanger-ref-plasmid" class="sanger-input">';
+    h += '<option value="">Select a plasmid…</option>';
+    sangerState.plasmids.forEach(function(p) {
+      h += '<option value="' + p.id + '">' + esc(p.name) + '</option>';
+    });
+    h += '</select>';
+    if (!sangerState.plasmids.length) {
+      h += '<div style="color:#8a7f72;font-size:.85rem;margin-top:4px">No plasmids with .gb files found. Upload a reference file instead.</div>';
+    }
+  } else if (sangerState.refMode === 'upload') {
+    h += '<div class="sanger-drop-zone" onclick="document.getElementById(\'sanger-ref-file-input\').click()" style="margin-top:8px">';
+    h += '<div id="sanger-ref-label">Drop FASTA or GenBank file here</div>';
+    h += '<input type="file" id="sanger-ref-file-input" accept=".fa,.fasta,.gb,.gbk,.genbank" style="display:none">';
+    h += '</div>';
+  } else {
+    h += '<textarea id="sanger-ref-raw" class="sanger-input" rows="4" placeholder="Paste raw DNA sequence (ATCG only) or FASTA format" style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.82rem"></textarea>';
+  }
+
+  h += '<button class="btn-sanger-primary" style="margin-top:24px;width:100%" onclick="sangerRunAlignment()" id="sanger-run-btn">Align</button>';
+  h += '<div id="sanger-status" style="margin-top:12px;color:#8a7f72;font-size:.85rem"></div>';
+  h += '</div>';
+
+  el.innerHTML = sangerStyles() + h;
+
+  setTimeout(function() {
+    var ab1Input = document.getElementById('sanger-ab1-input');
+    var ab1Drop = document.getElementById('sanger-ab1-drop');
+    if (ab1Input) {
+      ab1Input.onchange = function() { sangerUpdateFileList(); };
+    }
+    if (ab1Drop) {
+      ab1Drop.ondragover = function(e) { e.preventDefault(); ab1Drop.style.borderColor = '#5b7a5e'; };
+      ab1Drop.ondragleave = function() { ab1Drop.style.borderColor = '#d5cec0'; };
+      ab1Drop.ondrop = function(e) {
+        e.preventDefault();
+        ab1Drop.style.borderColor = '#5b7a5e';
+        if (e.dataTransfer.files.length) {
+          ab1Input.files = e.dataTransfer.files;
+          sangerUpdateFileList();
+        }
+      };
+    }
+    var refInput = document.getElementById('sanger-ref-file-input');
+    if (refInput) {
+      refInput.onchange = function() {
+        if (refInput.files[0]) {
+          document.getElementById('sanger-ref-label').textContent = refInput.files[0].name;
+        }
+      };
+    }
+  }, 50);
+}
+
+function sangerUpdateFileList() {
+  var ab1Input = document.getElementById('sanger-ab1-input');
+  var listEl = document.getElementById('sanger-file-list');
+  var dropLabel = document.getElementById('sanger-ab1-label');
+  var drop = document.getElementById('sanger-ab1-drop');
+  if (!ab1Input || !listEl) return;
+  var files = ab1Input.files;
+  if (!files.length) {
+    listEl.innerHTML = '';
+    dropLabel.textContent = 'Drop .ab1 file(s) here or click to browse';
+    drop.style.borderColor = '#d5cec0';
+    return;
+  }
+  drop.style.borderColor = '#5b7a5e';
+  if (files.length === 1) {
+    dropLabel.textContent = files[0].name;
+    listEl.innerHTML = '';
+  } else {
+    dropLabel.textContent = files.length + ' files selected';
+    var h = '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px">';
+    for (var i = 0; i < files.length; i++) {
+      h += '<span style="font-size:.78rem;background:#f0ebe3;padding:2px 8px;border-radius:4px;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace">' + esc(files[i].name) + '</span>';
+    }
+    h += '</div>';
+    listEl.innerHTML = h;
+  }
+}
+
+/* ── run alignment ───────────────────────────────────────── */
+async function sangerRunAlignment() {
+  var btn = document.getElementById('sanger-run-btn');
+  var status = document.getElementById('sanger-status');
+  var ab1Input = document.getElementById('sanger-ab1-input');
+  if (!ab1Input || !ab1Input.files.length) { toast('Please select at least one AB1 file', true); return; }
+
+  var fd = new FormData();
+  for (var i = 0; i < ab1Input.files.length; i++) {
+    fd.append('ab1', ab1Input.files[i]);
+  }
+  var nameVal = (document.getElementById('sanger-name') || {}).value || '';
+  if (nameVal) fd.append('name', nameVal);
+
+  if (sangerState.refMode === 'plasmid') {
+    var sel = document.getElementById('sanger-ref-plasmid');
+    if (!sel || !sel.value) { toast('Select a plasmid reference', true); return; }
+    fd.append('ref_source', 'plasmid');
+    fd.append('ref_id', sel.value);
+  } else if (sangerState.refMode === 'upload') {
+    var refFile = document.getElementById('sanger-ref-file-input');
+    if (!refFile || !refFile.files[0]) { toast('Select a reference file', true); return; }
+    var refContent = await refFile.files[0].text();
+    var ext = refFile.files[0].name.split('.').pop().toLowerCase();
+    var src = (ext === 'gb' || ext === 'gbk' || ext === 'genbank') ? 'genbank' : 'fasta';
+    fd.append('ref_source', src);
+    fd.append('ref_text', refContent);
+  } else {
+    var raw = (document.getElementById('sanger-ref-raw') || {}).value;
+    if (!raw || !raw.trim()) { toast('Paste a reference sequence', true); return; }
+    if (raw.trim().startsWith('>')) {
+      fd.append('ref_source', 'fasta');
+    } else {
+      fd.append('ref_source', 'raw');
+    }
+    fd.append('ref_text', raw.trim());
+  }
+
+  var fileCount = ab1Input.files.length;
+  btn.disabled = true;
+  btn.textContent = 'Aligning ' + fileCount + ' file' + (fileCount > 1 ? 's' : '') + '…';
+  status.textContent = 'Uploading and aligning — this may take a moment…';
+
+  try {
+    var resp = await fetch('/api/sanger/align', { method: 'POST', body: fd });
+    if (!resp.ok) {
+      var err = await resp.json().catch(function() { return { detail: resp.statusText }; });
+      throw new Error(err.detail || 'Alignment failed');
+    }
+    var result = await resp.json();
+    var items = result.items || [];
+    var errors = result.errors || [];
+
+    if (errors.length && items.length) {
+      toast(items.length + ' aligned, ' + errors.length + ' failed');
+    } else if (errors.length && !items.length) {
+      toast('All files failed: ' + errors[0].error, true);
+      status.textContent = '';
+      btn.disabled = false;
+      btn.textContent = 'Align';
+      return;
+    } else {
+      toast(items.length + ' alignment' + (items.length > 1 ? 's' : '') + ' complete');
+    }
+
+    if (items.length === 1) {
+      sangerState.view = 'detail';
+      sangerState.current = items[0];
+      sangerState.traceData = null;
+      sangerState.batchItems = items;
+      sangerState.batchIdx = 0;
+    } else {
+      sangerState.view = 'batch';
+      sangerState.batchItems = items;
+      sangerState.batchId = result.batch_id;
+      sangerState.batchIdx = 0;
+    }
+    sangerNav(sangerState.view);
+  } catch(e) {
+    toast(e.message, true);
+    status.textContent = '';
+    btn.disabled = false;
+    btn.textContent = 'Align';
+  }
+}
+
+/* ── BATCH VIEW — summary of multi-file results ─────────── */
+async function renderBatch(el) {
+  var items = sangerState.batchItems;
+  if (!items.length) { sangerState.view = 'list'; return renderList(el); }
+
+  var h = '<div>';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap">';
+  h += '<button class="btn-sanger-ghost" onclick="sangerState.batchItems=[];sangerNav(\'list\')">← Back</button>';
+  h += '<div style="font-variant:small-caps;font-size:.72rem;letter-spacing:.12em;color:#8a7f72">batch results</div>';
+  h += '<div style="flex:1"></div>';
+  h += '<span style="font-size:.85rem;color:#8a7f72">' + items.length + ' alignment' + (items.length > 1 ? 's' : '') + ' against <strong>' + esc(items[0].ref_name) + '</strong></span>';
+  h += '</div>';
+
+  h += '<div class="sanger-batch-grid">';
+  items.forEach(function(a, idx) {
+    var borderColor = a.identity_pct >= 98 ? QUAL_GOOD : a.identity_pct >= 90 ? QUAL_MED : QUAL_BAD;
+    h += '<div class="sanger-batch-card" style="border-left:4px solid ' + borderColor + '" onclick="sangerBatchDetail(' + idx + ')">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:start">';
+    h += '<div style="font-weight:600;font-size:.92rem;color:#4a4139">' + esc(a.name) + '</div>';
+    h += identityBadge(a.identity_pct);
+    h += '</div>';
+    h += '<div style="display:flex;gap:16px;margin-top:8px;font-size:.8rem;color:#8a7f72">';
+    h += '<span>' + a.num_mismatches + ' mismatch' + (a.num_mismatches !== 1 ? 'es' : '') + '</span>';
+    h += '<span>' + a.num_gaps + ' gap' + (a.num_gaps !== 1 ? 's' : '') + '</span>';
+    h += '<span>Ref ' + ((a.ref_start || 0) + 1) + '–' + (a.ref_end || 0) + '</span>';
+    h += '</div>';
+    h += '</div>';
+  });
+  h += '</div>';
+
+  h += '</div>';
+  el.innerHTML = sangerStyles() + h;
+}
+
+function sangerBatchDetail(idx) {
+  sangerState.batchIdx = idx;
+  sangerState.current = sangerState.batchItems[idx];
+  sangerState.traceData = null;
+  sangerState.traceZoom = 1;
+  sangerState.traceScroll = 0;
+  sangerNav('detail');
+}
+
+/* ── DETAIL VIEW ─────────────────────────────────────────── */
+async function renderDetail(el) {
+  var a = sangerState.current;
+  if (!a) { sangerState.view = 'list'; return renderList(el); }
+
+  if (!sangerState.traceData) {
+    try {
+      sangerState.traceData = await api('GET', '/api/sanger/alignments/' + a.id + '/trace');
+    } catch(e) {
+      sangerState.traceData = null;
+    }
+  }
+
+  var inBatch = sangerState.batchItems.length > 1;
+
+  var h = '<div>';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap">';
+  if (inBatch) {
+    h += '<button class="btn-sanger-ghost" onclick="sangerState.traceData=null;sangerNav(\'batch\')">← Batch</button>';
+  } else {
+    h += '<button class="btn-sanger-ghost" onclick="sangerState.current=null;sangerState.traceData=null;sangerNav(\'list\')">← Back</button>';
+  }
+  h += '<div style="font-weight:600;font-size:1.1rem;color:#4a4139">' + esc(a.name) + '</div>';
+  h += '<div style="flex:1"></div>';
+
+  if (inBatch) {
+    var idx = sangerState.batchIdx;
+    var total = sangerState.batchItems.length;
+    h += '<div style="display:flex;align-items:center;gap:6px">';
+    h += '<button class="btn-sanger-ghost btn-sm" onclick="sangerBatchNav(-1)"' + (idx === 0 ? ' disabled style="opacity:.3;pointer-events:none"' : '') + '>‹ Prev</button>';
+    h += '<span style="font-size:.82rem;color:#8a7f72">' + (idx + 1) + ' / ' + total + '</span>';
+    h += '<button class="btn-sanger-ghost btn-sm" onclick="sangerBatchNav(1)"' + (idx >= total - 1 ? ' disabled style="opacity:.3;pointer-events:none"' : '') + '>Next ›</button>';
+    h += '</div>';
+  }
+
+  h += identityBadge(a.identity_pct);
+  h += '</div>';
+
+  h += '<div class="sanger-stats-bar">';
+  h += sangerStat('Reference', a.ref_name);
+  h += sangerStat('Source', a.ref_source);
+  h += sangerStat('Score', a.alignment_score ? a.alignment_score.toFixed(1) : '—');
+  h += sangerStat('Mismatches', a.num_mismatches);
+  h += sangerStat('Gaps', a.num_gaps);
+  h += sangerStat('Ref region', ((a.ref_start || 0) + 1) + '–' + (a.ref_end || 0));
+  h += sangerStat('Query region', ((a.query_start || 0) + 1) + '–' + (a.query_end || 0));
+  h += '</div>';
+
+  if (sangerState.traceData && sangerState.traceData.quals && sangerState.traceData.quals.length) {
+    h += '<div style="font-variant:small-caps;font-size:.72rem;letter-spacing:.12em;color:#8a7f72;margin:24px 0 8px">quality scores</div>';
+    h += '<div style="position:relative;height:80px;background:#f0ebe3;border-radius:6px;overflow:hidden" id="sanger-qual-chart"></div>';
+    h += '<div style="display:flex;gap:16px;margin-top:4px;font-size:.75rem;color:#8a7f72">';
+    h += '<span><span style="display:inline-block;width:10px;height:10px;background:' + QUAL_GOOD + ';border-radius:2px;margin-right:3px"></span>Q≥30</span>';
+    h += '<span><span style="display:inline-block;width:10px;height:10px;background:' + QUAL_MED + ';border-radius:2px;margin-right:3px"></span>Q≥20</span>';
+    h += '<span><span style="display:inline-block;width:10px;height:10px;background:' + QUAL_BAD + ';border-radius:2px;margin-right:3px"></span>Q&lt;20</span>';
+    h += '</div>';
+  }
+
+  if (sangerState.traceData && sangerState.traceData.traces) {
+    h += '<div style="font-variant:small-caps;font-size:.72rem;letter-spacing:.12em;color:#8a7f72;margin:24px 0 8px">chromatogram</div>';
+    h += '<div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">';
+    h += '<button class="btn-sanger-ghost btn-sm" onclick="sangerZoom(-1)">−</button>';
+    h += '<span id="sanger-zoom-label" style="font-size:.8rem;color:#8a7f72;min-width:40px;text-align:center">' + sangerState.traceZoom.toFixed(1) + 'x</span>';
+    h += '<button class="btn-sanger-ghost btn-sm" onclick="sangerZoom(1)">+</button>';
+    h += '<button class="btn-sanger-ghost btn-sm" onclick="sangerZoom(0)">Reset</button>';
+    h += '<div style="flex:1"></div>';
+    h += '<div style="display:flex;gap:10px;font-size:.75rem">';
+    Object.keys(TRACE_COLORS).forEach(function(b) {
+      h += '<span style="color:' + TRACE_COLORS[b] + ';font-weight:700;font-family:\'SF Mono\',Monaco,Consolas,monospace">' + b + '</span>';
+    });
+    h += '</div></div>';
+    h += '<div id="sanger-trace-container" style="position:relative;overflow:hidden;background:#fff;border:1px solid #d5cec0;border-radius:6px;cursor:grab">';
+    h += '<canvas id="sanger-trace-canvas" style="display:block"></canvas>';
+    h += '</div>';
+  }
+
+  if (a.aligned_ref && a.aligned_query) {
+    h += '<div style="font-variant:small-caps;font-size:.72rem;letter-spacing:.12em;color:#8a7f72;margin:24px 0 8px">sequence alignment</div>';
+    h += '<div class="sanger-alignment-wrap" id="sanger-alignment-box">';
+    h += buildAlignmentHTML(a.aligned_ref, a.aligned_query, a.ref_start || 0);
+    h += '</div>';
+  }
+
+  h += '</div>';
+  el.innerHTML = sangerStyles() + h;
+
+  setTimeout(function() {
+    if (sangerState.traceData) {
+      renderQualityChart();
+      renderTraceCanvas();
+      wireTraceDrag();
+    }
+  }, 60);
+}
+
+function sangerBatchNav(dir) {
+  var newIdx = sangerState.batchIdx + dir;
+  if (newIdx < 0 || newIdx >= sangerState.batchItems.length) return;
+  sangerState.batchIdx = newIdx;
+  sangerState.current = sangerState.batchItems[newIdx];
+  sangerState.traceData = null;
+  sangerState.traceZoom = 1;
+  sangerState.traceScroll = 0;
+  sangerNav('detail');
+}
+
+function sangerStat(label, val) {
+  return '<div class="sanger-stat"><div class="sanger-stat-label">' + esc(label) + '</div><div class="sanger-stat-val">' + esc(String(val)) + '</div></div>';
+}
+
+/* ── quality bar chart (canvas) ──────────────────────────── */
+function renderQualityChart() {
+  var box = document.getElementById('sanger-qual-chart');
+  if (!box || !sangerState.traceData) return;
+  var quals = sangerState.traceData.quals;
+  var n = quals.length;
+  if (!n) return;
+  var maxQ = 50;
+  var barW = Math.max(1, Math.min(4, box.clientWidth / n));
+  var canvas = document.createElement('canvas');
+  canvas.width = Math.ceil(barW * n);
+  canvas.height = 80;
+  canvas.style.width = '100%';
+  canvas.style.height = '80px';
+  var ctx = canvas.getContext('2d');
+  for (var i = 0; i < n; i++) {
+    var q = quals[i];
+    var bh = Math.round((q / maxQ) * 76);
+    ctx.fillStyle = qualColor(q);
+    ctx.fillRect(i * barW, 80 - bh, Math.max(1, barW - 0.5), bh);
+  }
+  box.innerHTML = '';
+  box.appendChild(canvas);
+}
+
+/* ── trace canvas ────────────────────────────────────────── */
+function renderTraceCanvas() {
+  var canvas = document.getElementById('sanger-trace-canvas');
+  var container = document.getElementById('sanger-trace-container');
+  if (!canvas || !sangerState.traceData) return;
+  var td = sangerState.traceData;
+  var traces = td.traces;
+  var peaks = td.peaks || [];
+  var bases = td.bases || '';
+
+  var traceLen = Math.max(
+    traces.G.length, traces.A.length, traces.T.length, traces.C.length, 1
+  );
+
+  var pxPerSample = 1.2 * sangerState.traceZoom;
+  var totalW = Math.ceil(traceLen * pxPerSample);
+  var H = 260;
+  canvas.width = totalW;
+  canvas.height = H;
+  canvas.style.width = totalW + 'px';
+  canvas.style.height = H + 'px';
+  container.style.height = H + 'px';
+
+  var ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, totalW, H);
+
+  var maxAmp = 0;
+  ['G', 'A', 'T', 'C'].forEach(function(ch) {
+    for (var i = 0; i < traces[ch].length; i++) {
+      if (traces[ch][i] > maxAmp) maxAmp = traces[ch][i];
+    }
+  });
+  if (maxAmp === 0) maxAmp = 1;
+  var scaleY = (H - 40) / maxAmp;
+
+  ['G', 'A', 'T', 'C'].forEach(function(ch) {
+    var data = traces[ch];
+    ctx.beginPath();
+    ctx.strokeStyle = TRACE_COLORS[ch];
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.85;
+    for (var i = 0; i < data.length; i++) {
+      var x = i * pxPerSample;
+      var y = H - 30 - data[i] * scaleY;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  });
+
+  ctx.font = '10px "SF Mono",Monaco,Consolas,monospace';
+  ctx.textAlign = 'center';
+  for (var i = 0; i < peaks.length && i < bases.length; i++) {
+    var x = peaks[i] * pxPerSample;
+    var base = bases[i];
+    ctx.fillStyle = TRACE_COLORS[base] || '#999';
+    ctx.fillText(base, x, H - 6);
+    ctx.strokeStyle = '#d5cec0';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(x, H - 20);
+    ctx.lineTo(x, H - 28);
+    ctx.stroke();
+  }
+
+  container.scrollLeft = sangerState.traceScroll;
+}
+
+function wireTraceDrag() {
+  var container = document.getElementById('sanger-trace-container');
+  if (!container) return;
+  container.onmousedown = function(e) {
+    sangerState.dragging = true;
+    sangerState.dragStart = e.clientX;
+    sangerState.scrollStart = container.scrollLeft;
+    container.style.cursor = 'grabbing';
+    e.preventDefault();
+  };
+  document.addEventListener('mousemove', function(e) {
+    if (!sangerState.dragging) return;
+    var c = document.getElementById('sanger-trace-container');
+    if (!c) return;
+    c.scrollLeft = sangerState.scrollStart - (e.clientX - sangerState.dragStart);
+  });
+  document.addEventListener('mouseup', function() {
+    if (!sangerState.dragging) return;
+    sangerState.dragging = false;
+    var c = document.getElementById('sanger-trace-container');
+    if (c) {
+      c.style.cursor = 'grab';
+      sangerState.traceScroll = c.scrollLeft;
+    }
+  });
+}
+
+function sangerZoom(dir) {
+  if (dir === 0) { sangerState.traceZoom = 1; sangerState.traceScroll = 0; }
+  else if (dir > 0) sangerState.traceZoom = Math.min(8, sangerState.traceZoom * 1.3);
+  else sangerState.traceZoom = Math.max(0.3, sangerState.traceZoom / 1.3);
+  renderTraceCanvas();
+  var label = document.getElementById('sanger-zoom-label');
+  if (label) label.textContent = sangerState.traceZoom.toFixed(1) + 'x';
+}
+
+/* ── alignment HTML builder ──────────────────────────────── */
+function buildAlignmentHTML(refAln, qryAln, refOffset) {
+  var BLOCK = 80;
+  var h = '';
+  var len = Math.max(refAln.length, qryAln.length);
+  for (var i = 0; i < len; i += BLOCK) {
+    var rSlice = refAln.substring(i, i + BLOCK);
+    var qSlice = qryAln.substring(i, i + BLOCK);
+    var matchLine = '';
+    var refLine = '';
+    var qryLine = '';
+    for (var j = 0; j < rSlice.length; j++) {
+      var rb = rSlice[j] || ' ';
+      var qb = qSlice[j] || ' ';
+      if (rb === qb && rb !== '-') {
+        matchLine += '|';
+        refLine += rb;
+        qryLine += qb;
+      } else if (rb === '-' || qb === '-') {
+        matchLine += ' ';
+        refLine += '<span class="sanger-gap">' + rb + '</span>';
+        qryLine += '<span class="sanger-gap">' + qb + '</span>';
+      } else {
+        matchLine += ' ';
+        refLine += '<span class="sanger-mismatch">' + rb + '</span>';
+        qryLine += '<span class="sanger-mismatch">' + qb + '</span>';
+      }
+    }
+    var pos = refOffset + i + 1;
+    h += '<div class="sanger-aln-block">';
+    h += '<div class="sanger-aln-num">' + pos + '</div>';
+    h += '<div class="sanger-aln-label">Ref</div><div class="sanger-aln-seq">' + refLine + '</div>';
+    h += '<div class="sanger-aln-num"></div>';
+    h += '<div class="sanger-aln-label"></div><div class="sanger-aln-seq sanger-aln-match">' + matchLine + '</div>';
+    h += '<div class="sanger-aln-num"></div>';
+    h += '<div class="sanger-aln-label">Qry</div><div class="sanger-aln-seq">' + qryLine + '</div>';
+    h += '</div>';
+  }
+  return h;
+}
+
+/* ── actions ─────────────────────────────────────────────── */
+async function sangerOpenDetail(id) {
+  try {
+    sangerState.current = await api('GET', '/api/sanger/alignments/' + id);
+    sangerState.traceData = null;
+    sangerState.traceZoom = 1;
+    sangerState.traceScroll = 0;
+    sangerState.batchItems = [sangerState.current];
+    sangerState.batchIdx = 0;
+    sangerNav('detail');
+  } catch(e) {
+    toast('Failed to load alignment', true);
+  }
+}
+
+async function sangerOpenBatch(batchId) {
+  try {
+    var data = await api('GET', '/api/sanger/batch/' + batchId);
+    sangerState.batchItems = data.items || [];
+    sangerState.batchId = batchId;
+    sangerState.batchIdx = 0;
+    sangerNav('batch');
+  } catch(e) {
+    toast('Failed to load batch', true);
+  }
+}
+
+async function sangerDelete(id) {
+  if (!confirm('Delete this alignment?')) return;
+  try {
+    await api('DELETE', '/api/sanger/alignments/' + id);
+    toast('Alignment deleted');
+    sangerNav('list');
+  } catch(e) {
+    toast('Delete failed', true);
+  }
+}
+
+async function sangerDeleteBatch(batchId) {
+  if (!confirm('Delete all alignments in this batch?')) return;
+  try {
+    await api('DELETE', '/api/sanger/batch/' + batchId);
+    toast('Batch deleted');
+    sangerNav('list');
+  } catch(e) {
+    toast('Delete failed', true);
+  }
+}
+
+/* ── styles ──────────────────────────────────────────────── */
+function sangerStyles() {
+  return '<style>\
+.btn-sanger-primary{background:#5b7a5e;color:#fff;border:none;padding:8px 18px;border-radius:6px;font-size:.85rem;cursor:pointer;font-weight:600;transition:background .15s}\
+.btn-sanger-primary:hover{background:#4a6a4d}\
+.btn-sanger-primary:disabled{opacity:.5;cursor:default}\
+.btn-sanger-ghost{background:none;border:1px solid #d5cec0;color:#4a4139;padding:5px 14px;border-radius:6px;font-size:.82rem;cursor:pointer;transition:border-color .15s}\
+.btn-sanger-ghost:hover{border-color:#8a7f72}\
+.btn-sanger-ghost.btn-sm{padding:3px 10px;font-size:.78rem}\
+.btn-sanger-icon{background:none;border:none;color:#8a7f72;cursor:pointer;font-size:.9rem;padding:4px 6px;border-radius:4px;transition:color .15s}\
+.btn-sanger-icon:hover{color:#c25a4a}\
+.sanger-empty{text-align:center;padding:60px 20px;color:#4a4139}\
+.sanger-table-wrap{overflow-x:auto}\
+.sanger-table{width:100%;border-collapse:collapse;font-size:.88rem}\
+.sanger-table th{text-align:left;font-variant:small-caps;font-size:.72rem;letter-spacing:.1em;color:#8a7f72;padding:8px 12px;border-bottom:2px solid #d5cec0}\
+.sanger-table td{padding:10px 12px;border-bottom:1px solid #ece7dd}\
+.sanger-row:hover{background:#f5f1ea}\
+.sanger-batch-row{background:#faf7f2}\
+.sanger-batch-badge{display:inline-block;background:#5b7a5e;color:#fff;font-size:.7rem;padding:2px 7px;border-radius:3px;font-weight:600;margin-right:6px;font-variant:normal}\
+.sanger-label{display:block;font-variant:small-caps;font-size:.72rem;letter-spacing:.12em;color:#8a7f72;margin-bottom:4px}\
+.sanger-input{width:100%;padding:9px 12px;border:1px solid #d5cec0;border-radius:6px;background:#fff;font-size:.9rem;color:#4a4139;box-sizing:border-box}\
+.sanger-input:focus{outline:none;border-color:#5b7a5e}\
+.sanger-drop-zone{border:2px dashed #d5cec0;border-radius:8px;padding:28px;text-align:center;color:#8a7f72;cursor:pointer;transition:border-color .2s;font-size:.88rem}\
+.sanger-drop-zone:hover{border-color:#5b7a5e}\
+.sanger-tabs{display:flex;gap:0;margin-bottom:10px}\
+.sanger-tab{padding:7px 16px;border:1px solid #d5cec0;background:#f0ebe3;color:#8a7f72;font-size:.82rem;cursor:pointer;transition:all .15s;border-right:none}\
+.sanger-tab:first-child{border-radius:6px 0 0 6px}\
+.sanger-tab:last-child{border-radius:0 6px 6px 0;border-right:1px solid #d5cec0}\
+.sanger-tab.active{background:#5b7a5e;color:#fff;border-color:#5b7a5e}\
+.sanger-stats-bar{display:flex;flex-wrap:wrap;gap:12px;background:#f0ebe3;border-radius:8px;padding:14px 18px}\
+.sanger-stat{}\
+.sanger-stat-label{font-variant:small-caps;font-size:.65rem;letter-spacing:.1em;color:#8a7f72}\
+.sanger-stat-val{font-family:"SF Mono",Monaco,Consolas,monospace;font-size:.85rem;color:#4a4139;margin-top:1px}\
+.sanger-batch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}\
+.sanger-batch-card{background:#fff;border:1px solid #d5cec0;border-radius:8px;padding:16px;cursor:pointer;transition:box-shadow .15s}\
+.sanger-batch-card:hover{box-shadow:0 2px 8px rgba(60,52,42,.1)}\
+.sanger-alignment-wrap{background:#fff;border:1px solid #d5cec0;border-radius:6px;padding:16px;overflow-x:auto;font-family:"SF Mono",Monaco,Consolas,monospace;font-size:.78rem;line-height:1.5}\
+.sanger-aln-block{display:grid;grid-template-columns:50px 28px 1fr;margin-bottom:8px}\
+.sanger-aln-num{color:#8a7f72;font-size:.7rem;text-align:right;padding-right:6px}\
+.sanger-aln-label{color:#8a7f72;font-size:.7rem}\
+.sanger-aln-seq{white-space:pre;letter-spacing:.05em}\
+.sanger-aln-match{color:#5b7a5e}\
+.sanger-mismatch{background:#f5d0ca;color:#c25a4a;border-radius:2px;padding:0 1px}\
+.sanger-gap{background:#f5ecc8;color:#a08930;border-radius:2px;padding:0 1px}\
+</style>';
+}
+
+registerView('sanger', renderSanger);
 
 
 // ── dilution.js ──
