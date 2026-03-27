@@ -221,6 +221,7 @@ async function renderNotebookBook(el){
             '+ Add image <input type="file" accept="image/*" style="display:none" data-entry="'+e.id+'" id="nb-img-inp-'+e.id+'"/>'+
           '</label>'+
         '</div>'+
+        '<div id="nb-gels-'+e.id+'" style="margin-bottom:8px"></div>'+
         '<div class="nb-entry-actions">'+
           '<button class="btn primary" onclick="saveEntryFull('+e.id+')">Save all</button>'+
           '<button class="btn" onclick="summariseEntry('+e.id+')">&#128161; Summarise</button>'+
@@ -266,6 +267,7 @@ async function renderNotebookBook(el){
     if(S.nbPage&&byDate[S.nbPage]){
       byDate[S.nbPage].forEach(function(e){
         loadEntryImages(e.id);
+        if(typeof gelRenderLinkedGels==='function') gelRenderLinkedGels('nb-gels-'+e.id,e.id);
         var inp=document.getElementById('nb-img-inp-'+e.id);
         if(inp) inp.addEventListener('change',function(ev){
           if(ev.target.files[0]) uploadEntryImage(e.id,ev.target.files[0]);

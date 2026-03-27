@@ -39,6 +39,8 @@ register_table("sanger_alignments", """CREATE TABLE IF NOT EXISTS sanger_alignme
     num_mismatches  INTEGER,
     num_gaps        INTEGER,
     is_reverse      INTEGER DEFAULT 0,
+    trim_start      INTEGER DEFAULT 0,
+    trim_end        INTEGER DEFAULT 0,
     created         TEXT NOT NULL)""")
 
 register_table("sanger_batches", """CREATE TABLE IF NOT EXISTS sanger_batches (
@@ -72,29 +74,93 @@ def parse_ab1(filepath):
     }
 
 
+def quality_trim(bases, quals, threshold=20, window=10):
+    """Trim low-quality bases from both ends using a sliding window approach.
+    Returns (trimmed_bases, trim_start, trim_end) where trim_start/end are
+    indices into the original sequence."""
+    n = len(quals)
+    if n == 0:
+        return bases, 0, 0
+
+    # Find start: first position where a window of bases averages above threshold
+    trim_start = 0
+    for i in range(n - window + 1):
+        w = quals[i:i + window]
+        if sum(w) / len(w) >= threshold:
+            trim_start = i
+            break
+    else:
+        trim_start = 0
+
+    # Find end: last position where a window of bases averages above threshold
+    trim_end = n
+    for i in range(n - 1, window - 2, -1):
+        w = quals[i - window + 1:i + 1]
+        if sum(w) / len(w) >= threshold:
+            trim_end = i + 1
+            break
+    else:
+        trim_end = n
+
+    if trim_start >= trim_end:
+        # Couldn't find good region, use full sequence
+        return bases, 0, n
+
+    return bases[trim_start:trim_end], trim_start, trim_end
+
+
 # ── Reference parsing ────────────────────────────────────
 
 def parse_gb_annotations(record):
-    """Extract annotations from a BioPython SeqRecord."""
+    """Extract all meaningful annotations from a BioPython SeqRecord."""
     annos = []
+    seen = set()  # deduplicate overlapping gene/CDS with same label+span
     for feat in record.features:
-        if feat.type in ("source",):
+        if feat.type == "source":
             continue
         label = ""
-        for key in ("label", "gene", "product", "note"):
+        for key in ("label", "gene", "product", "name", "locus_tag",
+                     "standard_name", "note", "ApEinfo_label"):
             if key in feat.qualifiers:
-                label = feat.qualifiers[key][0]
+                val = feat.qualifiers[key]
+                label = val[0] if isinstance(val, list) else str(val)
                 break
         if not label:
             label = feat.type
+        try:
+            start = int(feat.location.start)
+            end = int(feat.location.end)
+        except Exception:
+            continue
+        if end <= start:
+            continue
+        # Deduplicate: if a gene and CDS share the same label and span, keep one
+        key = (label, start, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Map SnapGene/ApE feature types to standard types
+        ftype = feat.type
         annos.append({
-            "type": feat.type,
+            "type": ftype,
             "label": label,
-            "start": int(feat.location.start),
-            "end": int(feat.location.end),
+            "start": start,
+            "end": end,
             "strand": feat.location.strand,
+            "color": _get_feat_color(feat),
         })
     return annos
+
+
+def _get_feat_color(feat):
+    """Try to extract color from SnapGene/ApE qualifiers."""
+    for key in ("ApEinfo_fwdcolor", "ApEinfo_revcolor", "color"):
+        if key in feat.qualifiers:
+            val = feat.qualifiers[key]
+            c = val[0] if isinstance(val, list) else str(val)
+            if c.startswith("#") or c.startswith("rgb"):
+                return c
+    return None
 
 
 def get_reference_sequence(ref_source, ref_id=None, ref_text=None):
@@ -280,7 +346,7 @@ def get_alignment(aid: int):
 def get_trace(aid: int):
     with get_db() as conn:
         row = conn.execute(
-            "SELECT ab1_filename, is_reverse FROM sanger_alignments WHERE id=?", (aid,)
+            "SELECT ab1_filename, is_reverse, trim_start, trim_end FROM sanger_alignments WHERE id=?", (aid,)
         ).fetchone()
     if not row:
         raise HTTPException(404, "Alignment not found")
@@ -289,20 +355,33 @@ def get_trace(aid: int):
         raise HTTPException(404, "AB1 file not found")
     data = parse_ab1(ab1_path)
     is_rev = row["is_reverse"] if "is_reverse" in row.keys() else 0
+    total_bases = len(data["bases"])
+
+    # Get trim values (handle missing columns gracefully)
+    try:
+        ts = row["trim_start"] or 0
+        te = row["trim_end"] or total_bases
+    except (KeyError, IndexError):
+        ts, te = 0, total_bases
+
     if is_rev:
-        # Reverse and complement trace data for display
         data["bases"] = reverse_complement(data["bases"])
         data["quals"] = list(reversed(data["quals"]))
         trace_len = max(len(data["traces"]["G"]), len(data["traces"]["A"]),
                        len(data["traces"]["T"]), len(data["traces"]["C"]), 1)
-        # Reverse the trace channels AND swap complements
         g, a, t, c = data["traces"]["G"], data["traces"]["A"], data["traces"]["T"], data["traces"]["C"]
-        data["traces"]["G"] = list(reversed(c))  # G<->C complement
+        data["traces"]["G"] = list(reversed(c))
         data["traces"]["C"] = list(reversed(g))
-        data["traces"]["A"] = list(reversed(t))  # A<->T complement
+        data["traces"]["A"] = list(reversed(t))
         data["traces"]["T"] = list(reversed(a))
-        # Reverse peak positions (mirror)
         data["peaks"] = [trace_len - 1 - p for p in reversed(data["peaks"])]
+        # Reverse trim indices
+        new_ts = total_bases - te
+        new_te = total_bases - ts
+        ts, te = new_ts, new_te
+
+    data["trim_start"] = ts
+    data["trim_end"] = te
     return data
 
 
@@ -313,6 +392,7 @@ async def align_ab1(
     ref_id: Optional[str] = Form(None),
     ref_text: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
+    trim_qual: Optional[int] = Form(20),
 ):
     try:
         ref_seq, ref_label, ref_annos = get_reference_sequence(ref_source, ref_id, ref_text)
@@ -356,6 +436,19 @@ async def align_ab1(
             errors.append({"file": file.filename, "error": "No base calls"})
             continue
 
+        # Quality trim
+        trim_threshold = trim_qual if trim_qual and trim_qual > 0 else 0
+        trim_start_idx = 0
+        trim_end_idx = len(query_seq)
+        if trim_threshold > 0:
+            query_seq, trim_start_idx, trim_end_idx = quality_trim(
+                query_seq, trace_data["quals"], threshold=trim_threshold
+            )
+            if not query_seq:
+                ab1_path.unlink(missing_ok=True)
+                errors.append({"file": file.filename, "error": "No bases left after trimming"})
+                continue
+
         result = do_alignment(query_seq, ref_seq)
         if not result:
             ab1_path.unlink(missing_ok=True)
@@ -375,13 +468,14 @@ async def align_ab1(
                    (batch_id, name, ab1_filename, ref_source, ref_name, identity_pct,
                     aligned_query, aligned_ref, alignment_score,
                     query_start, query_end, ref_start, ref_end,
-                    num_mismatches, num_gaps, is_reverse, created)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    num_mismatches, num_gaps, is_reverse, trim_start, trim_end, created)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (batch_id, aln_name, stored_name, ref_source, ref_label,
                  result["identity_pct"], result["aligned_query"], result["aligned_ref"],
                  result["score"], result["query_start"], result["query_end"],
                  result["ref_start"], result["ref_end"],
-                 result["num_mismatches"], result["num_gaps"], is_rev, now),
+                 result["num_mismatches"], result["num_gaps"], is_rev,
+                 trim_start_idx, trim_end_idx, now),
             )
             conn.commit()
             row = dict(conn.execute(

@@ -46,9 +46,14 @@ if (!document.getElementById('pl-css')) {
 }
 .pl-scrd:hover { border-color: #b5aca0; }
 .pl-scrd-sel { border-color: #5b7a5e !important; background: #edf2ed; }
+.pl-scrd-done { opacity: .6; }
+.pl-scrd-done .pl-sname { text-decoration: line-through; }
 .pl-sname { font-size: .83rem; font-weight: 600; color: #4a4139; }
 .pl-sproto { font-size: .7rem; color: #5b7a5e; margin-top: 2px; }
 .pl-snotes { font-size: .7rem; color: #8a7f72; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pl-sstatus { font-size: .62rem; font-weight: 600; margin-top: 3px; }
+.pl-sstatus-done { color: #5b7a5e; }
+.pl-sstatus-pending { color: #8a7f72; }
 .pl-sbtns { position: absolute; top: 6px; right: 6px; display: none; gap: 2px; }
 .pl-scrd:hover .pl-sbtns { display: flex; }
 
@@ -99,6 +104,8 @@ if (!document.getElementById('pl-css')) {
 .pl-btn-on:hover { background: #4a6a4d; }
 .pl-btn-del { background: transparent; border-color: #c0796a; color: #c0796a; width: 100%; }
 .pl-btn-del:hover { background: #c0796a18; }
+.pl-btn-sync { background: transparent; border-color: #5b7a5e; color: #5b7a5e; width: 100%; margin-bottom: 6px; }
+.pl-btn-sync:hover { background: #5b7a5e14; }
 .pl-btn-back { color: #8a7f72; font-size: .74rem; padding: 3px 8px; }
 .pl-row-btns { display: flex; gap: 6px; margin-top: 4px; }
 .pl-ibtn { background: none; border: none; cursor: pointer; padding: 2px 4px; font-size: .78rem; color: #8a7f72; border-radius: 3px; }
@@ -137,9 +144,12 @@ if (!document.getElementById('pl-css')) {
 .pl-ns .pl-nbg { stroke: #5b7a5e; stroke-width: 2; fill: #edf2ed; }
 .pl-ncs .pl-nbg { stroke: #5b7a5e; stroke-width: 2.5; fill: #e4ede4; }
 .pl-ncm:hover .pl-nbg { stroke: #8aaa8a; }
+.pl-ndone .pl-nbg { fill: #d4e6d6; stroke: #5b7a5e; stroke-width: 1.5; }
+.pl-ndone .pl-nlbl { fill: #3a5a3d; }
 .pl-nlbl { font-size: 13px; font-weight: 600; fill: #4a4139; pointer-events: none; }
 .pl-nproto { font-size: 10.5px; fill: #5b7a5e; pointer-events: none; }
 .pl-nnotes { font-size: 10.5px; fill: #8a7f72; pointer-events: none; }
+.pl-ncheck { font-size: 11px; fill: #5b7a5e; pointer-events: none; }
 .pl-edge { fill: none; stroke: #bfb8ae; stroke-width: 2; cursor: pointer; }
 .pl-edge:hover { stroke: #c07060; stroke-width: 2.5; }
 .pl-eprev {
@@ -182,7 +192,10 @@ function plStep(id) {
     : null;
 }
 function trunc(str, n) {
-  return str && str.length > n ? str.substring(0, n - 1) + '…' : (str || '');
+  return str && str.length > n ? str.substring(0, n - 1) + '\u2026' : (str || '');
+}
+function isDone(s) {
+  return s && (s.status === 'done');
 }
 function bezier(from, to) {
   var x1 = from.pos_x + NW, y1 = from.pos_y + NH / 2;
@@ -204,6 +217,31 @@ function worldPt(svg, worldEl, e) {
   var pt = svg.createSVGPoint();
   pt.x = e.clientX; pt.y = e.clientY;
   return pt.matrixTransform(worldEl.getScreenCTM().inverse());
+}
+
+/* ═══════════════ NODE HTML ═══════════════ */
+function plNodeHtml(s) {
+  var sel  = PL.selectedStep === s.id;
+  var csrc = PL.connectFrom  === s.id;
+  var done = isDone(s);
+  var cls  = 'pl-node' + (sel ? ' pl-ns' : '') + (csrc ? ' pl-ncs' : '') + (done ? ' pl-ndone' : '') + (PL.connectMode ? ' pl-ncm' : '');
+  var h = '<g class="' + cls + '" data-sid="' + s.id + '" transform="translate(' + s.pos_x + ',' + s.pos_y + ')">';
+  h += '<rect class="pl-nbg" width="' + NW + '" height="' + NH + '" rx="8"/>';
+  if (done) {
+    h += '<text class="pl-ncheck" x="' + (NW - 18) + '" y="16">\u2713</text>';
+  }
+  h += '<text class="pl-nlbl" x="12" y="26">' + esc(trunc(s.name, 17)) + '</text>';
+  var pr = plProto(s.protocol_id);
+  if (pr) {
+    h += '<text class="pl-nproto" x="12" y="45">\u2B21 ' + esc(trunc(pr.title, 20)) + '</text>';
+  } else if (s.notes) {
+    h += '<text class="pl-nnotes" x="12" y="45">' + esc(trunc(s.notes, 22)) + '</text>';
+  }
+  if (PL.connectMode && !PL.connectFrom) {
+    h += '<circle class="pl-hdl" cx="' + NW + '" cy="' + (NH / 2) + '" r="6" data-sid="' + s.id + '"/>';
+  }
+  h += '</g>';
+  return h;
 }
 
 /* ═══════════════ DRAW ═══════════════ */
@@ -249,9 +287,14 @@ function plSbList() {
 
 function plSbPipeline() {
   var c = PL.current;
+  var doneCount = c.steps.filter(isDone).length;
+  var totalCount = c.steps.length;
   var h = '<div class="pl-sb">';
   h += '<div class="pl-sb-head">';
-  h += '<button class="pl-btn pl-btn-back" onclick="plClose()">← Back</button>';
+  h += '<button class="pl-btn pl-btn-back" onclick="plClose()">\u2190 Back</button>';
+  if (totalCount > 0) {
+    h += '<span style="font-size:.68rem;color:#8a7f72">' + doneCount + '/' + totalCount + ' done</span>';
+  }
   h += '</div>';
   h += '<div class="pl-ptitle-wrap">';
   h += '<div contenteditable="true" id="pl-ptitle" class="pl-ptitle" onblur="plSaveTitle(this)">' + esc(c.pipeline.name) + '</div>';
@@ -268,19 +311,23 @@ function plSbPipeline() {
   } else {
     c.steps.forEach(function (s) {
       var sel = PL.selectedStep === s.id;
-      h += '<div class="pl-scrd' + (sel ? ' pl-scrd-sel' : '') + '" onclick="plSelStep(' + s.id + ')">';
-      h += '<div class="pl-sname">' + esc(s.name) + '</div>';
+      var done = isDone(s);
+      h += '<div class="pl-scrd' + (sel ? ' pl-scrd-sel' : '') + (done ? ' pl-scrd-done' : '') + '" onclick="plSelStep(' + s.id + ')">';
+      h += '<div class="pl-sname">' + (done ? '\u2713 ' : '') + esc(s.name) + '</div>';
       var pr = plProto(s.protocol_id);
-      if (pr) h += '<div class="pl-sproto">⬡ ' + esc(pr.title) + '</div>';
+      if (pr) h += '<div class="pl-sproto">\u2B21 ' + esc(pr.title) + '</div>';
       if (s.notes) h += '<div class="pl-snotes">' + esc(s.notes) + '</div>';
       h += '<div class="pl-sbtns">';
-      h += '<button class="pl-ibtn" onclick="event.stopPropagation();plEditStep(' + s.id + ')" title="Edit">✎</button>';
-      h += '<button class="pl-ibtn pl-ibtn-d" onclick="event.stopPropagation();plDelStep(' + s.id + ')" title="Delete">✕</button>';
+      h += '<button class="pl-ibtn" onclick="event.stopPropagation();plEditStep(' + s.id + ')" title="Edit">\u270E</button>';
+      h += '<button class="pl-ibtn pl-ibtn-d" onclick="event.stopPropagation();plDelStep(' + s.id + ')" title="Delete">\u2715</button>';
       h += '</div></div>';
     });
   }
   h += '</div>';
-  h += '<div class="pl-sb-foot"><button class="pl-btn pl-btn-del" onclick="plDelPipeline()">Delete Pipeline</button></div>';
+  h += '<div class="pl-sb-foot">';
+  h += '<button class="pl-btn pl-btn-sync" onclick="plSyncReminders()">\u21BB Push to Reminders</button>';
+  h += '<button class="pl-btn pl-btn-del" onclick="plDelPipeline()">Delete Pipeline</button>';
+  h += '</div>';
   h += '</div>';
   return h;
 }
@@ -308,7 +355,7 @@ function plStepForm() {
 /* ── canvas ── */
 function plCanvas() {
   if (!PL.current) {
-    return '<div class="pl-cv-empty"><div class="pl-cv-hint">← Select a pipeline to view its graph</div></div>';
+    return '<div class="pl-cv-empty"><div class="pl-cv-hint">\u2190 Select a pipeline to view its graph</div></div>';
   }
   var c = PL.current;
   var h = '<div class="pl-cv">';
@@ -316,21 +363,19 @@ function plCanvas() {
   /* toolbar */
   h += '<div class="pl-toolbar">';
   if (PL.connectMode) {
-    h += '<button class="pl-btn pl-btn-on" onclick="plTogConn()">✕ Cancel</button>';
+    h += '<button class="pl-btn pl-btn-on" onclick="plTogConn()">\u2715 Cancel</button>';
     h += '<span class="pl-hint">' + (PL.connectFrom ? 'Now click the destination step' : 'Click the source step') + '</span>';
   } else {
-    h += '<button class="pl-btn" onclick="plTogConn()">↝ Connect Steps</button>';
-    h += '<span class="pl-hint">Drag nodes to reposition · Click edges to remove</span>';
+    h += '<button class="pl-btn" onclick="plTogConn()">\u219D Connect Steps</button>';
+    h += '<span class="pl-hint">Drag nodes to reposition \u00B7 Click edges to remove</span>';
   }
   h += '</div>';
 
   /* SVG */
   h += '<svg class="pl-svg" id="pl-svg">';
   h += '<defs>';
-  /* normal arrowhead */
   h += '<marker id="arr" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">';
   h += '<path d="M0,0 L0,7 L9,3.5 z" fill="#b5aca0"/></marker>';
-  /* highlight arrowhead (preview / hover) */
   h += '<marker id="arr-hi" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">';
   h += '<path d="M0,0 L0,7 L9,3.5 z" fill="#5b7a5e"/></marker>';
   h += '</defs>';
@@ -363,23 +408,7 @@ function plCanvas() {
   /* nodes */
   h += '<g id="pl-nodes">';
   c.steps.forEach(function (s) {
-    var sel  = PL.selectedStep === s.id;
-    var csrc = PL.connectFrom  === s.id;
-    var cls  = 'pl-node' + (sel ? ' pl-ns' : '') + (csrc ? ' pl-ncs' : '') + (PL.connectMode ? ' pl-ncm' : '');
-    h += '<g class="' + cls + '" data-sid="' + s.id + '" transform="translate(' + s.pos_x + ',' + s.pos_y + ')">';
-    h += '<rect class="pl-nbg" width="' + NW + '" height="' + NH + '" rx="8"/>';
-    h += '<text class="pl-nlbl" x="12" y="26">' + esc(trunc(s.name, 17)) + '</text>';
-    var pr = plProto(s.protocol_id);
-    if (pr) {
-      h += '<text class="pl-nproto" x="12" y="45">⬡ ' + esc(trunc(pr.title, 20)) + '</text>';
-    } else if (s.notes) {
-      h += '<text class="pl-nnotes" x="12" y="45">' + esc(trunc(s.notes, 22)) + '</text>';
-    }
-    /* connection handle – only shown when in connect-mode awaiting source pick */
-    if (PL.connectMode && !PL.connectFrom) {
-      h += '<circle class="pl-hdl" cx="' + NW + '" cy="' + (NH / 2) + '" r="6" data-sid="' + s.id + '"/>';
-    }
-    h += '</g>';
+    h += plNodeHtml(s);
   });
   h += '</g>';
   h += '</g>'; /* world */
@@ -426,22 +455,7 @@ function plRedrGraph() {
   if (nEl) {
     var nh = '';
     PL.current.steps.forEach(function (s) {
-      var sel  = PL.selectedStep === s.id;
-      var csrc = PL.connectFrom  === s.id;
-      var cls  = 'pl-node' + (sel ? ' pl-ns' : '') + (csrc ? ' pl-ncs' : '') + (PL.connectMode ? ' pl-ncm' : '');
-      nh += '<g class="' + cls + '" data-sid="' + s.id + '" transform="translate(' + s.pos_x + ',' + s.pos_y + ')">';
-      nh += '<rect class="pl-nbg" width="' + NW + '" height="' + NH + '" rx="8"/>';
-      nh += '<text class="pl-nlbl" x="12" y="26">' + esc(trunc(s.name, 17)) + '</text>';
-      var pr = plProto(s.protocol_id);
-      if (pr) {
-        nh += '<text class="pl-nproto" x="12" y="45">⬡ ' + esc(trunc(pr.title, 20)) + '</text>';
-      } else if (s.notes) {
-        nh += '<text class="pl-nnotes" x="12" y="45">' + esc(trunc(s.notes, 22)) + '</text>';
-      }
-      if (PL.connectMode && !PL.connectFrom) {
-        nh += '<circle class="pl-hdl" cx="' + NW + '" cy="' + (NH / 2) + '" r="6" data-sid="' + s.id + '"/>';
-      }
-      nh += '</g>';
+      nh += plNodeHtml(s);
     });
     nEl.innerHTML = nh;
   }
@@ -702,6 +716,17 @@ function plTogConn() {
   plDraw();
 }
 
+async function plSyncReminders() {
+  if (!PL.current) return;
+  var pid = PL.current.pipeline.id;
+  var res = await api('POST', '/api/pipelines/' + pid + '/sync-reminders');
+  if (res.synced > 0) {
+    toast(res.synced + ' step' + (res.synced > 1 ? 's' : '') + ' pushed to ' + res.group_name + ' reminders');
+  } else {
+    toast('All steps already in reminders');
+  }
+}
+
 /* ═══════════════ REGISTER ═══════════════ */
 async function renderPipeline(el) {
   _plEl = el;
@@ -736,5 +761,6 @@ window.plCancelEdit = plCancelEdit;
 window.plSaveStep   = plSaveStep;
 window.plDelStep    = plDelStep;
 window.plTogConn    = plTogConn;
+window.plSyncReminders = plSyncReminders;
 
 })(); /* end IIFE */

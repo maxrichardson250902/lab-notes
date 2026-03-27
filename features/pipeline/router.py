@@ -20,6 +20,7 @@ register_table("pipeline_steps", """CREATE TABLE IF NOT EXISTS pipeline_steps (
     protocol_id INTEGER,
     pos_x       REAL NOT NULL DEFAULT 100,
     pos_y       REAL NOT NULL DEFAULT 100,
+    status      TEXT NOT NULL DEFAULT 'pending',
     created     TEXT NOT NULL)""")
 
 register_table("pipeline_edges", """CREATE TABLE IF NOT EXISTS pipeline_edges (
@@ -115,6 +116,13 @@ def update_pipeline(pid: int, body: UpdatePipeline):
 @router.delete("/pipelines/{pid}")
 def delete_pipeline(pid: int):
     with get_db() as conn:
+        # Also remove linked reminders
+        step_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM pipeline_steps WHERE pipeline_id=?", (pid,)).fetchall()]
+        if step_ids:
+            ph = ",".join("?" * len(step_ids))
+            conn.execute(
+                f"DELETE FROM reminders WHERE pipeline_step_id IN ({ph})", step_ids)
         conn.execute("DELETE FROM pipeline_edges WHERE pipeline_id=?", (pid,))
         conn.execute("DELETE FROM pipeline_steps WHERE pipeline_id=?", (pid,))
         conn.execute("DELETE FROM pipelines WHERE id=?", (pid,))
@@ -143,6 +151,10 @@ def update_step(pid: int, sid: int, body: UpdateStep):
             (body.name, body.notes, body.protocol_id, body.pos_x, body.pos_y, sid, pid))
         conn.commit()
         row = dict(conn.execute("SELECT * FROM pipeline_steps WHERE id=?", (sid,)).fetchone())
+        # If this step has a linked reminder, update its text too
+        conn.execute(
+            "UPDATE reminders SET text=? WHERE pipeline_step_id=?", (body.name, sid))
+        conn.commit()
     return row
 
 
@@ -153,6 +165,8 @@ def delete_step(pid: int, sid: int):
             "DELETE FROM pipeline_edges WHERE pipeline_id=? AND (from_step=? OR to_step=?)",
             (pid, sid, sid))
         conn.execute("DELETE FROM pipeline_steps WHERE id=? AND pipeline_id=?", (sid, pid))
+        # Remove linked reminder
+        conn.execute("DELETE FROM reminders WHERE pipeline_step_id=?", (sid,))
         conn.commit()
     return {"ok": True}
 
@@ -190,6 +204,45 @@ def delete_edge(pid: int, eid: int):
         conn.execute("DELETE FROM pipeline_edges WHERE id=? AND pipeline_id=?", (eid, pid))
         conn.commit()
     return {"ok": True}
+
+
+# ── Sync to reminders ─────────────────────────────────────────────────────────
+
+@router.post("/pipelines/{pid}/sync-reminders")
+def sync_reminders(pid: int):
+    """Create reminders for all steps that don't already have one.
+    Uses pipeline.name as group_name. Idempotent — skips steps already linked."""
+    with get_db() as conn:
+        p = conn.execute("SELECT * FROM pipelines WHERE id=?", (pid,)).fetchone()
+        if not p:
+            raise HTTPException(404, "Pipeline not found")
+        steps = conn.execute(
+            "SELECT * FROM pipeline_steps WHERE pipeline_id=? ORDER BY created", (pid,)).fetchall()
+
+        # Find which steps already have linked reminders
+        step_ids = [s["id"] for s in steps]
+        existing = set()
+        if step_ids:
+            ph = ",".join("?" * len(step_ids))
+            rows = conn.execute(
+                f"SELECT pipeline_step_id FROM reminders WHERE pipeline_step_id IN ({ph})",
+                step_ids).fetchall()
+            existing = set(r["pipeline_step_id"] for r in rows)
+
+        now = datetime.utcnow().isoformat()
+        created = 0
+        for s in steps:
+            if s["id"] in existing:
+                continue
+            conn.execute(
+                "INSERT INTO reminders (text,due_date,done,source,group_name,pipeline_step_id,created) "
+                "VALUES (?,NULL,?,?,?,?,?)",
+                (s["name"], 1 if (s.get("status") or "pending") == "done" else 0,
+                 "pipeline", p["name"], s["id"], now))
+            created += 1
+        conn.commit()
+
+    return {"synced": created, "total_steps": len(steps), "group_name": p["name"]}
 
 
 @router.get("/pipeline/protocols")

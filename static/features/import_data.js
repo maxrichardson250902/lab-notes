@@ -5,8 +5,78 @@ var _dna = {
   importState: {},
   settings: { primer_prefix: '', plasmid_prefix: '' },
   linkRegex: null,
-  showSettings: false
+  showSettings: false,
+  search: { primers: '', plasmids: '' },
+  sort: {
+    primers: { col: 'name', dir: 'asc' },
+    plasmids: { col: 'name', dir: 'asc' }
+  }
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SORTING & FILTERING HELPERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+function _dnaFilterItems(items, query, fields) {
+  if (!query) return items;
+  var lc = query.toLowerCase();
+  return items.filter(function(item) {
+    for (var i = 0; i < fields.length; i++) {
+      var val = (item[fields[i]] || '').toLowerCase();
+      if (val.indexOf(lc) !== -1) return true;
+    }
+    return false;
+  });
+}
+
+function _dnaSortItems(items, col, dir) {
+  var sorted = items.slice();
+  sorted.sort(function(a, b) {
+    var va = (a[col] || '').toLowerCase();
+    var vb = (b[col] || '').toLowerCase();
+    if (va < vb) return dir === 'asc' ? -1 : 1;
+    if (va > vb) return dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+  return sorted;
+}
+
+function _dnaSortBy(tab, col) {
+  var s = _dna.sort[tab];
+  if (s.col === col) {
+    s.dir = (s.dir === 'asc') ? 'desc' : 'asc';
+  } else {
+    s.col = col;
+    s.dir = 'asc';
+  }
+  _dnaRenderTable();
+}
+
+function _dnaSortIndicator(tab, col) {
+  var s = _dna.sort[tab];
+  if (s.col !== col) return ' <span class="dna-sort-arrow dna-sort-neutral">\u2195</span>';
+  if (s.dir === 'asc') return ' <span class="dna-sort-arrow">\u25B2</span>';
+  return ' <span class="dna-sort-arrow">\u25BC</span>';
+}
+
+function _dnaOnSearch(tab) {
+  var input = document.getElementById('dna-search-' + tab);
+  _dna.search[tab] = input ? input.value : '';
+  _dnaRenderTable();
+}
+
+function _dnaClearSearch(tab) {
+  _dna.search[tab] = '';
+  var input = document.getElementById('dna-search-' + tab);
+  if (input) input.value = '';
+  _dnaRenderTable();
+}
+
+function _dnaRenderTable() {
+  var wrap = document.getElementById('dna-table-area');
+  if (!wrap) return;
+  wrap.innerHTML = (_dna.tab === 'primers') ? _dnaPrimerTable() : _dnaPlasmidTable();
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  MAIN RENDER
@@ -32,11 +102,14 @@ async function renderDnaManager(el) {
 
   // tabs
   html += '<div class="dna-tabs">';
-  html += '<span class="dna-tab' + (_dna.tab === 'primers' ? ' active' : '') + '" onclick="_dnaSetTab(\'primers\')">Primers <small class="muted">(' + _dna.primers.length + ')</small></span>';
-  html += '<span class="dna-tab' + (_dna.tab === 'plasmids' ? ' active' : '') + '" onclick="_dnaSetTab(\'plasmids\')">Plasmids <small class="muted">(' + _dna.plasmids.length + ')</small></span>';
+  html += '<span class="dna-tab' + (_dna.tab === 'primers' ? ' active' : '') + '" onclick="_dnaSetTab(\x27primers\x27)">Primers <small class="muted">(' + _dna.primers.length + ')</small></span>';
+  html += '<span class="dna-tab' + (_dna.tab === 'plasmids' ? ' active' : '') + '" onclick="_dnaSetTab(\x27plasmids\x27)">Plasmids <small class="muted">(' + _dna.plasmids.length + ')</small></span>';
   html += '</div>';
 
+  html += '<div id="dna-table-area">';
   html += (_dna.tab === 'primers') ? _dnaPrimerTable() : _dnaPlasmidTable();
+  html += '</div>';
+
   html += '</div>';
 
   // import modal (hidden)
@@ -111,18 +184,53 @@ async function _dnaSaveSettings() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  SEARCH BAR
+// ══════════════════════════════════════════════════════════════════════════════
+
+function _dnaSearchBar(tab, totalCount, filteredCount) {
+  var query = _dna.search[tab] || '';
+  var countLabel = '';
+  if (query && filteredCount !== totalCount) {
+    countLabel = filteredCount + ' of ' + totalCount + ' items';
+  } else {
+    countLabel = totalCount + ' items';
+  }
+  var html = '<div class="dna-search-bar">';
+  html += '<span class="dna-search-count">' + esc(countLabel) + '</span>';
+  html += '<div class="dna-search-input-wrap">';
+  html += '<input id="dna-search-' + tab + '" class="dna-input dna-search-input" type="text" placeholder="Search\u2026" value="' + esc(query) + '" oninput="_dnaOnSearch(\x27' + tab + '\x27)">';
+  if (query) {
+    html += '<span class="dna-search-clear" onclick="_dnaClearSearch(\x27' + tab + '\x27)">\u00d7</span>';
+  }
+  html += '</div></div>';
+  return html;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  PRIMER TABLE
 // ══════════════════════════════════════════════════════════════════════════════
 
 function _dnaPrimerTable() {
-  var items = _dna.primers;
-  var html = '<div class="dna-section-hdr">PRIMERS</div>';
+  var allItems = _dna.primers;
+  var searchFields = ['name', 'sequence', 'use', 'box_number'];
+  var filtered = _dnaFilterItems(allItems, _dna.search.primers, searchFields);
+  var s = _dna.sort.primers;
+  var items = _dnaSortItems(filtered, s.col, s.dir);
 
-  if (!items.length) {
+  var html = '<div class="dna-section-hdr">PRIMERS</div>';
+  html += _dnaSearchBar('primers', allItems.length, filtered.length);
+
+  if (!allItems.length) {
     html += '<div class="dna-empty">No primers yet \u2014 add one below or import from a file.</div>';
+  } else if (!items.length) {
+    html += '<div class="dna-empty">No primers match your search.</div>';
   } else {
     html += '<div class="dna-table-wrap"><table class="dna-table"><thead><tr>';
-    html += '<th>Name</th><th>Sequence</th><th>Use</th><th>Box #</th><th>Tm</th><th>.gb</th><th style="width:2.5rem"></th>';
+    html += '<th class="dna-th-sort" onclick="_dnaSortBy(\x27primers\x27,\x27name\x27)">Name' + _dnaSortIndicator('primers', 'name') + '</th>';
+    html += '<th class="dna-th-sort" onclick="_dnaSortBy(\x27primers\x27,\x27sequence\x27)">Sequence' + _dnaSortIndicator('primers', 'sequence') + '</th>';
+    html += '<th class="dna-th-sort" onclick="_dnaSortBy(\x27primers\x27,\x27use\x27)">Use' + _dnaSortIndicator('primers', 'use') + '</th>';
+    html += '<th class="dna-th-sort" onclick="_dnaSortBy(\x27primers\x27,\x27box_number\x27)">Box #' + _dnaSortIndicator('primers', 'box_number') + '</th>';
+    html += '<th>Tm</th><th>.gb</th><th style="width:2.5rem"></th>';
     html += '</tr></thead><tbody>';
     items.forEach(function(p) {
       var seq = esc(p.sequence || '');
@@ -191,18 +299,30 @@ async function _dnaDeletePrimer(id) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 function _dnaPlasmidTable() {
-  var items = _dna.plasmids;
-  var html = '<div class="dna-section-hdr">PLASMIDS</div>';
+  var allItems = _dna.plasmids;
+  var searchFields = ['name', 'use', 'box_location', 'glycerol_location'];
+  var filtered = _dnaFilterItems(allItems, _dna.search.plasmids, searchFields);
+  var s = _dna.sort.plasmids;
+  var items = _dnaSortItems(filtered, s.col, s.dir);
 
-  if (!items.length) {
+  var html = '<div class="dna-section-hdr">PLASMIDS</div>';
+  html += _dnaSearchBar('plasmids', allItems.length, filtered.length);
+
+  if (!allItems.length) {
     html += '<div class="dna-empty">No plasmids yet \u2014 add one below or import from a file.</div>';
+  } else if (!items.length) {
+    html += '<div class="dna-empty">No plasmids match your search.</div>';
   } else {
     // Check if any plasmid has resistance data
-    var anyResistance = items.some(function(p) { return p.antibiotic_resistance; });
-    var anyGb = items.some(function(p) { return p.gb_file; });
+    var anyGb = allItems.some(function(p) { return p.gb_file; });
 
     html += '<div class="dna-table-wrap"><table class="dna-table"><thead><tr>';
-    html += '<th>Name</th><th>Use</th><th>Resistance</th><th>Box Location</th><th>Glycerol</th><th>.gb</th><th style="width:2.5rem"></th>';
+    html += '<th class="dna-th-sort" onclick="_dnaSortBy(\x27plasmids\x27,\x27name\x27)">Name' + _dnaSortIndicator('plasmids', 'name') + '</th>';
+    html += '<th class="dna-th-sort" onclick="_dnaSortBy(\x27plasmids\x27,\x27use\x27)">Use' + _dnaSortIndicator('plasmids', 'use') + '</th>';
+    html += '<th>Resistance</th>';
+    html += '<th class="dna-th-sort" onclick="_dnaSortBy(\x27plasmids\x27,\x27box_location\x27)">Box Location' + _dnaSortIndicator('plasmids', 'box_location') + '</th>';
+    html += '<th class="dna-th-sort" onclick="_dnaSortBy(\x27plasmids\x27,\x27glycerol_location\x27)">Glycerol' + _dnaSortIndicator('plasmids', 'glycerol_location') + '</th>';
+    html += '<th>.gb</th><th style="width:2.5rem"></th>';
     html += '</tr></thead><tbody>';
     items.forEach(function(p) {
       html += '<tr>';
@@ -286,10 +406,10 @@ async function _dnaDeletePlasmid(id) {
 function _dnaGbCell(type, item) {
   if (item.gb_file) {
     return '<a href="/api/' + type + 's/' + item.id + '/gb" class="dna-gb-link" title="Download ' + esc(item.gb_file) + '">\u2b07 ' + esc(item.gb_file) + '</a>' +
-           ' <span class="dna-del" onclick="_dnaRemoveGb(\'' + type + '\',' + item.id + ')" title="Remove .gb">\u00d7</span>';
+           ' <span class="dna-del" onclick="_dnaRemoveGb(\x27' + type + '\x27,' + item.id + ')" title="Remove .gb">\u00d7</span>';
   }
   return '<label class="dna-gb-upload" title="Attach .gb file">\u{1F4CE}' +
-         '<input type="file" accept=".gb,.gbk,.genbank" style="display:none" onchange="_dnaUploadGb(\'' + type + '\',' + item.id + ',this)">' +
+         '<input type="file" accept=".gb,.gbk,.genbank" style="display:none" onchange="_dnaUploadGb(\x27' + type + '\x27,' + item.id + ',this)">' +
          '</label>';
 }
 
@@ -663,13 +783,10 @@ function _dnaLinkifyElement(el) {
 }
 
 // ── Scan all existing content for linkification ─────────────────────────────
-// This fixes the bug where links only appeared when scrolling through days
-// (i.e. only on new mutations) but not on initial view render.
 
 function _dnaLinkifyAll() {
   if (!_dna.linkRegex) return;
   var target = document.getElementById('main') || document.getElementById('content') || document.body;
-  // Find all elements that could contain text content to linkify
   var candidates = target.querySelectorAll('.card, .entry, .entry-content, [class*="content"], p, div, td, li, span, h1, h2, h3, h4');
   for (var i = 0; i < candidates.length; i++) {
     _dnaLinkifyElement(candidates[i]);
@@ -691,24 +808,17 @@ function _dnaStartObserver() {
   });
   _dnaObserver.observe(target, { childList: true, subtree: true });
 
-  // Immediately linkify existing content on the page
   _dnaLinkifyAll();
 }
-
-// ── Hook into view changes so we re-linkify after navigation ────────────────
-// When setView() is called, the new view renders async content that may not
-// be caught by the mutation observer (e.g. if innerHTML is set on an element
-// that already exists). We re-scan after a short delay to catch these cases.
 
 var _dnaOrigSetView = null;
 
 function _dnaHookSetView() {
-  if (_dnaOrigSetView) return; // already hooked
+  if (_dnaOrigSetView) return;
   if (typeof setView !== 'function') return;
   _dnaOrigSetView = setView;
   setView = function(name) {
     _dnaOrigSetView(name);
-    // Re-linkify after the new view has rendered (async content needs time)
     setTimeout(_dnaLinkifyAll, 200);
     setTimeout(_dnaLinkifyAll, 800);
   };
@@ -774,7 +884,7 @@ function _dnaShowPopover(linkEl) {
     html += '</div>';
   }
 
-  html += '<div class="dna-pop-footer"><a href="#" onclick="_dnaGoToManager(\'' + esc(type || '') + '\');return false;">View in DNA Manager \u2192</a></div>';
+  html += '<div class="dna-pop-footer"><a href="#" onclick="_dnaGoToManager(\x27' + esc(type || '') + '\x27);return false;">View in DNA Manager \u2192</a></div>';
 
   pop.innerHTML = html;
 
@@ -838,6 +948,20 @@ function _dnaStyles() {
     '.dna-del { cursor:pointer; color:#b09e8e; font-size:1.1rem; line-height:1; }' +
     '.dna-del:hover { color:#c0392b; }' +
     '.dna-setting-label { display:flex; flex-direction:column; font-size:.82rem; color:#8a7f72; gap:.2rem; }' +
+
+    /* search bar */
+    '.dna-search-bar { display:flex; align-items:center; justify-content:space-between; gap:.8rem; margin-bottom:.5rem; }' +
+    '.dna-search-count { font-size:.8rem; color:#8a7f72; white-space:nowrap; }' +
+    '.dna-search-input-wrap { position:relative; }' +
+    '.dna-search-input { width:14rem; padding-right:1.6rem !important; }' +
+    '.dna-search-clear { position:absolute; right:.4rem; top:50%; transform:translateY(-50%); cursor:pointer; color:#b09e8e; font-size:1rem; line-height:1; }' +
+    '.dna-search-clear:hover { color:#c0392b; }' +
+
+    /* sortable headers */
+    '.dna-th-sort { cursor:pointer; user-select:none; white-space:nowrap; }' +
+    '.dna-th-sort:hover { color:#4a4139; }' +
+    '.dna-sort-arrow { font-size:.65rem; vertical-align:middle; margin-left:.15rem; }' +
+    '.dna-sort-neutral { color:#ccc5b8; }' +
 
     /* resistance badges */
     '.dna-resist-badge { display:inline-block; font-size:.75rem; padding:.15rem .45rem; background:#e8f0e8; color:#3d5a3f; border:1px solid #b8cfb8; border-radius:3px; font-weight:500; letter-spacing:.02em; white-space:nowrap; }' +

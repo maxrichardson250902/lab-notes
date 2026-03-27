@@ -17,6 +17,7 @@
     '.proto-search-bar{margin-bottom:12px}',
     '.proto-search-bar input{width:100%;max-width:360px}',
     '.protocol-card{border:1px solid #d5cec0;border-radius:8px;background:#faf8f4;margin-bottom:10px;overflow:hidden}',
+    '.protocol-card.editing{border-color:#5b7a5e;box-shadow:0 0 0 1px #5b7a5e}',
     '.protocol-header{display:flex;align-items:flex-start;gap:12px;padding:14px 16px;cursor:pointer;user-select:none}',
     '.protocol-header:hover{background:#f0ebe3}',
     '.protocol-title{font-weight:600;font-size:14px;color:#4a4139;margin-bottom:2px}',
@@ -38,8 +39,16 @@
     '.recipe-table th .del-col:hover{color:#c0392b}',
     '.recipe-table .del-row{background:none;border:none;cursor:pointer;font-size:13px;color:#c0b8b0;padding:4px 8px;width:100%;height:100%}',
     '.recipe-table .del-row:hover{color:#c0392b;background:#fff0f0}',
+    '.recipe-table th input.col-rename{border:none;background:transparent;font-size:12px;font-weight:600;font-family:inherit;color:#4a4139;outline:none;width:100%;padding:0}',
+    '.recipe-table th input.col-rename:focus{background:#fff8f0;border-radius:2px}',
     '.recipe-add-row{display:flex;gap:8px;margin-top:8px;align-items:center}',
     '.recipe-edit-actions{display:flex;gap:6px;align-items:center}',
+    '.recipe-table-wrap{margin-bottom:14px;border:1px solid #d5cec0;border-radius:6px;overflow:hidden}',
+    '.recipe-table-header{display:flex;align-items:center;background:#f0ebe3;padding:6px 10px;gap:8px}',
+    '.recipe-table-header input{flex:1;font-size:12px;font-weight:600;border:none;background:transparent;color:#4a4139;outline:none}',
+    '.recipe-table-header input:focus{background:#faf8f4;border-radius:2px}',
+    '.recipe-table-body{padding:8px 10px}',
+    '.recipe-totals-row td{font-weight:600;font-size:12px;color:#5b7a5e;background:#f0f6f0;padding:4px 10px;border:1px solid #e8e2d8}',
     '.proto-card-actions{display:flex;gap:6px;align-items:center;flex-shrink:0;flex-wrap:wrap}',
     '.manual-step-row{display:flex;gap:6px;align-items:center;margin-bottom:6px}',
     '.manual-step-row input{flex:1;font-size:13px}',
@@ -60,6 +69,10 @@
     '.proto-edit-step input{flex:1;font-size:13px}',
     '.proto-edit-step .link-btn{font-size:11px;color:#5b7a5e;background:none;border:1px solid #c8d8c8;border-radius:3px;padding:2px 7px;cursor:pointer;white-space:nowrap}',
     '.proto-edit-step .link-btn:hover{background:#e8f0e8}',
+    '.proto-edit-step .move-btn{background:none;border:none;cursor:pointer;color:#b0a898;font-size:14px;padding:0 2px;line-height:1}',
+    '.proto-edit-step .move-btn:hover{color:#4a4139}',
+    '.proto-edit-step .move-btn:disabled{color:#e0dcd6;cursor:default}',
+    '.proto-edit-mode-banner{background:#e8f0e8;border:1px solid #c8d8c8;border-radius:6px;padding:8px 14px;margin-bottom:12px;font-size:12px;color:#3d5e3f;display:flex;align-items:center;gap:8px}',
     /* run history inside card */
     '.run-history-section{margin-top:18px;border-top:1px solid #e8e2d8;padding-top:14px}',
     '.run-history-head{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:8px}',
@@ -76,38 +89,51 @@
     '.run-detail-steps li{margin-bottom:2px}',
     '.run-detail-steps li.done{color:#8a7f72}',
     '.run-detail-steps li.done::marker{content:"\\2713  "}',
-    '.run-detail-deviation{font-size:11px;color:#c97b3c;margin-left:4px}'
+    '.run-detail-deviation{font-size:11px;color:#c97b3c;margin-left:4px}',
+    '.copy-tbl-btn{background:none;border:1px solid #d5cec0;border-radius:4px;padding:2px 8px;font-size:11px;color:#8a7f72;cursor:pointer;white-space:nowrap}',
+    '.copy-tbl-btn:hover{background:#f0ebe3;color:#4a4139}'
   ].join('');
   document.head.appendChild(s);
 })();
 
 // ── state ─────────────────────────────────────────────────────────────────────
 var DEFAULT_RECIPE = { columns: ['Component', 'Stock conc.', 'Volume (uL)', 'Final conc.'], rows: [] };
-var _recipeState = {};
+var _recipeState = {};   // pid -> array of {name, columns, rows}
 var _manualSteps = [''];
 var _manualRecipes = []; // array of {name, columns, rows}
 var _UNITS = ['uL', 'mL', 'L', 'ng', 'ug', 'mg', 'g', 'nM', 'uM', 'mM', 'M', 'U', 'x', '%', 'units'];
 
-function _parseRecipe(raw) {
-  if (!raw) return JSON.parse(JSON.stringify(DEFAULT_RECIPE));
+// ── recipe parsing — always returns array of tables ───────────────────────────
+function _parseRecipeArray(raw) {
+  if (!raw) return [{ name: 'Recipe', columns: DEFAULT_RECIPE.columns.slice(), rows: [] }];
   try {
     var r = JSON.parse(raw);
-    // new format: array of tables
-    if (Array.isArray(r) && r.length && r[0].columns) return r[0]; // return first for compat
-    // old format: single object
-    if (r && Array.isArray(r.columns) && Array.isArray(r.rows)) return r;
+    // already an array of tables
+    if (Array.isArray(r) && r.length && r[0] && r[0].columns) {
+      return r.map(function(t) {
+        return {
+          name: t.name || 'Recipe',
+          columns: (t.columns || []).map(String),
+          rows: (t.rows || []).map(function(row) { return Array.isArray(row) ? row.map(String) : []; })
+        };
+      });
+    }
+    // single table object
+    if (r && Array.isArray(r.columns) && Array.isArray(r.rows)) {
+      return [{
+        name: r.name || 'Recipe',
+        columns: r.columns.map(String),
+        rows: r.rows.map(function(row) { return Array.isArray(row) ? row.map(String) : []; })
+      }];
+    }
   } catch(e) {}
-  return JSON.parse(JSON.stringify(DEFAULT_RECIPE));
+  return [{ name: 'Recipe', columns: DEFAULT_RECIPE.columns.slice(), rows: [] }];
 }
 
-function _parseAllRecipes(raw) {
-  if (!raw) return null;
-  try {
-    var r = JSON.parse(raw);
-    if (Array.isArray(r) && r.length && r[0].columns) return r;
-    if (r && Array.isArray(r.columns)) return null; // single table, use old display
-  } catch(e) {}
-  return null;
+// back-compat: returns first table only (used in run history display)
+function _parseRecipe(raw) {
+  var tables = _parseRecipeArray(raw);
+  return tables[0] || JSON.parse(JSON.stringify(DEFAULT_RECIPE));
 }
 
 function _isUnitCol(n) { return /vol|amount|conc|stock|final|mass|weight/i.test(n); }
@@ -118,35 +144,34 @@ function _parseAmountUnit(val) {
   return { num: m ? m[1] : '', unit: m ? m[2].trim() : '' };
 }
 
-function _manualUnitCellHTML(ri, ci, val) {
-  var p = _parseAmountUnit(val);
-  var unitOpts = _UNITS.map(function(u) { return '<option value="' + u + '"' + (p.unit === u ? ' selected' : '') + '>' + u + '</option>'; }).join('');
-  return '<td style="padding:0"><div style="display:flex;align-items:center">' +
-    '<input type="number" value="' + esc(p.num) + '" min="0" step="any" placeholder="0" ' +
-      'style="width:68px;border:none;background:transparent;padding:6px 4px 6px 8px;font-size:13px;font-family:inherit;color:#4a4139;outline:none" ' +
-      'oninput="manualRecipeCellUnit(' + ri + ',' + ci + ',this.value,this.nextElementSibling.value)"/>' +
-    '<select style="border:none;background:transparent;font-size:12px;color:#8a7f72;font-family:inherit;padding:0 4px 0 0;cursor:pointer;outline:none" ' +
-      'onchange="manualRecipeCellUnit(' + ri + ',' + ci + ',this.previousElementSibling.value,this.value)">' +
-      '<option value="">-</option>' + unitOpts +
-    '</select></div></td>';
+// ── serialize recipe state for saving ─────────────────────────────────────────
+function _serializeRecipeState(tables) {
+  if (!tables || !tables.length) return JSON.stringify(DEFAULT_RECIPE);
+  if (tables.length === 1) {
+    // single table: store as object for back-compat
+    return JSON.stringify(tables[0]);
+  }
+  return JSON.stringify(tables);
 }
 
+// ── recipe display (view mode) ────────────────────────────────────────────────
 function _recipeDisplayHTML(raw) {
-  var tables = _parseAllRecipes(raw);
-  if (tables) {
-    // multi-table display
-    return tables.map(function(t) {
-      return '<div style="margin-bottom:10px">' +
-        (t.name ? '<div style="font-size:11px;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">' + esc(t.name) + '</div>' : '') +
-        _recipeReadHTML(t) +
-      '</div>';
-    }).join('');
-  }
-  return _recipeReadHTML(_parseRecipe(raw));
+  var tables = _parseRecipeArray(raw);
+  if (!tables.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No tables.</div>';
+  return tables.map(function(t, ti) {
+    var hasData = t.rows && t.rows.length > 0;
+    var nameHtml = tables.length > 1 || (t.name && t.name !== 'Recipe')
+      ? '<div style="font-size:11px;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;display:flex;align-items:center;gap:8px">' +
+          esc(t.name || 'Table ' + (ti + 1)) +
+          (hasData ? '<button class="copy-tbl-btn" onclick="protoCopyTable(event,' + ti + ')">&#128203; Copy</button>' : '') +
+        '</div>'
+      : (hasData ? '<div style="margin-bottom:4px"><button class="copy-tbl-btn" onclick="protoCopyTable(event,0)">&#128203; Copy table</button></div>' : '');
+    return '<div style="margin-bottom:10px">' + nameHtml + _recipeReadHTML(t) + '</div>';
+  }).join('');
 }
 
 function _recipeReadHTML(recipe) {
-  if (!recipe.rows.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components yet.</div>';
+  if (!recipe.rows || !recipe.rows.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components yet.</div>';
   var html = '<div class="recipe-wrap"><table class="recipe-table"><thead><tr>';
   recipe.columns.forEach(function(c) { html += '<th>' + esc(c) + '</th>'; });
   html += '</tr></thead><tbody>';
@@ -155,28 +180,172 @@ function _recipeReadHTML(recipe) {
     recipe.columns.forEach(function(_, ci) { html += '<td style="padding:6px 10px">' + esc(row[ci] || '') + '</td>'; });
     html += '</tr>';
   });
+  // auto-totals for numeric columns
+  html += _totalsRowHTML(recipe);
   return html + '</tbody></table></div>';
 }
 
-function _recipeEditHTML(pid, recipe) {
-  var html = '<div class="recipe-wrap"><table class="recipe-table" id="rtbl-' + pid + '"><thead><tr>';
-  recipe.columns.forEach(function(c, ci) { html += '<th>' + esc(c) + '<button class="del-col" onclick="protoDelCol(' + pid + ',' + ci + ')">&#215;</button></th>'; });
-  html += '<th style="width:32px"></th></tr></thead><tbody>';
-  recipe.rows.forEach(function(row, ri) {
-    html += '<tr id="rrow-' + pid + '-' + ri + '">';
-    recipe.columns.forEach(function(_, ci) { html += '<td><input type="text" value="' + esc(row[ci] || '') + '" oninput="protoRecipeCell(' + pid + ',' + ri + ',' + ci + ',this.value)"/></td>'; });
-    html += '<td><button class="del-row" onclick="protoDelRow(' + pid + ',' + ri + ')">&#215;</button></td></tr>';
+function _totalsRowHTML(recipe) {
+  if (!recipe.rows || recipe.rows.length < 2) return '';
+  var hasTotals = false;
+  var totals = recipe.columns.map(function(col, ci) {
+    if (!_isUnitCol(col)) return '';
+    var sum = 0, found = false;
+    recipe.rows.forEach(function(row) {
+      var p = _parseAmountUnit(row[ci] || '');
+      var n = parseFloat(p.num);
+      if (!isNaN(n)) { sum += n; found = true; }
+    });
+    if (found) { hasTotals = true; return sum % 1 === 0 ? String(sum) : sum.toFixed(2); }
+    return '';
   });
-  html += '</tbody></table></div>';
-  html += '<div class="recipe-add-row"><button class="btn" onclick="protoAddRow(' + pid + ')">+ Row</button><button class="btn" onclick="protoAddCol(' + pid + ')">+ Column</button></div>';
+  if (!hasTotals) return '';
+  return '<tr class="recipe-totals-row">' + totals.map(function(v, ci) {
+    return '<td style="padding:4px 10px;font-weight:600;font-size:12px;color:#5b7a5e;background:#f0f6f0;border:1px solid #e8e2d8">' + (ci === 0 && !v ? 'Total' : esc(v)) + '</td>';
+  }).join('') + '</tr>';
+}
+
+// ── copy table to clipboard ───────────────────────────────────────────────────
+function protoCopyTable(evt, tableIdx) {
+  evt.stopPropagation();
+  // find the protocol card this belongs to
+  var card = evt.target.closest('.protocol-card');
+  var pid = card ? parseInt(card.id.replace('pc-', '')) : null;
+  var tables;
+  if (pid && _recipeState[pid]) {
+    tables = _recipeState[pid];
+  } else if (pid) {
+    var p = (S.protocols || []).find(function(x) { return x.id === pid; });
+    tables = p ? _parseRecipeArray(p.recipe) : [];
+  } else {
+    tables = [];
+  }
+  var t = tables[tableIdx];
+  if (!t) { toast('Table not found', true); return; }
+  var lines = [];
+  if (t.name) lines.push(t.name);
+  lines.push(t.columns.join('\t'));
+  t.rows.forEach(function(row) { lines.push(t.columns.map(function(_, ci) { return row[ci] || ''; }).join('\t')); });
+  navigator.clipboard.writeText(lines.join('\n')).then(function() { toast('Table copied'); }).catch(function() { toast('Copy failed', true); });
+}
+
+// ── recipe editing (all tables) ───────────────────────────────────────────────
+function _recipeEditAllHTML(pid, tables) {
+  var html = '';
+  tables.forEach(function(t, ti) {
+    html += '<div class="recipe-table-wrap" id="rtw-' + pid + '-' + ti + '">';
+    html += '<div class="recipe-table-header">';
+    html += '<input type="text" value="' + esc(t.name || '') + '" placeholder="Table name (e.g. PCR Mix)" spellcheck="false" ' +
+      'oninput="protoRenameTable(' + pid + ',' + ti + ',this.value)"/>';
+    if (tables.length > 1) {
+      html += '<button class="btn" style="font-size:11px" onclick="protoMoveTable(' + pid + ',' + ti + ',-1)"' + (ti === 0 ? ' disabled' : '') + '>&#9650;</button>';
+      html += '<button class="btn" style="font-size:11px" onclick="protoMoveTable(' + pid + ',' + ti + ',1)"' + (ti === tables.length - 1 ? ' disabled' : '') + '>&#9660;</button>';
+    }
+    html += '<button class="btn" style="font-size:11px;color:#c0392b" onclick="protoDelTable(' + pid + ',' + ti + ')">&#215; Remove</button>';
+    html += '</div>';
+    html += '<div class="recipe-table-body">';
+    html += _singleTableEditHTML(pid, ti, t);
+    html += '</div></div>';
+  });
+  html += '<div style="margin-top:8px"><button class="btn" onclick="protoAddTable(' + pid + ')">+ Add table</button></div>';
   return html;
 }
 
-// ── active runs helpers ───────────────────────────────────────────────────────
-function _getActiveRuns() { try { return JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(e) { return []; } }
+function _singleTableEditHTML(pid, ti, t) {
+  if (!t.rows.length) {
+    var html = '<div style="color:#8a7f72;font-size:13px;font-style:italic;margin-bottom:6px">No components yet</div>';
+    html += '<div class="recipe-add-row">' +
+      '<button class="btn" onclick="protoTblAddRow(' + pid + ',' + ti + ')">+ Row</button>' +
+      '<button class="btn" onclick="protoTblAddCol(' + pid + ',' + ti + ')">+ Column</button>' +
+    '</div>';
+    return html;
+  }
+  var html = '<div class="recipe-wrap"><table class="recipe-table" id="rtbl-' + pid + '-' + ti + '"><thead><tr>';
+  t.columns.forEach(function(c, ci) {
+    html += '<th><input class="col-rename" type="text" value="' + esc(c) + '" ' +
+      'oninput="protoTblRenameCol(' + pid + ',' + ti + ',' + ci + ',this.value)"/>' +
+      '<button class="del-col" onclick="protoTblDelCol(' + pid + ',' + ti + ',' + ci + ')">&#215;</button></th>';
+  });
+  html += '<th style="width:32px"></th></tr></thead><tbody>';
+  t.rows.forEach(function(row, ri) {
+    html += '<tr>';
+    t.columns.forEach(function(_, ci) {
+      html += '<td><input type="text" value="' + esc(row[ci] || '') + '" ' +
+        'oninput="protoTblCell(' + pid + ',' + ti + ',' + ri + ',' + ci + ',this.value)"/></td>';
+    });
+    html += '<td><button class="del-row" onclick="protoTblDelRow(' + pid + ',' + ti + ',' + ri + ')">&#215;</button></td></tr>';
+  });
+  html += '</tbody></table></div>';
+  html += '<div class="recipe-add-row">' +
+    '<button class="btn" onclick="protoTblAddRow(' + pid + ',' + ti + ')">+ Row</button>' +
+    '<button class="btn" onclick="protoTblAddCol(' + pid + ',' + ti + ')">+ Column</button>' +
+  '</div>';
+  return html;
+}
 
+// ── recipe edit actions (per-table) ───────────────────────────────────────────
+function protoTblCell(pid, ti, ri, ci, value) {
+  if (_recipeState[pid] && _recipeState[pid][ti] && _recipeState[pid][ti].rows[ri]) {
+    _recipeState[pid][ti].rows[ri][ci] = value;
+  }
+}
+function protoTblRenameCol(pid, ti, ci, value) {
+  if (_recipeState[pid] && _recipeState[pid][ti]) _recipeState[pid][ti].columns[ci] = value;
+}
+function protoRenameTable(pid, ti, value) {
+  if (_recipeState[pid] && _recipeState[pid][ti]) _recipeState[pid][ti].name = value;
+}
+function protoTblAddRow(pid, ti) {
+  var tables = _recipeState[pid]; if (!tables || !tables[ti]) return;
+  var t = tables[ti];
+  t.rows.push(t.columns.map(function() { return ''; }));
+  _refreshRecipeEdit(pid);
+}
+function protoTblDelRow(pid, ti, ri) {
+  var tables = _recipeState[pid]; if (!tables || !tables[ti]) return;
+  tables[ti].rows.splice(ri, 1);
+  _refreshRecipeEdit(pid);
+}
+function protoTblAddCol(pid, ti) {
+  var name = prompt('Column name:'); if (!name) return;
+  var tables = _recipeState[pid]; if (!tables || !tables[ti]) return;
+  tables[ti].columns.push(name);
+  tables[ti].rows.forEach(function(row) { row.push(''); });
+  _refreshRecipeEdit(pid);
+}
+function protoTblDelCol(pid, ti, ci) {
+  var tables = _recipeState[pid]; if (!tables || !tables[ti]) return;
+  if (tables[ti].columns.length <= 1) { toast('Need at least one column', true); return; }
+  tables[ti].columns.splice(ci, 1);
+  tables[ti].rows.forEach(function(row) { row.splice(ci, 1); });
+  _refreshRecipeEdit(pid);
+}
+function protoAddTable(pid) {
+  var tables = _recipeState[pid]; if (!tables) return;
+  tables.push({ name: 'Table ' + (tables.length + 1), columns: DEFAULT_RECIPE.columns.slice(), rows: [] });
+  _refreshRecipeEdit(pid);
+}
+function protoDelTable(pid, ti) {
+  var tables = _recipeState[pid]; if (!tables) return;
+  if (tables.length <= 1) { toast('Need at least one table', true); return; }
+  tables.splice(ti, 1);
+  _refreshRecipeEdit(pid);
+}
+function protoMoveTable(pid, ti, dir) {
+  var tables = _recipeState[pid]; if (!tables) return;
+  var ni = ti + dir;
+  if (ni < 0 || ni >= tables.length) return;
+  var tmp = tables[ti]; tables[ti] = tables[ni]; tables[ni] = tmp;
+  _refreshRecipeEdit(pid);
+}
+
+function _refreshRecipeEdit(pid) {
+  var body = document.getElementById('recipe-body-' + pid);
+  if (body && _recipeState[pid]) body.innerHTML = _recipeEditAllHTML(pid, _recipeState[pid]);
+}
+
+// ── active runs helpers ───────────────────────────────────────────────────────
 function _getActiveRuns() {
-  // kept for sync fallback only - protocols.js uses _activeRunsHTMLAsync
   try { return JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(e) { return []; }
 }
 
@@ -228,9 +397,9 @@ function _activeRunsHTML() {
         '<div class="active-run-bar"><div class="active-run-fill" style="width:' + pct + '%"></div></div>' +
       '</div>' +
       '<div style="display:flex;gap:6px;flex-shrink:0">' +
-        '<button class="btn primary" style="font-size:12px" onclick="spResumeRunById(\'' + run.runId + '\')">&#9654; Resume</button>' +
-        '<button class="btn" style="font-size:12px" onclick="spSaveRunToEntry(\'' + run.runId + '\')">Save to Entry</button>' +
-        '<button class="btn" style="font-size:12px;color:#c0392b" onclick="spDiscardRunById(\'' + run.runId + '\')">Discard</button>' +
+        '<button class="btn primary" style="font-size:12px" data-runid="' + esc(run.runId) + '" onclick="spResumeRunById(this.dataset.runid)">&#9654; Resume</button>' +
+        '<button class="btn" style="font-size:12px" data-runid="' + esc(run.runId) + '" onclick="spSaveRunToEntry(this.dataset.runid)">Save to Entry</button>' +
+        '<button class="btn" style="font-size:12px;color:#c0392b" data-runid="' + esc(run.runId) + '" onclick="spDiscardRunById(this.dataset.runid)">Discard</button>' +
       '</div>' +
     '</div>';
   });
@@ -242,7 +411,6 @@ function _runHistoryRowHTML(run) {
   var pct  = run.steps_total ? Math.round((run.steps_done / run.steps_total) * 100) : 0;
   var date = run.date || run.created.split('T')[0];
 
-  // build step-by-step detail
   var steps = [];
   try { steps = JSON.parse(run.steps_json || '[]'); } catch(e) {}
   var stepsHtml = '';
@@ -258,22 +426,23 @@ function _runHistoryRowHTML(run) {
     stepsHtml += '</ol>';
   }
 
-  // recipe if present
   var recipeHtml = '';
   try {
-    var recipe = JSON.parse(run.recipe_json || 'null');
-    if (recipe && recipe.rows && recipe.rows.length) {
-      recipeHtml = '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin:10px 0 6px">Recipe used</div>';
-      recipeHtml += '<div style="overflow-x:auto"><table class="recipe-table"><thead><tr>';
-      recipe.columns.forEach(function(c) { recipeHtml += '<th>' + esc(c) + '</th>'; });
-      recipeHtml += '</tr></thead><tbody>';
-      recipe.rows.forEach(function(row) {
-        recipeHtml += '<tr>';
-        recipe.columns.forEach(function(_, ci) { recipeHtml += '<td style="padding:5px 10px;font-size:12px">' + esc(row[ci] || '') + '</td>'; });
-        recipeHtml += '</tr>';
-      });
-      recipeHtml += '</tbody></table></div>';
-    }
+    var recTables = _parseRecipeArray(run.recipe_json);
+    recTables.forEach(function(recipe) {
+      if (recipe && recipe.rows && recipe.rows.length) {
+        recipeHtml += '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin:10px 0 6px">' + esc(recipe.name || 'Recipe used') + '</div>';
+        recipeHtml += '<div style="overflow-x:auto"><table class="recipe-table"><thead><tr>';
+        recipe.columns.forEach(function(c) { recipeHtml += '<th>' + esc(c) + '</th>'; });
+        recipeHtml += '</tr></thead><tbody>';
+        recipe.rows.forEach(function(row) {
+          recipeHtml += '<tr>';
+          recipe.columns.forEach(function(_, ci) { recipeHtml += '<td style="padding:5px 10px;font-size:12px">' + esc(row[ci] || '') + '</td>'; });
+          recipeHtml += '</tr>';
+        });
+        recipeHtml += '</tbody></table></div>';
+      }
+    });
   } catch(e) {}
 
   return '<div class="run-history-row" id="rhr-' + run.id + '">' +
@@ -296,7 +465,6 @@ function protoToggleRunDetail(runId) {
 }
 
 function protoViewEntry(entryId) {
-  // navigate to notebook and highlight the entry
   if (typeof setView === 'function') {
     S._jumpToEntry = entryId;
     setView('notebook');
@@ -322,10 +490,10 @@ async function renderProtocols(el) {
 
 function _buildImportUI() {
   return '<div class="proto-import-tabs">' +
-    '<button class="proto-tab active" onclick="protoTab(\'url\',this)">URL</button>' +
-    '<button class="proto-tab" onclick="protoTab(\'paste\',this)">Paste text</button>' +
-    '<button class="proto-tab" onclick="protoTab(\'file\',this)">Upload file</button>' +
-    '<button class="proto-tab" onclick="protoTab(\'manual\',this)">Write manually</button>' +
+    '<button class="proto-tab active" onclick="protoTab(\x27url\x27,this)">URL</button>' +
+    '<button class="proto-tab" onclick="protoTab(\x27paste\x27,this)">Paste text</button>' +
+    '<button class="proto-tab" onclick="protoTab(\x27file\x27,this)">Upload file</button>' +
+    '<button class="proto-tab" onclick="protoTab(\x27manual\x27,this)">Write manually</button>' +
     '</div>' +
     '<div id="pt-url"><div class="proto-import-row">' +
       '<input type="text" id="proto-url" placeholder="https://www.protocols.io/..." spellcheck="false"/>' +
@@ -387,13 +555,13 @@ function _protoCard(p) {
   if (!p.steps || p.steps === '[]') {
     stepsHtml = '<div style="color:#8a7f72;font-size:13px;font-style:italic">No steps yet — click Extract steps to pull from source.</div>';
   } else if (isStructured) {
-    stepsHtml = '<ol class="steps-list">' + steps.map(function(s) { return '<li>' + _renderStepText(s.text) + '</li>'; }).join('') + '</ol>';
+    stepsHtml = '<ol class="steps-list">' + steps.map(function(s) { return '<li>' + _renderStepText(s.text) + (s.note ? '<div style="font-size:11px;color:#8a7f72;margin:2px 0 4px;padding-left:4px;border-left:2px solid #e8e2d8">' + esc(s.note) + '</div>' : '') + '</li>'; }).join('') + '</ol>';
   } else {
     stepsHtml = '<div class="steps-text">' + esc(p.steps) + '</div>';
   }
 
-  var recipe = _parseRecipe(p.recipe);
-  _recipeState[p.id] = JSON.parse(JSON.stringify(recipe));
+  // init recipe state as full array of tables
+  _recipeState[p.id] = JSON.parse(JSON.stringify(_parseRecipeArray(p.recipe)));
 
   return '<div class="protocol-card" id="pc-' + p.id + '">' +
     '<div class="protocol-header" onclick="protoToggle(' + p.id + ')">' +
@@ -414,9 +582,9 @@ function _protoCard(p) {
     '<div class="protocol-body" id="pb-' + p.id + '">' +
       stepsHtml +
       '<div class="recipe-section">' +
-        '<div class="recipe-section-head"><span>Reaction Recipe</span>' +
+        '<div class="recipe-section-head"><span>Reaction Tables</span>' +
           '<div class="recipe-edit-actions" id="recipe-actions-' + p.id + '">' +
-            '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + p.id + ')">Edit</button>' +
+            '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + p.id + ')">Edit tables</button>' +
           '</div>' +
         '</div>' +
         '<div id="recipe-body-' + p.id + '">' + _recipeDisplayHTML(p.recipe) + '</div>' +
@@ -438,7 +606,6 @@ function protoToggle(id) {
   var card = document.getElementById('pc-' + id);
   if (!card) return;
   card.classList.toggle('open');
-  // load run history when card opens
   if (card.classList.contains('open')) protoLoadRunHistory(id);
 }
 
@@ -457,63 +624,53 @@ async function protoLoadRunHistory(pid) {
   }
 }
 
-// ── recipe editing ─────────────────────────────────────────────────────────────
+// ── recipe edit/save/cancel (protocol card) ────────────────────────────────────
 function protoRecipeEdit(pid) {
-  var recipe = _recipeState[pid] || JSON.parse(JSON.stringify(DEFAULT_RECIPE));
-  _recipeState[pid] = recipe;
-  document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, recipe);
+  // load full array of tables
+  var p = (S.protocols || []).find(function(x) { return x.id === pid; });
+  var tables = p ? _parseRecipeArray(p.recipe) : _recipeState[pid] || [{ name: 'Recipe', columns: DEFAULT_RECIPE.columns.slice(), rows: [] }];
+  _recipeState[pid] = JSON.parse(JSON.stringify(tables));
+  document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditAllHTML(pid, _recipeState[pid]);
   document.getElementById('recipe-actions-' + pid).innerHTML =
-    '<button class="btn primary" onclick="event.stopPropagation();protoRecipeSave(' + pid + ')">Save recipe</button>' +
+    '<button class="btn primary" onclick="event.stopPropagation();protoRecipeSave(' + pid + ')">Save tables</button>' +
     '<button class="btn" onclick="event.stopPropagation();protoRecipeCancel(' + pid + ')">Cancel</button>';
 }
 
 function protoRecipeCancel(pid) {
   var p = (S.protocols || []).find(function(x) { return x.id === pid; }); if (!p) return;
-  var recipe = _parseRecipe(p.recipe);
-  _recipeState[pid] = JSON.parse(JSON.stringify(recipe));
-  document.getElementById('recipe-body-' + pid).innerHTML = _recipeReadHTML(recipe);
-  document.getElementById('recipe-actions-' + pid).innerHTML = '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + pid + ')">Edit</button>';
+  _recipeState[pid] = JSON.parse(JSON.stringify(_parseRecipeArray(p.recipe)));
+  document.getElementById('recipe-body-' + pid).innerHTML = _recipeDisplayHTML(p.recipe);
+  document.getElementById('recipe-actions-' + pid).innerHTML = '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + pid + ')">Edit tables</button>';
 }
 
 async function protoRecipeSave(pid) {
-  var recipe = _recipeState[pid]; if (!recipe) return;
-  await api('PUT', '/api/protocols/' + pid, { recipe: JSON.stringify(recipe) });
+  var tables = _recipeState[pid]; if (!tables) return;
+  var recipeJson = _serializeRecipeState(tables);
+  await api('PUT', '/api/protocols/' + pid, { recipe: recipeJson });
   var p = (S.protocols || []).find(function(x) { return x.id === pid; });
-  if (p) p.recipe = JSON.stringify(recipe);
-  document.getElementById('recipe-body-' + pid).innerHTML = _recipeReadHTML(recipe);
-  document.getElementById('recipe-actions-' + pid).innerHTML = '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + pid + ')">Edit</button>';
-  toast('Recipe saved');
+  if (p) p.recipe = recipeJson;
+  document.getElementById('recipe-body-' + pid).innerHTML = _recipeDisplayHTML(recipeJson);
+  document.getElementById('recipe-actions-' + pid).innerHTML = '<button class="btn" onclick="event.stopPropagation();protoRecipeEdit(' + pid + ')">Edit tables</button>';
+  toast('Tables saved');
 }
 
-function protoRecipeCell(pid, ri, ci, value) { if (_recipeState[pid] && _recipeState[pid].rows[ri]) _recipeState[pid].rows[ri][ci] = value; }
-
-function protoAddRow(pid) {
-  var r = _recipeState[pid]; if (!r) return;
-  r.rows.push(r.columns.map(function() { return ''; }));
-  var ri = r.rows.length - 1;
-  var tbody = document.querySelector('#rtbl-' + pid + ' tbody'); if (!tbody) return;
-  var tr = document.createElement('tr'); tr.id = 'rrow-' + pid + '-' + ri;
-  var inner = '';
-  r.columns.forEach(function(_, ci) { inner += '<td><input type="text" value="" oninput="protoRecipeCell(' + pid + ',' + ri + ',' + ci + ',this.value)"/></td>'; });
-  inner += '<td><button class="del-row" onclick="protoDelRow(' + pid + ',' + ri + ')">&#215;</button></td>';
-  tr.innerHTML = inner; tbody.appendChild(tr);
-}
-
-function protoDelRow(pid, ri) { var r = _recipeState[pid]; if (!r) return; r.rows.splice(ri, 1); document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r); }
-function protoAddCol(pid) { var name = prompt('Column name:'); if (!name) return; var r = _recipeState[pid]; if (!r) return; r.columns.push(name); r.rows.forEach(function(row) { row.push(''); }); document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r); }
-function protoDelCol(pid, ci) { var r = _recipeState[pid]; if (!r || r.columns.length <= 1) { toast('Need at least one column', true); return; } r.columns.splice(ci, 1); r.rows.forEach(function(row) { row.splice(ci, 1); }); document.getElementById('recipe-body-' + pid).innerHTML = _recipeEditHTML(pid, r); }
+// ── old single-table recipe functions (kept as shims for back-compat) ─────────
+function protoRecipeCell(pid, ri, ci, value) { protoTblCell(pid, 0, ri, ci, value); }
+function protoAddRow(pid) { protoTblAddRow(pid, 0); }
+function protoDelRow(pid, ri) { protoTblDelRow(pid, 0, ri); }
+function protoAddCol(pid) { protoTblAddCol(pid, 0); }
+function protoDelCol(pid, ci) { protoTblDelCol(pid, 0, ci); }
 
 // ── manual entry helpers ──────────────────────────────────────────────────────
 function _manualTableHTML(ti) {
   var t = _manualRecipes[ti];
-  var html = '<div class="manual-table-wrap" id="mtw-' + ti + '" style="margin-bottom:14px;border:1px solid #d5cec0;border-radius:6px;overflow:hidden">';
-  html += '<div style="display:flex;align-items:center;background:#f0ebe3;padding:6px 10px;gap:8px">';
+  var html = '<div class="recipe-table-wrap" id="mtw-' + ti + '">';
+  html += '<div class="recipe-table-header">';
   html += '<input type="text" value="' + esc(t.name) + '" placeholder="Table name (e.g. PCR Mix)" spellcheck="false" ' +
-    'style="flex:1;font-size:12px;font-weight:600;border:none;background:transparent;color:#4a4139;outline:none" ' +
     'oninput="manualTableRename(' + ti + ',this.value)"/>';
   html += '<button class="btn" style="font-size:11px;color:#c0392b" onclick="manualDelTable(' + ti + ')">&#215; Remove table</button>';
   html += '</div>';
-  html += '<div style="padding:8px 10px">';
+  html += '<div class="recipe-table-body">';
   if (!t.rows.length) {
     html += '<div style="color:#8a7f72;font-size:13px;font-style:italic;margin-bottom:6px">No components yet</div>';
   } else {
@@ -590,31 +747,6 @@ function _manualStepRowHTML(idx, value) {
   '</div>';
 }
 
-function _manualRecipeHTML() {
-  var r = _manualRecipeState();
-  if (!r.rows.length) {
-    return '<div style="display:flex;gap:6px;align-items:center">' +
-      '<span style="color:#8a7f72;font-size:13px;font-style:italic">No components yet</span>' +
-      '<button class="btn" onclick="manualRecipeAddRow()">+ Add component</button>' +
-      '<button class="btn" onclick="manualRecipeAddCol()">+ Column</button>' +
-    '</div>';
-  }
-  var html = '<div style="overflow-x:auto"><table class="recipe-table" style="margin-bottom:6px"><thead><tr>';
-  r.columns.forEach(function(c, ci) { html += '<th>' + esc(c) + '<button class="del-col" onclick="manualRecipeDelCol(' + ci + ')">&#215;</button></th>'; });
-  html += '<th style="width:28px"></th></tr></thead><tbody>';
-  r.rows.forEach(function(row, ri) {
-    html += '<tr>';
-    r.columns.forEach(function(col, ci) {
-      if (_isUnitCol(col)) { html += _manualUnitCellHTML(ri, ci, row[ci] || ''); }
-      else { html += '<td><input type="text" value="' + esc(row[ci] || '') + '" oninput="manualRecipeCell(' + ri + ',' + ci + ',this.value)"/></td>'; }
-    });
-    html += '<td><button class="del-row" onclick="manualRecipeDelRow(' + ri + ')">&#215;</button></td></tr>';
-  });
-  html += '</tbody></table></div>';
-  html += '<div class="recipe-add-row"><button class="btn" onclick="manualRecipeAddRow()">+ Row</button><button class="btn" onclick="manualRecipeAddCol()">+ Column</button></div>';
-  return html;
-}
-
 function _attachManualStepListeners() {
   var list = document.getElementById('manual-steps-list'); if (!list) return;
   list.querySelectorAll('input[data-stepidx]').forEach(function(inp) {
@@ -649,7 +781,6 @@ function manualAddStep() {
   }
 }
 function manualDelStep(idx) { if (_manualSteps.length <= 1) { _manualSteps[0] = ''; _refreshManualSteps(); return; } _manualSteps.splice(idx, 1); _refreshManualSteps(); }
-// single-table compat shims now in multi-table section above
 
 async function protoAddManual() {
   var title = (document.getElementById('proto-title-manual')?.value || '').trim();
@@ -744,7 +875,6 @@ function protoOpenRun(protocolId) {
 
 // ── protocol link rendering ───────────────────────────────────────────────────
 function _renderStepText(text) {
-  // render [@Title](proto:ID) as clickable badges, escape everything else
   var parts = text.split(/(\[@[^\]]+\]\(proto:\d+\))/g);
   return parts.map(function(part) {
     var m = part.match(/^\[@([^\]]+)\]\(proto:(\d+)\)$/);
@@ -756,7 +886,6 @@ function _renderStepText(text) {
 }
 
 function protoJumpTo(id) {
-  // open the card and scroll to it
   var card = document.getElementById('pc-' + id);
   if (!card) return;
   if (!card.classList.contains('open')) protoToggle(id);
@@ -767,12 +896,10 @@ function protoJumpTo(id) {
 function manualLinkProtocol() {
   var protos = (S.protocols || []);
   if (!protos.length) { toast('No protocols to link to yet', true); return; }
-  // find which step input is focused, or use last
   var focused = document.querySelector('#manual-steps-list input:focus');
   var targetInput = focused || document.querySelector('#manual-steps-list input:last-of-type');
   var targetIdx = targetInput ? parseInt((targetInput.closest('[id^=msr-]') || {}).id?.replace('msr-','') || '0') : 0;
 
-  // build a simple picker
   var opts = protos.map(function(p) { return '<option value="' + p.id + '">' + esc(p.title) + '</option>'; }).join('');
   var div = document.createElement('div');
   div.id = 'proto-link-picker';
@@ -801,21 +928,19 @@ function plpInsert(stepIdx) {
   if (!p) return;
   document.getElementById('proto-link-picker')?.remove();
   var link = '[@' + p.title + '](proto:' + p.id + ')';
-  // append link to the target step
   var inp = document.querySelector('#msr-' + stepIdx + ' input');
   if (inp) {
     var cur = inp.value;
     inp.value = cur ? cur + ' ' + link : link;
     manualStepUpdate(stepIdx, inp.value);
   } else {
-    // add as new step
     _manualSteps.push(link);
     _refreshManualSteps();
   }
 }
 
 // ── inline edit mode ──────────────────────────────────────────────────────────
-var _editState = {}; // pid -> {title, steps}
+var _editState = {}; // pid -> {title, steps: [{text, note}]}
 
 function protoEdit(pid) {
   var p = (S.protocols || []).find(function(x) { return x.id === pid; });
@@ -823,6 +948,7 @@ function protoEdit(pid) {
   var card = document.getElementById('pc-' + pid);
   if (!card) return;
   if (!card.classList.contains('open')) protoToggle(pid);
+  card.classList.add('editing');
 
   var steps = [];
   try {
@@ -830,20 +956,31 @@ function protoEdit(pid) {
     if (Array.isArray(parsed) && parsed.length && typeof parsed[0].text !== 'undefined') steps = parsed;
   } catch(e) {}
 
-  _editState[pid] = { title: p.title, steps: steps.map(function(s) { return s.text; }) };
+  _editState[pid] = {
+    title: p.title,
+    steps: steps.map(function(s) { return { text: s.text, note: s.note || '' }; })
+  };
 
   var body = document.getElementById('pb-' + pid); if (!body) return;
+
+  // insert edit mode banner
+  var existingBanner = body.querySelector('.proto-edit-mode-banner');
+  if (!existingBanner) {
+    var banner = document.createElement('div');
+    banner.className = 'proto-edit-mode-banner';
+    banner.innerHTML = '&#9998; <strong>Editing mode</strong> — reorder steps with arrows, edit titles and notes inline';
+    body.insertBefore(banner, body.firstChild);
+  }
 
   // replace title
   var titleEl = card.querySelector('.protocol-title');
   if (titleEl) titleEl.outerHTML = '<input id="pe-title-' + pid + '" type="text" value="' + esc(p.title) + '" ' +
-    'style="font-weight:600;font-size:14px;color:#4a4139;border:none;border-bottom:1px solid #5b7a5e;background:transparent;outline:none;width:100%;margin-bottom:4px" ' +
+    'style="font-weight:600;font-size:14px;color:#4a4139;border:none;border-bottom:2px solid #5b7a5e;background:transparent;outline:none;width:100%;margin-bottom:4px" ' +
     'oninput="_editState[' + pid + '].title=this.value"/>';
 
   // replace steps
   var stepsContainer = body.querySelector('ol.steps-list, div.steps-text');
   if (!stepsContainer && !steps.length) {
-    // no steps area, insert before recipe section
     var recipeSection = body.querySelector('.recipe-section');
     var placeholder = document.createElement('div');
     placeholder.id = 'pe-steps-' + pid;
@@ -852,22 +989,7 @@ function protoEdit(pid) {
 
   var stepsTarget = stepsContainer || document.getElementById('pe-steps-' + pid);
   if (stepsTarget) {
-    var stepsHtml = '<div id="pe-steps-' + pid + '">';
-    (_editState[pid].steps.length ? _editState[pid].steps : ['']).forEach(function(text, i) {
-      stepsHtml += '<div class="proto-edit-step" id="pes-' + pid + '-' + i + '">' +
-        '<span style="font-size:12px;color:#8a7f72;min-width:20px;text-align:right">' + (i+1) + '.</span>' +
-        '<input type="text" value="' + esc(text) + '" spellcheck="false" ' +
-          'oninput="_editState[' + pid + '].steps[' + i + ']=this.value" ' +
-          'data-editpid="' + pid + '" data-editidx="' + i + '"/>' +
-        '<button class="link-btn" onclick="protoEditLinkStep(' + pid + ',' + i + ')">&#8599; Link</button>' +
-        '<button style="background:none;border:none;cursor:pointer;color:#c0b8b0;font-size:16px;padding:0 4px" onclick="protoEditDelStep(' + pid + ',' + i + ')">&#215;</button>' +
-      '</div>';
-    });
-    stepsHtml += '<div style="margin-top:6px;display:flex;gap:6px">' +
-      '<button class="btn" onclick="protoEditAddStep(' + pid + ',-1)">+ Step</button>' +
-      '<button class="btn" style="color:#5b7a5e" onclick="protoEditLinkStep(' + pid + ',-1)">&#8599; Link protocol</button>' +
-    '</div></div>';
-    stepsTarget.outerHTML = stepsHtml;
+    stepsTarget.outerHTML = '<div id="pe-steps-' + pid + '">' + _buildEditStepsHTML(pid) + '</div>';
     _attachEditStepListeners(pid);
   }
 
@@ -878,10 +1000,46 @@ function protoEdit(pid) {
     '<button class="btn" onclick="event.stopPropagation();protoCancelEdit(' + pid + ')">Cancel</button>';
 }
 
+function _buildEditStepsHTML(pid) {
+  var es = _editState[pid]; if (!es) return '';
+  var stepsArr = es.steps.length ? es.steps : [{ text: '', note: '' }];
+  var html = '';
+  stepsArr.forEach(function(step, i) {
+    html += '<div class="proto-edit-step" id="pes-' + pid + '-' + i + '">' +
+      '<span style="font-size:12px;color:#8a7f72;min-width:20px;text-align:right">' + (i+1) + '.</span>' +
+      '<div style="flex:1;display:flex;flex-direction:column;gap:2px">' +
+        '<input type="text" value="' + esc(step.text) + '" spellcheck="false" placeholder="Step description..." ' +
+          'oninput="_editState[' + pid + '].steps[' + i + '].text=this.value" ' +
+          'data-editpid="' + pid + '" data-editidx="' + i + '"/>' +
+        '<input type="text" value="' + esc(step.note || '') + '" spellcheck="false" placeholder="Note (optional)" ' +
+          'style="font-size:11px;color:#8a7f72;border:1px dashed #d5cec0;background:transparent;padding:3px 8px;border-radius:3px" ' +
+          'oninput="_editState[' + pid + '].steps[' + i + '].note=this.value"/>' +
+      '</div>' +
+      '<button class="move-btn" onclick="protoEditMoveStep(' + pid + ',' + i + ',-1)" title="Move up"' + (i === 0 ? ' disabled' : '') + '>&#9650;</button>' +
+      '<button class="move-btn" onclick="protoEditMoveStep(' + pid + ',' + i + ',1)" title="Move down"' + (i === stepsArr.length - 1 ? ' disabled' : '') + '>&#9660;</button>' +
+      '<button class="link-btn" onclick="protoEditLinkStep(' + pid + ',' + i + ')">&#8599; Link</button>' +
+      '<button style="background:none;border:none;cursor:pointer;color:#c0b8b0;font-size:16px;padding:0 4px" onclick="protoEditDelStep(' + pid + ',' + i + ')">&#215;</button>' +
+    '</div>';
+  });
+  html += '<div style="margin-top:6px;display:flex;gap:6px">' +
+    '<button class="btn" onclick="protoEditAddStep(' + pid + ',-1)">+ Step</button>' +
+    '<button class="btn" style="color:#5b7a5e" onclick="protoEditLinkStep(' + pid + ',-1)">&#8599; Link protocol</button>' +
+  '</div>';
+  return html;
+}
+
+function protoEditMoveStep(pid, idx, dir) {
+  var es = _editState[pid]; if (!es) return;
+  var ni = idx + dir;
+  if (ni < 0 || ni >= es.steps.length) return;
+  var tmp = es.steps[idx]; es.steps[idx] = es.steps[ni]; es.steps[ni] = tmp;
+  _refreshEditSteps(pid);
+}
+
 function protoEditAddStep(pid, afterIdx) {
   var es = _editState[pid]; if (!es) return;
-  if (afterIdx < 0) es.steps.push('');
-  else es.steps.splice(afterIdx + 1, 0, '');
+  if (afterIdx < 0) es.steps.push({ text: '', note: '' });
+  else es.steps.splice(afterIdx + 1, 0, { text: '', note: '' });
   _refreshEditSteps(pid);
   setTimeout(function() {
     var idx = afterIdx < 0 ? es.steps.length - 1 : afterIdx + 1;
@@ -891,7 +1049,7 @@ function protoEditAddStep(pid, afterIdx) {
 
 function protoEditDelStep(pid, idx) {
   var es = _editState[pid]; if (!es) return;
-  if (es.steps.length <= 1) { es.steps[0] = ''; _refreshEditSteps(pid); return; }
+  if (es.steps.length <= 1) { es.steps[0] = { text: '', note: '' }; _refreshEditSteps(pid); return; }
   es.steps.splice(idx, 1);
   _refreshEditSteps(pid);
 }
@@ -923,8 +1081,8 @@ function plpEditInsert(pid, afterIdx) {
   document.getElementById('proto-link-picker')?.remove();
   var link = '[@' + p.title + '](proto:' + p.id + ')';
   var es = _editState[pid]; if (!es) return;
-  if (afterIdx < 0) es.steps.push(link);
-  else es.steps.splice(afterIdx + 1, 0, link);
+  if (afterIdx < 0) es.steps.push({ text: link, note: '' });
+  else es.steps.splice(afterIdx + 1, 0, { text: link, note: '' });
   _refreshEditSteps(pid);
 }
 
@@ -938,38 +1096,29 @@ function _attachEditStepListeners(pid) {
 }
 
 function _refreshEditSteps(pid) {
-  var es = _editState[pid]; if (!es) return;
   var container = document.getElementById('pe-steps-' + pid); if (!container) return;
-  var stepsHtml = '';
-  (es.steps.length ? es.steps : ['']).forEach(function(text, i) {
-    stepsHtml += '<div class="proto-edit-step" id="pes-' + pid + '-' + i + '">' +
-      '<span style="font-size:12px;color:#8a7f72;min-width:20px;text-align:right">' + (i+1) + '.</span>' +
-      '<input type="text" value="' + esc(text) + '" spellcheck="false" ' +
-        'oninput="_editState[' + pid + '].steps[' + i + ']=this.value" ' +
-        'data-editpid="' + pid + '" data-editidx="' + i + '"/>' +
-      '<button class="link-btn" onclick="protoEditLinkStep(' + pid + ',' + i + ')">&#8599; Link</button>' +
-      '<button style="background:none;border:none;cursor:pointer;color:#c0b8b0;font-size:16px;padding:0 4px" onclick="protoEditDelStep(' + pid + ',' + i + ')">&#215;</button>' +
-    '</div>';
-  });
-  stepsHtml += '<div style="margin-top:6px;display:flex;gap:6px">' +
-    '<button class="btn" onclick="protoEditAddStep(' + pid + ',-1)">+ Step</button>' +
-    '<button class="btn" style="color:#5b7a5e" onclick="protoEditLinkStep(' + pid + ',-1)">&#8599; Link protocol</button>' +
-  '</div>';
-  container.innerHTML = stepsHtml;
+  container.innerHTML = _buildEditStepsHTML(pid);
   _attachEditStepListeners(pid);
 }
 
 async function protoSaveEdit(pid) {
   var es = _editState[pid]; if (!es) return;
-  var steps = es.steps.filter(function(s) { return s.trim(); });
-  var stepsJson = JSON.stringify(steps.map(function(s) { return { text: s }; }));
+  var steps = es.steps.filter(function(s) { return s.text.trim(); });
+  var stepsJson = JSON.stringify(steps.map(function(s) {
+    var obj = { text: s.text };
+    if (s.note && s.note.trim()) obj.note = s.note.trim();
+    return obj;
+  }));
   var titleInput = document.getElementById('pe-title-' + pid);
   var title = titleInput ? titleInput.value.trim() : es.title;
   if (!title) { toast('Title cannot be empty', true); return; }
-  await api('PUT', '/api/protocols/' + pid, { title: title, steps: stepsJson });
-  // update local cache
+
+  // also save recipe state if it was edited
+  var recipeJson = _serializeRecipeState(_recipeState[pid]);
+  await api('PUT', '/api/protocols/' + pid, { title: title, steps: stepsJson, recipe: recipeJson });
+
   var p = (S.protocols || []).find(function(x) { return x.id === pid; });
-  if (p) { p.title = title; p.steps = stepsJson; }
+  if (p) { p.title = title; p.steps = stepsJson; p.recipe = recipeJson; }
   delete _editState[pid];
   await loadView();
   toast('Protocol updated');

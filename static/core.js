@@ -147,8 +147,8 @@ function setGroup(g) {
 
 async function loadView() {
   const el = document.getElementById('content');
-  if ((S.view === 'notebook' && S.nbBook) || S.view === 'cloning' || S.view === 'pipeline' || S.view === 'sanger') {
-    el.style.maxWidth = 'none'; el.style.padding = '0';
+  if ((S.view === 'notebook' && S.nbBook) || S.view === 'cloning' || S.view === 'pipeline' || S.view === 'sanger' || S.view === 'gel_annotation') {
+    el.style.maxWidth = 'none'; el.style.padding = '0 12px';
   } else {
     el.style.maxWidth = ''; el.style.padding = '';
   }

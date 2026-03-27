@@ -19,7 +19,11 @@ var SG = {
 var TRACE_COLORS = { A: '#2e8b40', C: '#2266cc', G: '#333', T: '#cc2222' };
 var ANNO_COLORS = {
   CDS: '#4a90d9', gene: '#5b7a5e', promoter: '#c9a84c', terminator: '#c25a4a',
-  rep_origin: '#7b68ae', misc_feature: '#b0a89a', primer_bind: '#d48c2e'
+  rep_origin: '#7b68ae', misc_feature: '#b0a89a', primer_bind: '#d48c2e',
+  RBS: '#d48c2e', regulatory: '#c9a84c', protein_bind: '#8a6daf',
+  oriT: '#7b68ae', sig_peptide: '#7b9ebd', mat_peptide: '#4a90d9',
+  misc_binding: '#b0a89a', misc_difference: '#c25a4a', misc_recomb: '#5b7a5e',
+  mobile_element: '#8a7f72', repeat_region: '#b88a5e'
 };
 var QUAL_GOOD = '#5b7a5e', QUAL_MED = '#c9a84c', QUAL_BAD = '#c25a4a';
 
@@ -128,6 +132,13 @@ async function renderNew(el) {
     h += '<textarea id="sg-ref-raw" class="sg-input" rows="4" placeholder="Paste raw DNA sequence or FASTA" style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.82rem"></textarea>';
   }
 
+  h += '<label class="sg-label" style="margin-top:16px">Quality trim</label>';
+  h += '<div style="display:flex;align-items:center;gap:12px">';
+  h += '<input type="range" id="sg-trim-qual" min="0" max="40" value="20" style="flex:1;accent-color:#5b7a5e" oninput="document.getElementById(\'sg-trim-val\').textContent=this.value===\'0\'?\'Off\':\'Q\'+this.value">';
+  h += '<span id="sg-trim-val" style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.82rem;color:#4a4139;min-width:36px">Q20</span>';
+  h += '</div>';
+  h += '<div style="font-size:.75rem;color:#8a7f72;margin-top:2px">Trims low-quality bases from read ends. Set to 0 to disable.</div>';
+
   h += '<button class="sg-btn-pri" style="margin-top:24px;width:100%" onclick="sgRunAlign()" id="sg-run-btn">Align</button>';
   h += '<div id="sg-status" style="margin-top:12px;color:#8a7f72;font-size:.85rem"></div>';
   h += '</div>';
@@ -174,6 +185,8 @@ async function sgRunAlign() {
   for(var i=0;i<inp.files.length;i++) fd.append('ab1',inp.files[i]);
   var nm=(document.getElementById('sg-name')||{}).value||'';
   if(nm)fd.append('name',nm);
+  var trimVal=document.getElementById('sg-trim-qual');
+  fd.append('trim_qual', trimVal ? trimVal.value : '20');
 
   if(SG.refMode==='plasmid'){
     var sel=document.getElementById('sg-ref-plasmid');
@@ -261,13 +274,15 @@ async function renderViewer(el) {
   var items = SG.batchItems;
   if (!items.length) return sgNav('list');
 
-  // Compute span across all alignments
-  var spanStart = Infinity, spanEnd = 0;
+  // Show full reference, compute alignment region for auto-scroll
+  var alnStart = Infinity, alnEnd = 0;
   items.forEach(function(a) {
-    if (a.ref_start < spanStart) spanStart = a.ref_start;
-    if (a.ref_end > spanEnd) spanEnd = a.ref_end;
+    if (a.ref_start < alnStart) alnStart = a.ref_start;
+    if (a.ref_end > alnEnd) alnEnd = a.ref_end;
   });
-  if (spanStart >= spanEnd) { spanStart = 0; spanEnd = SG.refSeq.length || 100; }
+  var spanStart = 0;
+  var spanEnd = SG.refSeq.length || alnEnd || 100;
+  if (alnStart >= alnEnd) { alnStart = 0; alnEnd = spanEnd; }
 
   var colW = Math.round(SG.COL_W * SG.zoom);
   var numCols = spanEnd - spanStart;
@@ -294,20 +309,39 @@ async function renderViewer(el) {
   h += '<span style="color:'+TRACE_COLORS.T+';font-weight:700">T</span>';
   h += '</div></div>';
 
+  // Compute annotation rows before building the layout
+  var annoRows = [];
+  var visAnnos = [];
+  if (SG.refAnnos.length) {
+    SG.refAnnos.forEach(function(an) {
+      var aStart = Math.max(an.start, spanStart);
+      var aEnd = Math.min(an.end, spanEnd);
+      if (aStart >= aEnd) return;
+      visAnnos.push({ start: aStart, end: aEnd, label: an.label, type: an.type, color: an.color || null, strand: an.strand || 0 });
+    });
+    visAnnos.sort(function(a, b) { return a.start - b.start || (b.end - b.start) - (a.end - a.start); });
+    visAnnos.forEach(function(an) {
+      var placed = false;
+      for (var r = 0; r < annoRows.length; r++) {
+        var last = annoRows[r][annoRows[r].length - 1];
+        if (an.start >= last.end + 1) { annoRows[r].push(an); placed = true; break; }
+      }
+      if (!placed) annoRows.push([an]);
+    });
+  }
+  var ANNO_ROW_H = 20;
+  var annoTrackH = Math.max(annoRows.length, visAnnos.length ? 1 : 0) * ANNO_ROW_H;
+
   // Main layout: fixed labels + scrollable content
-  h += '<div style="display:flex;border:1px solid #d5cec0;border-radius:8px;overflow:hidden;background:#fff">';
+  h += '<div style="display:flex;border:1px solid #d5cec0;border-radius:8px;overflow:hidden;background:#fff;max-width:100%">';
 
   // Left labels panel
   h += '<div class="sg-labels" style="width:130px;min-width:130px;border-right:1px solid #d5cec0;background:#faf8f4">';
-  // Ruler label
   h += '<div class="sg-label-row" style="height:22px;font-size:.7rem;color:#8a7f72;line-height:22px">Position</div>';
-  // Annotation label
-  if (SG.refAnnos.length) {
-    h += '<div class="sg-label-row" style="height:24px;font-size:.7rem;color:#8a7f72;line-height:24px">Features</div>';
+  if (visAnnos.length) {
+    h += '<div class="sg-label-row" style="height:'+annoTrackH+'px;font-size:.7rem;color:#8a7f72;line-height:'+annoTrackH+'px">Features</div>';
   }
-  // Reference label
   h += '<div class="sg-label-row" style="height:'+BASE_H+'px;font-size:.7rem;color:#8a7f72;line-height:'+BASE_H+'px;border-bottom:2px solid #d5cec0">Reference</div>';
-  // Per-file labels
   items.forEach(function(a) {
     var trackH = TRACE_H + BASE_H;
     h += '<div class="sg-label-row" style="height:'+trackH+'px;border-bottom:1px solid #ece7dd;padding:6px 10px">';
@@ -319,70 +353,49 @@ async function renderViewer(el) {
   h += '</div>';
 
   // Scrollable content
-  h += '<div id="sg-scroll" style="flex:1;overflow-x:auto;overflow-y:hidden">';
+  h += '<div id="sg-scroll" style="flex:1;min-width:0;overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain">';
   h += '<div style="width:'+totalW+'px;min-width:'+totalW+'px">';
 
-  // Ruler track
+  // Ruler track (canvas-based)
   h += '<div style="height:22px;position:relative;background:#f5f1ea">';
-  for (var p = spanStart; p < spanEnd; p++) {
-    if ((p+1) % 10 === 0 || p === spanStart) {
-      var x = (p - spanStart) * colW;
-      h += '<span style="position:absolute;left:'+x+'px;top:2px;font-size:.65rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace">'+(p+1)+'</span>';
-    }
-  }
+  h += '<canvas id="sg-ruler" height="22" style="display:block;position:sticky;left:0;height:22px"></canvas>';
   h += '</div>';
 
   // Annotation track
-  if (SG.refAnnos.length) {
-    h += '<div style="height:24px;position:relative;background:#faf8f4">';
-    SG.refAnnos.forEach(function(an) {
-      var aStart = Math.max(an.start, spanStart);
-      var aEnd = Math.min(an.end, spanEnd);
-      if (aStart >= aEnd) return;
-      var x = (aStart - spanStart) * colW;
-      var w = (aEnd - aStart) * colW;
-      var col = ANNO_COLORS[an.type] || ANNO_COLORS.misc_feature;
-      h += '<div title="'+esc(an.label)+' ('+an.type+')" style="position:absolute;left:'+x+'px;top:3px;width:'+w+'px;height:18px;background:'+col+';border-radius:3px;overflow:hidden;display:flex;align-items:center;padding:0 4px">';
-      if (w > 30) h += '<span style="font-size:.6rem;color:#fff;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(an.label)+'</span>';
-      h += '</div>';
+  if (visAnnos.length) {
+    h += '<div style="height:'+annoTrackH+'px;position:relative;background:#faf8f4">';
+    annoRows.forEach(function(row, rowIdx) {
+      row.forEach(function(an) {
+        var x = (an.start - spanStart) * colW;
+        var w = (an.end - an.start) * colW;
+        var y = rowIdx * ANNO_ROW_H + 1;
+        // Use .gb file color if available, otherwise fall back to type color
+        var col = an.color || ANNO_COLORS[an.type] || ANNO_COLORS.misc_feature;
+        var arrow = an.strand === -1 ? '◂ ' : an.strand === 1 ? ' ▸' : '';
+        var labelText = an.strand === -1 ? '◂ '+an.label : an.strand === 1 ? an.label+' ▸' : an.label;
+        h += '<div title="'+esc(an.label)+' ('+an.type+', '+(an.end-an.start)+'bp)" style="position:absolute;left:'+x+'px;top:'+y+'px;width:'+w+'px;height:'+(ANNO_ROW_H - 2)+'px;background:'+col+';border-radius:3px;overflow:hidden;display:flex;align-items:center;padding:0 4px;opacity:0.85">';
+        if (w > 25) h += '<span style="font-size:.6rem;color:#fff;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 0 2px rgba(0,0,0,.3)">'+esc(labelText)+'</span>';
+        h += '</div>';
+      });
     });
     h += '</div>';
   }
 
-  // Reference sequence track
-  h += '<div style="height:'+BASE_H+'px;display:flex;border-bottom:2px solid #d5cec0;background:#f5f1ea">';
-  for (var p = spanStart; p < spanEnd; p++) {
-    var base = SG.refSeq[p] || '?';
-    h += '<div class="sg-base" style="width:'+colW+'px;color:#4a4139">'+base+'</div>';
-  }
+  // Reference sequence track (canvas-based)
+  h += '<div style="height:'+BASE_H+'px;border-bottom:2px solid #d5cec0;background:#f5f1ea;position:relative">';
+  h += '<canvas id="sg-ref-bases" height="'+BASE_H+'" style="display:block;position:sticky;left:0;height:'+BASE_H+'px"></canvas>';
   h += '</div>';
 
-  // Per-file tracks (canvas placeholder + bases)
+  // Per-file tracks (canvas trace + canvas bases)
   items.forEach(function(a, idx) {
-    var refMap = buildRefToQuery(a.aligned_ref, a.aligned_query, a.ref_start);
-    // Trace canvas
     h += '<div style="border-bottom:1px solid #ece7dd">';
-    h += '<canvas id="sg-trace-'+a.id+'" width="'+totalW+'" height="'+TRACE_H+'" style="display:block;width:'+totalW+'px;height:'+TRACE_H+'px"></canvas>';
-    // Aligned bases
-    h += '<div style="height:'+BASE_H+'px;display:flex">';
-    for (var p = spanStart; p < spanEnd; p++) {
-      var entry = refMap[p];
-      var refBase = SG.refSeq[p] || '';
-      if (!entry || entry.qi < 0) {
-        // Gap or no coverage
-        if (entry && entry.qi === -1) h += '<div class="sg-base sg-base-gap" style="width:'+colW+'px">-</div>';
-        else h += '<div class="sg-base" style="width:'+colW+'px;color:#e0dbd3">·</div>';
-      } else {
-        var qBase = entry.base;
-        var match = qBase.toUpperCase() === refBase.toUpperCase();
-        if (match) {
-          h += '<div class="sg-base sg-base-match" style="width:'+colW+'px">'+qBase+'</div>';
-        } else {
-          h += '<div class="sg-base sg-base-mm" style="width:'+colW+'px">'+qBase+'</div>';
-        }
-      }
-    }
-    h += '</div></div>';
+    h += '<div style="height:'+TRACE_H+'px;position:relative">';
+    h += '<canvas id="sg-trace-'+a.id+'" height="'+TRACE_H+'" style="display:block;position:sticky;left:0;height:'+TRACE_H+'px"></canvas>';
+    h += '</div>';
+    h += '<div style="height:'+BASE_H+'px;position:relative;background:#fff">';
+    h += '<canvas id="sg-bases-'+a.id+'" height="'+BASE_H+'" style="display:block;position:sticky;left:0;height:'+BASE_H+'px"></canvas>';
+    h += '</div>';
+    h += '</div>';
   });
 
   h += '</div></div>'; // end scrollable
@@ -390,12 +403,140 @@ async function renderViewer(el) {
 
   el.innerHTML = sgStyles() + h;
 
-  // Draw traces after DOM paint
+  // Store render params for scroll-based redraw
+  SG._renderParams = { items: items, spanStart: spanStart, spanEnd: spanEnd, colW: colW, TRACE_H: TRACE_H };
+
+  // Draw traces after DOM paint + scroll positioning
   setTimeout(function() {
-    items.forEach(function(a) {
-      drawAlignedTrace(a, spanStart, spanEnd, colW, TRACE_H);
+    var scroller = document.getElementById('sg-scroll');
+    if (scroller) {
+      if (SG._scrollCol !== undefined) {
+        // Restore scroll position from zoom
+        scroller.scrollLeft = SG._scrollCol * colW - scroller.clientWidth / 2;
+        SG._scrollCol = undefined;
+      } else {
+        // First load — scroll to alignment start
+        scroller.scrollLeft = Math.max(0, (alnStart - spanStart) * colW - 40);
+      }
+      scroller.addEventListener('scroll', function() {
+        window.requestAnimationFrame(sgDrawAllTraces);
+      });
+    }
+    sgDrawAllTraces();
+  }, 60);
+}
+
+function sgDrawAllTraces() {
+  var rp = SG._renderParams;
+  if (!rp) return;
+  var scroller = document.getElementById('sg-scroll');
+  if (!scroller) return;
+  var viewW = scroller.clientWidth;
+  var scrollLeft = scroller.scrollLeft;
+  var colW = rp.colW;
+  var spanStart = rp.spanStart;
+  var spanEnd = rp.spanEnd;
+  var BASE_H = 18;
+
+  // Draw ruler
+  drawRulerCanvas(viewW, scrollLeft, colW, spanStart, spanEnd);
+
+  // Draw ref bases
+  drawBaseCanvas('sg-ref-bases', viewW, BASE_H, scrollLeft, colW, spanStart, spanEnd, function(p) {
+    var base = SG.refSeq[p] || '';
+    return { char: base, fg: '#4a4139', bg: null };
+  });
+
+  // Draw traces + alignment bases
+  rp.items.forEach(function(a) {
+    drawAlignedTrace(a, spanStart, spanEnd, colW, rp.TRACE_H, viewW, scrollLeft);
+    var refMap = buildRefToQuery(a.aligned_ref, a.aligned_query, a.ref_start);
+    drawBaseCanvas('sg-bases-'+a.id, viewW, BASE_H, scrollLeft, colW, spanStart, spanEnd, function(p) {
+      var entry = refMap[p];
+      var refBase = (SG.refSeq[p] || '').toUpperCase();
+      if (!entry || entry.qi < 0) {
+        if (entry && entry.qi === -1) return { char: '-', fg: '#a08930', bg: '#f5ecc8' };
+        return { char: '·', fg: '#e0dbd3', bg: null };
+      }
+      var qBase = entry.base;
+      var match = qBase.toUpperCase() === refBase;
+      if (match) return { char: qBase, fg: '#8a7f72', bg: null };
+      return { char: qBase, fg: '#c25a4a', bg: '#f5d0ca' };
     });
-  }, 50);
+  });
+}
+
+/* ── Draw a base row canvas (viewport-based) ─────────────── */
+function drawBaseCanvas(canvasId, viewW, h, scrollLeft, colW, spanStart, spanEnd, getBase) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.ceil(viewW * dpr);
+  canvas.height = Math.ceil(h * dpr);
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = h + 'px';
+  var ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, viewW, h);
+
+  var fontSize = Math.min(12, Math.max(7, colW - 2));
+  ctx.font = fontSize + 'px "SF Mono",Monaco,Consolas,monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  var colStart = Math.max(0, Math.floor(scrollLeft / colW) - 1);
+  var colEnd = Math.min(spanEnd - spanStart, Math.ceil((scrollLeft + viewW) / colW) + 1);
+
+  for (var c = colStart; c < colEnd; c++) {
+    var p = spanStart + c;
+    var info = getBase(p);
+    if (!info || !info.char) continue;
+    var x = c * colW - scrollLeft;
+    if (info.bg) {
+      ctx.fillStyle = info.bg;
+      ctx.fillRect(x, 0, colW, h);
+    }
+    ctx.fillStyle = info.fg || '#4a4139';
+    ctx.fillText(info.char, x + colW / 2, h / 2);
+  }
+}
+
+/* ── Draw ruler canvas (viewport-based) ──────────────────── */
+function drawRulerCanvas(viewW, scrollLeft, colW, spanStart, spanEnd) {
+  var canvas = document.getElementById('sg-ruler');
+  if (!canvas) return;
+  var dpr = window.devicePixelRatio || 1;
+  var h = 22;
+  canvas.width = Math.ceil(viewW * dpr);
+  canvas.height = Math.ceil(h * dpr);
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = h + 'px';
+  var ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, viewW, h);
+
+  ctx.font = '9px "SF Mono",Monaco,Consolas,monospace';
+  ctx.fillStyle = '#8a7f72';
+  ctx.textAlign = 'left';
+
+  var colStart = Math.max(0, Math.floor(scrollLeft / colW) - 1);
+  var colEnd = Math.min(spanEnd - spanStart, Math.ceil((scrollLeft + viewW) / colW) + 1);
+
+  // Tick interval based on zoom
+  var interval = 10;
+  if (colW < 5) interval = 100;
+  else if (colW < 8) interval = 50;
+  else if (colW < 12) interval = 20;
+
+  for (var c = colStart; c < colEnd; c++) {
+    var pos = spanStart + c + 1; // 1-based
+    if (pos % interval === 0 || c === 0) {
+      var x = c * colW - scrollLeft;
+      ctx.fillText(String(pos), x + 2, 14);
+      // Small tick mark
+      ctx.fillRect(x, 18, 1, 4);
+    }
+  }
 }
 
 /* ── Build ref→query mapping ─────────────────────────────── */
@@ -419,26 +560,41 @@ function buildRefToQuery(alignedRef, alignedQuery, refStart) {
   return map;
 }
 
-/* ── Draw aligned trace on canvas ────────────────────────── */
-function drawAlignedTrace(alignment, spanStart, spanEnd, colW, trackH) {
+/* ── Draw aligned trace on canvas (viewport-based) ───────── */
+function drawAlignedTrace(alignment, spanStart, spanEnd, colW, trackH, viewW, scrollLeft) {
   var canvas = document.getElementById('sg-trace-'+alignment.id);
   if (!canvas) return;
   var td = SG.traces[alignment.id];
   if (!td || !td.traces || !td.peaks || !td.peaks.length) return;
 
+  // Size canvas to viewport
+  var dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.ceil(viewW * dpr);
+  canvas.height = Math.ceil(trackH * dpr);
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = trackH + 'px';
+
   var ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, viewW, trackH);
+
   var peaks = td.peaks;
   var bases = td.bases || '';
+  var trimStart = td.trim_start || 0;
   var refMap = buildRefToQuery(alignment.aligned_ref, alignment.aligned_query, alignment.ref_start);
 
-  // Build column→queryIdx for the visible span
+  // Visible column range (with buffer of a few columns for smooth edges)
+  var colStart = Math.max(0, Math.floor(scrollLeft / colW) - 2);
+  var colEnd = Math.min(spanEnd - spanStart, Math.ceil((scrollLeft + viewW) / colW) + 2);
+
+  // Build column→queryIdx for full span
   var colToQi = [];
   for (var p = spanStart; p < spanEnd; p++) {
     var entry = refMap[p];
     colToQi.push(entry ? entry.qi : -2);
   }
 
-  // Find max amplitude for this trace
+  // Find max amplitude
   var maxAmp = 0;
   ['G','A','T','C'].forEach(function(ch) {
     var d = td.traces[ch];
@@ -447,14 +603,29 @@ function drawAlignedTrace(alignment, spanStart, spanEnd, colW, trackH) {
   if (!maxAmp) return;
   var scaleY = (trackH - 24) / maxAmp;
 
-  // Collect mapped columns with their query indices
-  var mapped = [];
+  // Collect ALL mapped columns (need neighbors for interpolation)
+  var allMapped = [];
   for (var c = 0; c < colToQi.length; c++) {
-    if (colToQi[c] >= 0 && colToQi[c] < peaks.length) {
-      mapped.push({ col: c, qi: colToQi[c], peak: peaks[colToQi[c]] });
+    var qi = colToQi[c];
+    var peakIdx = qi + trimStart;
+    if (qi >= 0 && peakIdx >= 0 && peakIdx < peaks.length) {
+      allMapped.push({ col: c, qi: qi, peakIdx: peakIdx, peak: peaks[peakIdx] });
     }
   }
-  if (mapped.length < 2) return;
+  if (allMapped.length < 2) return;
+
+  // Filter to visible range + neighbors for drawing
+  var visMapped = [];
+  for (var i = 0; i < allMapped.length; i++) {
+    var m = allMapped[i];
+    if (m.col >= colStart - 1 && m.col <= colEnd + 1) visMapped.push(m);
+  }
+  // Also need the neighbor just before visible range for line continuity
+  if (visMapped.length && visMapped[0].col > 0) {
+    for (var i = allMapped.length - 1; i >= 0; i--) {
+      if (allMapped[i].col < visMapped[0].col) { visMapped.unshift(allMapped[i]); break; }
+    }
+  }
 
   // Draw each channel
   ['G','A','T','C'].forEach(function(ch) {
@@ -465,10 +636,10 @@ function drawAlignedTrace(alignment, spanStart, spanEnd, colW, trackH) {
     ctx.globalAlpha = 0.8;
     var started = false;
 
-    for (var m = 0; m < mapped.length - 1; m++) {
-      var m1 = mapped[m], m2 = mapped[m + 1];
-      var x1 = (m1.col + 0.5) * colW;
-      var x2 = (m2.col + 0.5) * colW;
+    for (var m = 0; m < visMapped.length - 1; m++) {
+      var m1 = visMapped[m], m2 = visMapped[m + 1];
+      var x1 = (m1.col + 0.5) * colW - scrollLeft;
+      var x2 = (m2.col + 0.5) * colW - scrollLeft;
       var p1 = m1.peak, p2 = m2.peak;
       var nSamp = p2 - p1;
       var nPx = Math.max(1, Math.round(x2 - x1));
@@ -489,23 +660,27 @@ function drawAlignedTrace(alignment, spanStart, spanEnd, colW, trackH) {
     ctx.globalAlpha = 1;
   });
 
-  // Draw base letters at peak positions in trace
+  // Draw base letters at peak positions
   ctx.font = (colW >= 10 ? '10' : '8') + 'px "SF Mono",Monaco,Consolas,monospace';
   ctx.textAlign = 'center';
-  mapped.forEach(function(m) {
-    var base = bases[m.qi] || '';
+  visMapped.forEach(function(m) {
+    var xc = (m.col + 0.5) * colW - scrollLeft;
+    if (xc < -colW || xc > viewW + colW) return;
+    var base = bases[m.peakIdx] || '';
     ctx.fillStyle = TRACE_COLORS[base] || '#999';
-    ctx.fillText(base, (m.col + 0.5) * colW, trackH - 4);
+    ctx.fillText(base, xc, trackH - 4);
   });
 
-  // Quality bars at top of trace
+  // Quality bars at top
   if (td.quals) {
-    mapped.forEach(function(m) {
-      var q = td.quals[m.qi] || 0;
+    visMapped.forEach(function(m) {
+      var xc = m.col * colW - scrollLeft;
+      if (xc < -colW || xc > viewW + colW) return;
+      var q = td.quals[m.peakIdx] || 0;
       var bh = Math.round((q / 50) * 12);
       ctx.fillStyle = qualColor(q);
       ctx.globalAlpha = 0.5;
-      ctx.fillRect(m.col * colW + 1, 0, Math.max(1, colW - 2), bh);
+      ctx.fillRect(xc + 1, 0, Math.max(1, colW - 2), bh);
     });
     ctx.globalAlpha = 1;
   }
@@ -513,6 +688,12 @@ function drawAlignedTrace(alignment, spanStart, spanEnd, colW, trackH) {
 
 /* ── Zoom ────────────────────────────────────────────────── */
 function sgZoom(dir) {
+  // Save current scroll position as column fraction
+  var scroller = document.getElementById('sg-scroll');
+  var rp = SG._renderParams;
+  if (scroller && rp && rp.colW) {
+    SG._scrollCol = (scroller.scrollLeft + scroller.clientWidth / 2) / rp.colW;
+  }
   if (dir === 0) SG.zoom = 1;
   else if (dir > 0) SG.zoom = Math.min(4, SG.zoom * 1.3);
   else SG.zoom = Math.max(0.4, SG.zoom / 1.3);

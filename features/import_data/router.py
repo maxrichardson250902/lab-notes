@@ -245,7 +245,7 @@ class UpdatePrimer(BaseModel):
 @router.get("/primers")
 def list_primers():
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM primers ORDER BY created DESC").fetchall()
+        rows = conn.execute("SELECT * FROM primers ORDER BY name ASC").fetchall()
     return {"items": [dict(r) for r in rows]}
 
 @router.post("/primers")
@@ -345,7 +345,7 @@ class UpdatePlasmid(BaseModel):
 def list_plasmids():
     _ensure_resistance_column()
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM plasmids ORDER BY created DESC").fetchall()
+        rows = conn.execute("SELECT * FROM plasmids ORDER BY name ASC").fetchall()
     return {"items": [dict(r) for r in rows]}
 
 @router.post("/plasmids")

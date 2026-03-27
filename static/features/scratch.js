@@ -141,13 +141,225 @@ async function _getAllRuns() {
     '.sp-dev-orig s{text-decoration:line-through}',
     '.sp-dev-new{color:#b85c1a;font-size:12px;margin-top:1px}',
     '.sp-summary-clean{font-size:13px;color:#5b7a5e;font-style:italic}',
-    '.sp-run-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}'
+    '.sp-run-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}',
+
+    '.sp-timer-btn{background:none;border:1px solid #d5cec0;border-radius:4px;font-size:11px;color:#8a7f72;cursor:pointer;padding:2px 8px;margin-left:25px;margin-top:4px;display:inline-flex;align-items:center;gap:4px}',
+    '.sp-timer-btn:hover{background:#f0ebe3;color:#4a4139}',
+    '.sp-timer-btn.running{border-color:#5b7a5e;color:#5b7a5e;background:#e8f0e8}',
+    '.sp-timer-btn.expired{border-color:#c0392b;color:#c0392b;background:#fde8e8;animation:sp-flash 0.8s infinite}',
+    '.sp-timer-display{font-family:"SF Mono",Monaco,Consolas,monospace;font-size:12px;font-weight:600;min-width:44px;text-align:center}',
+    '@keyframes sp-flash{0%,100%{opacity:1}50%{opacity:0.3}}',
+    '.sp-timer-popup{position:fixed;bottom:24px;right:24px;background:#faf8f4;border:2px solid #c0392b;border-radius:8px;padding:16px 20px;z-index:3000;min-width:260px;max-width:380px;box-shadow:0 4px 20px rgba(60,52,42,.2)}',
+    '.sp-timer-popup-title{font-weight:700;font-size:13px;color:#c0392b;margin-bottom:4px}',
+    '.sp-timer-popup-text{font-size:12px;color:#4a4139;margin-bottom:10px;line-height:1.5}',
+    '.sp-step.timer-expired{border-left:3px solid #c0392b;background:#fff8f8}'
   ].join('');
   document.head.appendChild(s);
 })();
 
+
 // ── recipe helpers ────────────────────────────────────────────────────────────
 var _DEFAULT_RECIPE = { columns: ['Component', 'Stock conc.', 'Volume (uL)', 'Final conc.'], rows: [] };
+
+// ── timer state ───────────────────────────────────────────────────────────────
+var _stepTimers = {}; // stepId -> {endTime, intervalId, duration, paused, remaining}
+var _timerMasterInterval = null;
+
+function _parseDurationFromText(text) {
+  // auto-detect duration from step text e.g. "37°C for 30 min", "incubate 2 hours", "45 sec"
+  var t = text.toLowerCase();
+  var m;
+  if ((m = t.match(/(\d+(?:\.\d+)?)\s*h(?:ours?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]) * 3600);
+  if ((m = t.match(/(\d+(?:\.\d+)?)\s*min(?:utes?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]) * 60);
+  if ((m = t.match(/(\d+(?:\.\d+)?)\s*s(?:ec(?:onds?)?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]));
+  return 0;
+}
+
+function _fmtTime(secs) {
+  if (secs < 0) secs = 0;
+  var h = Math.floor(secs / 3600);
+  var m = Math.floor((secs % 3600) / 60);
+  var s = secs % 60;
+  if (h > 0) return h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+}
+
+function _requestNotifPermission() {
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function spStartTimer(stepId) {
+  var rs = _scratchProtoRun; if (!rs) return;
+  var step = rs.steps.find(function(s) { return s.id === stepId; }); if (!step) return;
+  var existing = _stepTimers[stepId];
+  if (existing && existing.intervalId) {
+    // already running — pause it
+    clearInterval(existing.intervalId);
+    existing.paused = true;
+    existing.remaining = Math.max(0, Math.ceil((existing.endTime - Date.now()) / 1000));
+    existing.intervalId = null;
+    _updateTimerDisplay(stepId);
+    return;
+  }
+  if (existing && existing.paused) {
+    // resume
+    existing.endTime = Date.now() + existing.remaining * 1000;
+    existing.paused = false;
+    existing.intervalId = setInterval(function() { _timerTick(stepId); }, 500);
+    _updateTimerDisplay(stepId);
+    return;
+  }
+  // start fresh — prompt for duration if not set
+  var duration = step.duration || _parseDurationFromText(step.text);
+  if (!duration) {
+    var input = prompt('Timer duration (e.g. 30min, 1h, 45sec, or seconds):');
+    if (!input) return;
+    duration = _parseInputDuration(input);
+    if (!duration) { toast('Could not parse duration', true); return; }
+    step.duration = duration;
+  }
+  _stepTimers[stepId] = {
+    duration:   duration,
+    endTime:    Date.now() + duration * 1000,
+    remaining:  duration,
+    paused:     false,
+    expired:    false,
+    intervalId: setInterval(function() { _timerTick(stepId); }, 500)
+  };
+  _requestNotifPermission();
+  _updateTimerDisplay(stepId);
+}
+
+function _parseInputDuration(input) {
+  input = input.trim().toLowerCase();
+  var m;
+  if ((m = input.match(/^(\d+(?:\.\d+)?)\s*h/))) return Math.round(parseFloat(m[1]) * 3600);
+  if ((m = input.match(/^(\d+(?:\.\d+)?)\s*m/))) return Math.round(parseFloat(m[1]) * 60);
+  if ((m = input.match(/^(\d+(?:\.\d+)?)\s*s/))) return Math.round(parseFloat(m[1]));
+  if ((m = input.match(/^(\d+)$/))) return parseInt(m[1]);
+  return 0;
+}
+
+function spResetTimer(stepId) {
+  var t = _stepTimers[stepId]; if (!t) return;
+  if (t.intervalId) clearInterval(t.intervalId);
+  delete _stepTimers[stepId];
+  var el = document.getElementById('sps-' + stepId);
+  if (el) {
+    el.classList.remove('timer-expired');
+    var btn = el.querySelector('.sp-timer-btn');
+    if (btn) { btn.className = 'sp-timer-btn'; btn.innerHTML = '&#9202; ' + (document.getElementById('sp-timer-custom-' + stepId) ? _fmtTime(0) : 'Timer'); }
+  }
+  _removeTimerPopup(stepId);
+}
+
+function _timerTick(stepId) {
+  var t = _stepTimers[stepId]; if (!t || t.paused) return;
+  var remaining = Math.ceil((t.endTime - Date.now()) / 1000);
+  t.remaining = remaining;
+  if (remaining <= 0 && !t.expired) {
+    t.expired = true;
+    clearInterval(t.intervalId);
+    t.intervalId = null;
+    _onTimerExpired(stepId);
+  }
+  _updateTimerDisplay(stepId);
+}
+
+function _updateTimerDisplay(stepId) {
+  var t = _stepTimers[stepId];
+  var el = document.getElementById('sps-' + stepId); if (!el) return;
+  var btn = el.querySelector('.sp-timer-btn'); if (!btn) return;
+  var disp = el.querySelector('.sp-timer-display');
+
+  if (!t) {
+    btn.className = 'sp-timer-btn';
+    btn.innerHTML = '&#9202; Timer';
+    return;
+  }
+  var remaining = t.paused ? t.remaining : Math.max(0, Math.ceil((t.endTime - Date.now()) / 1000));
+  var timeStr = _fmtTime(remaining);
+
+  if (t.expired) {
+    btn.className = 'sp-timer-btn expired';
+    btn.innerHTML = '&#9203; ' + timeStr + ' &nbsp;<small>done</small>';
+  } else if (t.paused) {
+    btn.className = 'sp-timer-btn';
+    btn.innerHTML = '&#9654; ' + timeStr + ' &nbsp;<small>paused</small>';
+  } else {
+    btn.className = 'sp-timer-btn running';
+    btn.innerHTML = '&#9646;&#9646; ' + timeStr;
+  }
+}
+
+function _onTimerExpired(stepId) {
+  var rs = _scratchProtoRun; if (!rs) return;
+  var step = rs.steps.find(function(s) { return s.id === stepId; });
+  var stepText = step ? step.text : 'Step ' + stepId;
+  // flash the step card
+  var el = document.getElementById('sps-' + stepId);
+  if (el) el.classList.add('timer-expired');
+  // browser notification
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    new Notification('Timer done — ' + (rs.protocol.title || 'Protocol'), {
+      body: stepText,
+      icon: '/favicon.ico'
+    });
+  }
+  // popup in corner
+  _showTimerPopup(stepId, stepText);
+  _updateTimerDisplay(stepId);
+}
+
+function _showTimerPopup(stepId, stepText) {
+  _removeTimerPopup(stepId);
+  var div = document.createElement('div');
+  div.className = 'sp-timer-popup';
+  div.id = 'sp-timer-popup-' + stepId;
+  div.innerHTML =
+    '<div class="sp-timer-popup-title">&#9203; Timer complete!</div>' +
+    '<div class="sp-timer-popup-text">' + esc(stepText) + '</div>' +
+    '<div style="display:flex;gap:8px">' +
+      '<button class="btn primary" style="flex:1" onclick="spDismissTimer(' + stepId + ')">Dismiss</button>' +
+      '<button class="btn" onclick="spResetTimer(' + stepId + ')">Reset</button>' +
+    '</div>';
+  document.body.appendChild(div);
+}
+
+function _removeTimerPopup(stepId) {
+  var el = document.getElementById('sp-timer-popup-' + stepId);
+  if (el) el.remove();
+}
+
+function spDismissTimer(stepId) {
+  _removeTimerPopup(stepId);
+  var el = document.getElementById('sps-' + stepId);
+  if (el) el.classList.remove('timer-expired');
+}
+
+function _clearAllTimers() {
+  Object.keys(_stepTimers).forEach(function(id) {
+    var t = _stepTimers[id];
+    if (t && t.intervalId) clearInterval(t.intervalId);
+    _removeTimerPopup(parseInt(id));
+  });
+  _stepTimers = {};
+}
+
+function _getTimerHTML(step) {
+  var t = _stepTimers[step.id];
+  var duration = step.duration || _parseDurationFromText(step.text);
+  var label = t ? '' : (duration ? _fmtTime(duration) : 'Timer');
+  var cls = t ? (t.expired ? 'expired' : t.paused ? '' : 'running') : '';
+  var icon = t ? (t.expired ? '&#9203;' : t.paused ? '&#9654;' : '&#9646;&#9646;') : '&#9202;';
+  var timeStr = t ? _fmtTime(t.paused ? t.remaining : Math.max(0, Math.ceil((t.endTime - Date.now()) / 1000))) : label;
+  return '<button class="sp-timer-btn ' + cls + '" onclick="spStartTimer(' + step.id + ')">' +
+    icon + ' ' + timeStr +
+    '</button>' +
+    (t ? ' <button class="sp-timer-btn" style="margin-left:4px" onclick="spResetTimer(' + step.id + ')">&#215;</button>' : '');
+}
 
 function _parseRecipeRun(raw) {
   if (!raw) return JSON.parse(JSON.stringify(_DEFAULT_RECIPE));
@@ -331,6 +543,7 @@ function spLaunchRunDirect(p, group, subgroup) {
   }).catch(function() {});
 
   _saveLocalOnly(_scratchProtoRun);
+  _requestNotifPermission();
 
   if (S.view === 'scratch') {
     var el = document.getElementById('content');
@@ -384,7 +597,10 @@ function _renderProtoRunInScratch(el) {
     return '<div class="sp-step' + (step.done ? ' done' : '') + (hasDev ? ' has-dev' : '') + '" id="sps-' + step.id + '">' +
       '<label class="sp-step-check"><input type="checkbox"' + (step.done ? ' checked' : '') + ' onchange="spToggleStep(' + step.id + ',this.checked)"/>' +
       '<span class="sp-step-text">' + esc(step.text) + '</span></label>' +
-      '<button class="sp-dev-btn" onclick="spToggleDev(' + step.id + ')">' + (hasDev ? '&#9998; deviation noted' : '+ deviation note') + '</button>' +
+      '<div style="display:flex;gap:0;align-items:center;flex-wrap:wrap">' +
+        _getTimerHTML(step) +
+        '<button class="sp-dev-btn" style="margin-left:8px" onclick="spToggleDev(' + step.id + ')">' + (hasDev ? '&#9998; deviation noted' : '+ deviation note') + '</button>' +
+      '</div>' +
       '<div class="sp-dev-note' + (hasDev ? ' open' : '') + '" id="spd-' + step.id + '"><textarea placeholder="What did you change?" oninput="spUpdateDev(' + step.id + ',this.value)">' + esc(step.deviation) + '</textarea></div>' +
     '</div>';
   }).join('');
@@ -413,9 +629,12 @@ function _renderProtoRunInScratch(el) {
         '<button class="btn primary" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
       '</div>' +
     '</div>';
+  // initialise timer buttons for each step (after DOM is set)
+  rs.steps.forEach(function(step) { _renderTimerBtn(step.id); });
 }
 
 function spSaveAndExit() {
+  _clearAllTimers();
   if (_scratchProtoRun) _saveRun(_scratchProtoRun);
   _scratchProtoRun = null;
   if (typeof setView === 'function') setView('protocols'); else loadView();
@@ -424,6 +643,7 @@ function spSaveAndExit() {
 
 function spAbandonRun() {
   if (!confirm('Abandon this run? Progress will be lost.')) return;
+  _clearAllTimers();
   if (_scratchProtoRun) _removeRun(_scratchProtoRun.runId);
   _scratchProtoRun = null;
   if (typeof setView === 'function') setView('protocols'); else loadView();
