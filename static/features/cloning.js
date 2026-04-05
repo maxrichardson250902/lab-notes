@@ -57,9 +57,11 @@ var _cl = {
   ad: {
     expanded: false,
     mode: 'gibson',  // 'gibson' | 'goldengate' | 'digestligate'
-    gibson: { fragments: [], overlapLen: 25, tmTarget: 62, result: null, designing: false },
-    goldengate: { enzyme: 'BsaI', fragments: [], result: null, designing: false },
+    gibson: { fragments: [], vector: null, overlapLen: 25, tmTarget: 62, result: null, designing: false },
+    goldengate: { enzyme: 'BsaI', bins: [], vector: null, result: null, designing: false },
     digestligate: { enzyme1: '', enzyme2: '', vectorSeq: '', vectorName: '', insertSeq: '', insertName: '', result: null, designing: false },
+    _libPicker: null,   // null or { target: 'gibson'|'goldengate'|'dl-vector'|'dl-insert', filter: '' }
+    _libLoading: false,
   },
 };
 
@@ -131,6 +133,7 @@ function _clSelectSequence(type, id) {
   _cl.ad.gibson.result = null;
   _cl.ad.goldengate.result = null;
   _cl.ad.digestligate.result = null;
+  _cl.ad._libPicker = null;
   _cl.search.results = null;
   _cl.search.activeIdx = 0;
   _cl.search.open = false;
@@ -305,21 +308,39 @@ function _clOnSeqVizSelection(sel) {
   }
 
   if (start === end && start === 0) return;
-  if (start > end) { var tmp = start; start = end; end = tmp; }
 
-  var isSingleClick = (start === end) || (Math.abs(end - start) <= 1);
-  var selSeq = (_cl.parsed && !isSingleClick) ? _cl.parsed.seq.substring(start, end) : '';
+  var isCircular = _cl.parsed && (_cl.parsed.topology || '').toLowerCase() === 'circular';
+  var crossesOrigin = false;
+
+  // For linear sequences or when SeqViz gives us inverted coords, swap
+  if (start > end) {
+    if (isCircular) {
+      // Cross-origin selection on circular — keep as-is
+      crossesOrigin = true;
+    } else {
+      var tmp = start; start = end; end = tmp;
+    }
+  }
+
+  var selLen = _clSelLen(start, end);
+  var isSingleClick = (start === end) || selLen <= 1;
+  var selSeq = (_cl.parsed && !isSingleClick) ? _clGetSelSeq(start, end) : '';
   var filled = false;
 
   // Store last selection for feature editor auto-fill
   if (!isSingleClick) {
-    _cl.lastSelection = { start: start, end: end };
+    _cl.lastSelection = { start: start, end: end, crossesOrigin: crossesOrigin };
     // Live-update feature editor panel if open
     if (_cl.editFeature !== null) {
       _clSetInputVal('cl-feat-start', start);
       _clSetInputVal('cl-feat-end', end);
     }
   }
+
+  // Format selection text for toasts
+  var selText = crossesOrigin
+    ? start + '\u2192origin\u2192' + end + ' (' + selLen + ' bp, wraps origin)'
+    : start + '\u2013' + end + ' (' + selLen + ' bp)';
 
   // ── Route to primer design panel if expanded
   if (_cl.pd.expanded) {
@@ -335,21 +356,21 @@ function _clOnSeqVizSelection(sel) {
       _cl.pd.custom.end = String(end);
       _clSetInputVal('cl-pd-custom-start', start);
       _clSetInputVal('cl-pd-custom-end', end);
-      toast('Primer region: ' + start + '\u2013' + end + ' (' + (end - start) + ' bp)', false);
+      toast('Primer region: ' + selText, false);
       filled = true;
     } else if (mode === 'pcr' && !isSingleClick) {
       _cl.pd.pcr.targetStart = String(start);
       _cl.pd.pcr.targetEnd = String(end);
       _clSetInputVal('cl-pd-pcr-targetStart', start);
       _clSetInputVal('cl-pd-pcr-targetEnd', end);
-      toast('PCR target: ' + start + '\u2013' + end + ' (' + (end - start) + ' bp)', false);
+      toast('PCR target: ' + selText, false);
       filled = true;
     } else if (mode === 'seq' && !isSingleClick) {
       _cl.pd.seq.regionStart = String(start);
       _cl.pd.seq.regionEnd = String(end);
       _clSetInputVal('cl-pd-seq-regionStart', start);
       _clSetInputVal('cl-pd-seq-regionEnd', end);
-      toast('Sequencing region: ' + start + '\u2013' + end + ' (' + (end - start) + ' bp)', false);
+      toast('Sequencing region: ' + selText, false);
       filled = true;
     }
   }
@@ -359,30 +380,29 @@ function _clOnSeqVizSelection(sel) {
     if (_cl.sa.mode === 'tools') {
       _cl.sa.tools.input = selSeq;
       _clSetInputVal('cl-sa-tools-input', selSeq);
-      if (!filled) toast('Selection: ' + (end - start) + ' bp \u2192 Sequence Tools', false);
+      if (!filled) toast('Selection: ' + selLen + ' bp \u2192 Sequence Tools', false);
       filled = true;
     } else if (_cl.sa.mode === 'blast') {
       _cl.sa.blast.seq = selSeq;
       _clSetInputVal('cl-sa-blast-input', selSeq);
-      if (!filled) toast('Selection: ' + (end - start) + ' bp \u2192 BLAST', false);
+      if (!filled) toast('Selection: ' + selLen + ' bp \u2192 BLAST', false);
       filled = true;
     } else if (_cl.sa.mode === 'restriction') {
-      // For RE: auto-fill isn't needed but we can show selection info
-      if (!filled) toast('Selected ' + start + '\u2013' + end + ' (' + (end - start) + ' bp)', false);
+      if (!filled) toast('Selected ' + selText, false);
     } else if (_cl.sa.mode === 'orfs') {
-      if (!filled) toast('Selected ' + start + '\u2013' + end + ' (' + (end - start) + ' bp)', false);
+      if (!filled) toast('Selected ' + selText, false);
     }
   }
 
   // ── Route to assembly panel if expanded
   if (_cl.ad.expanded && _cl.parsed && !isSingleClick && !filled) {
-    toast('Selected ' + start + '\u2013' + end + ' (' + (end - start) + ' bp) \u2014 click \u201c+ From loaded\u201d to add as fragment', false);
+    toast('Selected ' + selText + ' \u2014 click \u201c+ From loaded\u201d to add as fragment', false);
     filled = true;
   }
 
   // ── Fallback: if neither panel is expanded, just show a toast with the selection
   if (!filled && !isSingleClick) {
-    toast('Selected ' + start + '\u2013' + end + ' (' + (end - start) + ' bp) \u2014 open a panel to use it', false);
+    toast('Selected ' + selText + ' \u2014 open a panel to use it', false);
   }
   // Note: we intentionally do NOT re-render SeqViz here — that would destroy
   // the native drag highlight. Fields are updated via direct DOM manipulation.
@@ -404,6 +424,24 @@ function _clGcPct(seq) {
   return Math.round(gc / s.length * 100);
 }
 function _clCleanSeq(seq) { return (seq || '').toUpperCase().replace(/[^ATGCN]/g, ''); }
+
+/** Get selected sequence, handling cross-origin wrapping for circular. */
+function _clGetSelSeq(start, end) {
+  if (!_cl.parsed || !_cl.parsed.seq) return '';
+  var seq = _cl.parsed.seq;
+  if (start <= end) {
+    return seq.substring(start, end);
+  }
+  // Cross-origin: start > end → from start to end-of-seq + from 0 to end
+  return seq.substring(start) + seq.substring(0, end);
+}
+
+/** Length of selection, handling cross-origin. */
+function _clSelLen(start, end) {
+  if (!_cl.parsed) return Math.abs(end - start);
+  if (start <= end) return end - start;
+  return (_cl.parsed.seq.length - start) + end;
+}
 
 /* ── main render ───────────────────────────────────────────── */
 var _clEl = null;
@@ -451,10 +489,12 @@ function _clRenderViewerTab() {
     h += '</div>';
 
     var plasmids = _cl.sequences.filter(function(s) { return s.type === 'plasmid' && s.has_file; });
+    var kitparts = _cl.sequences.filter(function(s) { return s.type === 'kitpart' && s.has_file; });
     var primers = _cl.sequences.filter(function(s) { return s.type === 'primer' && s.has_file; });
     if (_cl.filter) {
       var f = _cl.filter.toLowerCase();
       plasmids = plasmids.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1; });
+      kitparts = kitparts.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.kit_name && s.kit_name.toLowerCase().indexOf(f) !== -1); });
       primers = primers.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1; });
     }
 
@@ -471,6 +511,21 @@ function _clRenderViewerTab() {
         h += '</div>';
       });
     }
+    if (kitparts.length > 0) {
+      h += '<div style="padding:.3rem .7rem;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8E44AD;font-weight:600;border-bottom:1px solid #e8e2d8;margin-top:.2rem;">\ud83e\uddf0 Kit Parts</div>';
+      kitparts.forEach(function(s) {
+        var isA = _cl.selected && _cl.selected.type === s.type && _cl.selected.id === s.id;
+        h += '<div onclick="_clSelectSequence(\x27' + s.type + '\x27,' + s.id + ')" style="padding:.5rem .7rem;cursor:pointer;border-bottom:1px solid #f0ebe3;' +
+             (isA ? 'background:#eef4ee;border-left:3px solid #5b7a5e;' : 'border-left:3px solid transparent;') + 'transition:background .15s;" ' +
+             'onmouseover="this.style.background=\x27' + (isA ? '#eef4ee' : '#f5f1eb') + '\x27" onmouseout="this.style.background=\x27' + (isA ? '#eef4ee' : 'transparent') + '\x27">';
+        h += '<div style="font-size:.85rem;font-weight:500;color:#4a4139;">' + esc(s.name) + '</div>';
+        var meta = [];
+        if (s.kit_name) meta.push(s.kit_name);
+        if (s.part_type) meta.push(s.part_type);
+        if (meta.length > 0) h += '<div style="font-size:.72rem;color:#8E44AD;margin-top:.15rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(meta.join(' \u00b7 ')) + '</div>';
+        h += '</div>';
+      });
+    }
     if (primers.length > 0) {
       h += '<div style="padding:.3rem .7rem;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;font-weight:600;border-bottom:1px solid #e8e2d8;margin-top:.2rem;">Primers</div>';
       primers.forEach(function(s) {
@@ -483,7 +538,7 @@ function _clRenderViewerTab() {
         h += '</div>';
       });
     }
-    if (plasmids.length === 0 && primers.length === 0) {
+    if (plasmids.length === 0 && kitparts.length === 0 && primers.length === 0) {
       h += '<div style="padding:1.5rem;text-align:center;color:#8a7f72;font-size:.82rem;">';
       h += _cl.filter ? 'No sequences match your filter.' : 'No sequences with GenBank files found.<br><br><span style="font-size:.75rem;">Import with .gb files in DNA Manager first.</span>';
       h += '</div>';
@@ -522,6 +577,9 @@ function _clRenderViewerTab() {
     h += '</div>';
     if (!_cl.pd._viewingProduct) {
       h += '<a href="/api/' + esc(_cl.selected.type) + 's/' + _cl.selected.id + '/gb" download style="padding:.25rem .5rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;text-decoration:none;">\u2b07 .gb</a>';
+      if ((_cl.parsed.topology || '').toLowerCase() === 'circular') {
+        h += '<button onclick="_clReindex()" style="padding:.25rem .5rem;font-size:.72rem;color:#e67e22;border:1px solid #e67e22;border-radius:4px;background:#fff;cursor:pointer;" title="Set a new origin (position 0) for this circular sequence">\ud83d\udd04 Reindex</button>';
+      }
       h += '<button onclick="_clSendToOC()" style="padding:.25rem .5rem;font-size:.72rem;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;">\ud83d\udce4 Send to OC</button>';
     }
     h += '<button onclick="_clSearchToggle()" style="padding:.25rem .5rem;font-size:.72rem;border:1px solid ' + (_cl.search.open ? '#5b7a5e' : '#d5cec0') + ';border-radius:4px;background:' + (_cl.search.open ? '#5b7a5e' : '#faf8f4') + ';color:' + (_cl.search.open ? '#fff' : '#8a7f72') + ';cursor:pointer;" title="Search sequence (fwd + RC)">\ud83d\udd0d</button>';
@@ -1976,6 +2034,40 @@ function _clToggleSidebar() { _cl.sidebarOpen = !_cl.sidebarOpen; _clRender(); }
 function _clToggleOcSidebar() { _cl.ocSidebarOpen = !_cl.ocSidebarOpen; _clRender(); }
 function _clToggleFeatures() { _cl.featuresOpen = !_cl.featuresOpen; _clRender(); }
 
+/* ── Reindex origin ───────────────────────────────────────── */
+function _clReindex() {
+  if (!_cl.parsed || !_cl.selected) { toast('No sequence loaded', true); return; }
+  if ((_cl.parsed.topology || '').toLowerCase() !== 'circular') { toast('Reindex only works on circular sequences', true); return; }
+
+  var sel = _cl.lastSelection || { start: 0, end: 0 };
+  var defaultPos = sel.start > 0 ? sel.start : 0;
+  var input = prompt('Enter new origin position (current selection start: ' + defaultPos + '):', String(defaultPos));
+  if (input === null) return;
+  var newOrigin = parseInt(input, 10);
+  if (isNaN(newOrigin) || newOrigin < 0 || newOrigin >= _cl.parsed.length) {
+    toast('Invalid position (0\u2013' + (_cl.parsed.length - 1) + ')', true);
+    return;
+  }
+  if (newOrigin === 0) { toast('Already at origin 0', false); return; }
+
+  _cl.loading = true;
+  _clRender();
+  api('POST', '/api/cloning/sequences/' + _cl.selected.type + '/' + _cl.selected.id + '/reindex', {
+    new_origin: newOrigin,
+  }).then(function(data) {
+    _cl.parsed = data;
+    _cl.loading = false;
+    _cl.lastSelection = { start: 0, end: 0 };
+    toast('Origin moved to position ' + newOrigin + ' \u2014 sequence reindexed');
+    _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }).catch(function(err) {
+    _cl.loading = false;
+    toast('Reindex failed: ' + (err.message || err), true);
+    _clRender();
+  });
+}
+
 /* ── Sequence search (forward + reverse complement) ──────── */
 function _clSearchToggle() {
   _cl.search.open = !_cl.search.open;
@@ -2409,8 +2501,14 @@ function _clRenderFragmentList(fragments, modeKey) {
   h += '<span style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Fragments (' + fragments.length + ')</span>';
   h += '<div style="display:flex;gap:.3rem;">';
   h += '<button onclick="_adAddFromLoaded(\x27' + modeKey + '\x27)" style="padding:.25rem .5rem;font-size:.7rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;background:#fff;cursor:pointer;" title="Add the currently loaded sequence (or selection) as a fragment">+ From loaded</button>';
+  h += '<button onclick="_adOpenLib(\x27' + modeKey + '\x27)" style="padding:.25rem .5rem;font-size:.7rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;" title="Pick from saved plasmids and primers">\ud83d\udcc2 From library</button>';
   h += '<button onclick="_adAddPaste(\x27' + modeKey + '\x27)" style="padding:.25rem .5rem;font-size:.7rem;color:#4682B4;border:1px solid #4682B4;border-radius:3px;background:#fff;cursor:pointer;" title="Paste a raw DNA sequence">+ Paste</button>';
   h += '</div></div>';
+
+  // ── Inline library picker
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === modeKey) {
+    h += _clRenderLibPicker(modeKey);
+  }
 
   if (fragments.length === 0) {
     h += '<div style="padding:.8rem;text-align:center;color:#8a7f72;font-size:.78rem;border:1px dashed #d5cec0;border-radius:5px;">No fragments added yet. Use the buttons above or drag-select a region on the map.</div>';
@@ -2436,20 +2534,136 @@ function _clRenderFragmentList(fragments, modeKey) {
   return h;
 }
 
+/* ── Library picker (inline dropdown of saved sequences) ──── */
+function _clRenderLibPicker(target) {
+  var lp = _cl.ad._libPicker;
+  var h = '';
+  h += '<div style="border:1px solid #8E44AD;border-radius:5px;background:#faf8f4;margin-bottom:.6rem;overflow:hidden;">';
+  // Header with search + close
+  h += '<div style="display:flex;align-items:center;gap:.4rem;padding:.4rem .6rem;border-bottom:1px solid #e8e2d8;background:#f3eef8;">';
+  h += '<span style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8E44AD;font-weight:600;white-space:nowrap;">\ud83d\udcc2 Library</span>';
+  h += '<input id="cl-lib-filter" type="text" placeholder="Filter\u2026" value="' + esc(lp.filter || '') + '" oninput="_adLibFilter(this.value)" style="flex:1;padding:.25rem .4rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;font-size:.76rem;color:#4a4139;" />';
+  if (_cl.ad._libLoading) {
+    h += '<span style="font-size:.72rem;color:#8a7f72;">\u23f3</span>';
+  }
+  h += '<button onclick="_adCloseLib()" style="padding:.15rem .35rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#8a7f72;cursor:pointer;">\u2715</button>';
+  h += '</div>';
+
+  // Sequence list — plasmids, kit parts, primers
+  var plasmids = _cl.sequences.filter(function(s) { return s.type === 'plasmid' && s.has_file; });
+  var kitparts = _cl.sequences.filter(function(s) { return s.type === 'kitpart' && s.has_file; });
+  var primers = _cl.sequences.filter(function(s) { return s.type === 'primer' && s.has_file; });
+  if (lp.filter) {
+    var f = lp.filter.toLowerCase();
+    plasmids = plasmids.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.use && s.use.toLowerCase().indexOf(f) !== -1); });
+    kitparts = kitparts.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.kit_name && s.kit_name.toLowerCase().indexOf(f) !== -1) || (s.part_type && s.part_type.toLowerCase().indexOf(f) !== -1); });
+    primers = primers.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.sequence && s.sequence.toLowerCase().indexOf(f) !== -1); });
+  }
+
+  var totalCount = plasmids.length + kitparts.length + primers.length;
+
+  h += '<div style="max-height:240px;overflow-y:auto;">';
+
+  // Kit Parts (shown first — most relevant for assembly)
+  if (kitparts.length > 0) {
+    h += '<div style="padding:.25rem .6rem;font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:#8E44AD;font-weight:600;background:#f3eef8;border-bottom:1px solid #e8e2d8;">\ud83e\uddf0 Kit Parts (' + kitparts.length + ')</div>';
+    kitparts.forEach(function(s) {
+      h += '<div onclick="_adLibPick(\x27' + esc(target) + '\x27,\x27' + s.type + '\x27,' + s.id + ')" style="padding:.35rem .6rem;cursor:pointer;border-bottom:1px solid #f0ebe3;display:flex;align-items:center;gap:.5rem;" onmouseover="this.style.background=\x27#eee8f4\x27" onmouseout="this.style.background=\x27transparent\x27">';
+      h += '<span style="font-size:.8rem;color:#4a4139;font-weight:500;flex:1;">' + esc(s.name) + '</span>';
+      var meta = [];
+      if (s.kit_name) meta.push(s.kit_name);
+      if (s.part_type) meta.push(s.part_type);
+      if (meta.length > 0) h += '<span style="font-size:.66rem;color:#8E44AD;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(meta.join(' \u00b7 ')) + '</span>';
+      h += '</div>';
+    });
+  }
+
+  // Plasmids
+  if (plasmids.length > 0) {
+    h += '<div style="padding:.25rem .6rem;font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;background:#f0ebe3;border-bottom:1px solid #e8e2d8;">Plasmids (' + plasmids.length + ')</div>';
+    plasmids.forEach(function(s) {
+      h += '<div onclick="_adLibPick(\x27' + esc(target) + '\x27,\x27' + s.type + '\x27,' + s.id + ')" style="padding:.35rem .6rem;cursor:pointer;border-bottom:1px solid #f0ebe3;display:flex;align-items:center;gap:.5rem;" onmouseover="this.style.background=\x27#eee8f4\x27" onmouseout="this.style.background=\x27transparent\x27">';
+      h += '<span style="font-size:.8rem;color:#4a4139;font-weight:500;flex:1;">' + esc(s.name) + '</span>';
+      if (s.use) h += '<span style="font-size:.68rem;color:#8a7f72;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(s.use) + '</span>';
+      h += '</div>';
+    });
+  }
+
+  // Primers
+  if (primers.length > 0) {
+    h += '<div style="padding:.25rem .6rem;font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;background:#f0ebe3;border-bottom:1px solid #e8e2d8;">Primers (' + primers.length + ')</div>';
+    primers.forEach(function(s) {
+      h += '<div onclick="_adLibPick(\x27' + esc(target) + '\x27,\x27' + s.type + '\x27,' + s.id + ')" style="padding:.35rem .6rem;cursor:pointer;border-bottom:1px solid #f0ebe3;display:flex;align-items:center;gap:.5rem;" onmouseover="this.style.background=\x27#eee8f4\x27" onmouseout="this.style.background=\x27transparent\x27">';
+      h += '<span style="font-size:.8rem;color:#4a4139;font-weight:500;flex:1;">' + esc(s.name) + '</span>';
+      if (s.sequence) h += '<span style="font-size:.66rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(s.sequence.substring(0, 25)) + '</span>';
+      h += '</div>';
+    });
+  }
+
+  if (totalCount === 0) {
+    h += '<div style="padding:.8rem;text-align:center;color:#8a7f72;font-size:.78rem;">' + (lp.filter ? 'No matches.' : 'No sequences with .gb files found.') + '</div>';
+  }
+  h += '</div></div>';
+  return h;
+}
+
 /* ── GIBSON TAB ───────────────────────────────────────────── */
 function _clRenderGibsonTab() {
   var g = _cl.ad.gibson;
   var h = '';
-  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Gibson assembly joins 2+ fragments with overlapping primer tails. Add fragments in the desired order, then design primers with ~25bp overlaps.</p>';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Gibson assembly joins 2+ fragments with overlapping primer tails. Set the <strong style="color:#4a4139;">vector</strong> (backbone), add <strong style="color:#4a4139;">insert fragments</strong>, then design primers with ~25bp overlaps.</p>';
 
+  // ── Loaded sequence banner
+  if (_cl.parsed) {
+    var sel = _cl.lastSelection || { start: 0, end: 0 };
+    var hasSelection = sel.end > sel.start && sel.end - sel.start < _cl.parsed.seq.length;
+    var isVec = g.vector && g.vector._sourceId === (_cl.selected.type + '_' + _cl.selected.id);
+    h += '<div style="border:1px solid ' + (isVec ? '#5b7a5e' : '#4682B4') + ';border-radius:5px;padding:.5rem .7rem;margin-bottom:.7rem;background:' + (isVec ? '#eef4ee' : '#eef2f8') + ';display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;">';
+    h += '<span style="font-size:.72rem;font-weight:600;color:#4a4139;">\ud83e\uddec ' + esc(_cl.parsed.name) + '</span>';
+    h += '<span style="font-size:.7rem;color:#8a7f72;">' + _cl.parsed.length.toLocaleString() + ' bp \u00b7 ' + esc(_cl.parsed.topology) + '</span>';
+    if (hasSelection) {
+      h += '<span style="font-size:.7rem;color:#5b7a5e;font-weight:500;">Selection: ' + sel.start + '\u2013' + sel.end + ' (' + (sel.end - sel.start) + ' bp)</span>';
+    }
+    h += '<div style="display:flex;gap:.3rem;margin-left:auto;">';
+    if (!isVec) {
+      h += '<button onclick="_adGibsonUseAsVec()" style="padding:.25rem .55rem;font-size:.7rem;font-weight:600;color:#fff;background:#5b7a5e;border:none;border-radius:3px;cursor:pointer;">Use as Vector</button>';
+    } else {
+      h += '<span style="font-size:.68rem;color:#5b7a5e;font-weight:600;padding:.25rem .4rem;">\u2705 Vector</span>';
+    }
+    h += '<button onclick="_adGibsonAddLoaded()" style="padding:.25rem .55rem;font-size:.7rem;color:#4682B4;border:1px solid #4682B4;border-radius:3px;background:#fff;cursor:pointer;">' + (hasSelection ? 'Add Selection as Fragment' : 'Add as Fragment') + '</button>';
+    h += '</div></div>';
+  }
+
+  // ── Vector section
+  h += '<div style="margin-bottom:.6rem;">';
+  h += '<div style="display:flex;align-items:center;gap:.4rem;margin-bottom:.3rem;">';
+  h += '<label style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Vector (backbone)</label>';
+  if (g.vector) {
+    h += '<span style="font-size:.76rem;color:#4a4139;font-weight:500;padding:.2rem .5rem;background:#eef4ee;border-radius:3px;border:1px solid #5b7a5e;">' + esc(g.vector.name) + ' (' + g.vector.seq.length + ' bp)</span>';
+    h += '<button onclick="_adGibsonClearVec()" style="padding:.15rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Remove vector">\u2715</button>';
+  } else {
+    h += '<button onclick="_adOpenLib(\x27gibson-vector\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;">\ud83d\udcc2 From library</button>';
+    h += '<span style="font-size:.72rem;color:#8a7f72;font-style:italic;">select above or pick from library</span>';
+  }
+  h += '</div>';
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'gibson-vector') {
+    h += _clRenderLibPicker('gibson-vector');
+  }
+  h += '</div>';
+
+  // ── Insert fragments
+  h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Insert Fragments</div>';
   h += _clRenderFragmentList(g.fragments, 'gibson');
 
+  // ── Settings + design
   h += '<div style="display:flex;gap:.6rem;margin-bottom:.7rem;align-items:end;flex-wrap:wrap;">';
   h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Overlap (bp)</label>';
   h += '<input type="number" min="15" max="60" value="' + g.overlapLen + '" oninput="_adGibsonSet(\x27overlapLen\x27,this.value)" style="width:80px;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
   h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Tm Target (\u00b0C)</label>';
   h += '<input type="number" min="50" max="75" value="' + g.tmTarget + '" oninput="_adGibsonSet(\x27tmTarget\x27,this.value)" style="width:80px;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
-  h += '<button onclick="_adGibsonDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (g.designing ? 'opacity:.6;pointer-events:none;' : '') + (g.fragments.length < 2 ? 'opacity:.5;pointer-events:none;' : '') + '">' + (g.designing ? '\u23f3 Designing\u2026' : '\ud83e\udde9 Design Gibson Assembly') + '</button>';
+
+  var totalFrags = g.fragments.length + (g.vector ? 1 : 0);
+  h += '<button onclick="_adGibsonDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (g.designing ? 'opacity:.6;pointer-events:none;' : '') + (totalFrags < 2 ? 'opacity:.5;pointer-events:none;' : '') + '">' + (g.designing ? '\u23f3 Designing\u2026' : '\ud83e\udde9 Design Gibson Assembly') + '</button>';
   h += '</div>';
 
   if (g.result) { h += _clRenderAssemblyResult(g.result, 'gibson'); }
@@ -2460,28 +2674,184 @@ function _clRenderGibsonTab() {
 function _clRenderGoldenGateTab() {
   var gg = _cl.ad.goldengate;
   var h = '';
-  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Golden Gate uses type IIS restriction enzymes to create programmable 4bp sticky ends. Fragments are joined with unique overhangs in a one-pot reaction.</p>';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Golden Gate uses type IIS enzymes to join parts via programmable 4bp overhangs. Add <strong style="color:#4a4139;">bins</strong> (positions) \u2014 each bin can hold multiple part options for combinatorial assemblies.</p>';
 
-  h += '<div style="margin-bottom:.6rem;"><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Type IIS Enzyme</label>';
+  // Enzyme selector
+  h += '<div style="display:flex;gap:.6rem;align-items:end;margin-bottom:.7rem;flex-wrap:wrap;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Type IIS Enzyme</label>';
   h += '<select onchange="_adGGSet(\x27enzyme\x27,this.value)" style="padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;">';
   ['BsaI', 'BbsI', 'BpiI', 'SapI', 'BsmBI'].forEach(function(e) {
     h += '<option value="' + e + '"' + (gg.enzyme === e ? ' selected' : '') + '>' + e + '</option>';
   });
   h += '</select></div>';
 
-  h += _clRenderFragmentList(gg.fragments, 'goldengate');
+  // Vector selector
+  h += '<div style="display:flex;align-items:center;gap:.3rem;">';
+  h += '<label style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Vector:</label>';
+  if (gg.vector) {
+    h += '<span style="font-size:.76rem;color:#4a4139;font-weight:500;padding:.25rem .5rem;background:#eef4ee;border-radius:3px;">' + esc(gg.vector.name) + ' (' + gg.vector.seq.length + ' bp)</span>';
+    h += '<button onclick="_adGGClearVec()" style="padding:.15rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;">\u2715</button>';
+  } else {
+    h += '<button onclick="_adGGLoadVec()" style="padding:.25rem .5rem;font-size:.7rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;background:#fff;cursor:pointer;">Use loaded</button>';
+    h += '<button onclick="_adOpenLib(\x27gg-vector\x27)" style="padding:.25rem .5rem;font-size:.7rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;">\ud83d\udcc2 Library</button>';
+    h += '<span style="font-size:.72rem;color:#8a7f72;font-style:italic;">optional backbone</span>';
+  }
+  h += '</div>';
+  h += '</div>';
 
+  // Vector library picker
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'gg-vector') {
+    h += _clRenderLibPicker('gg-vector');
+  }
+
+  // Internal sites warning
   if (gg.result && gg.result.internal_sites && gg.result.internal_sites.length > 0) {
     h += '<div style="background:#fdf2e9;border:1px solid #e8a838;border-radius:5px;padding:.5rem .7rem;margin-bottom:.6rem;">';
     gg.result.internal_sites.forEach(function(is) {
-      h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(is.fragment) + ' has internal ' + esc(gg.enzyme) + ' sites at positions: ' + is.positions.join(', ') + '</div>';
+      h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(is.fragment) + (is.bin ? ' (bin ' + esc(is.bin) + ')' : '') + ' has internal ' + esc(gg.enzyme) + ' sites at: ' + is.positions.join(', ') + '</div>';
     });
     h += '</div>';
   }
 
-  h += '<button onclick="_adGGDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (gg.designing ? 'opacity:.6;pointer-events:none;' : '') + (gg.fragments.length < 2 ? 'opacity:.5;pointer-events:none;' : '') + '">' + (gg.designing ? '\u23f3 Designing\u2026' : '\u2728 Design Golden Gate Assembly') + '</button>';
+  // ── Bins
+  h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.4rem;">Assembly Bins (' + gg.bins.length + ')</div>';
 
-  if (gg.result) { h += _clRenderAssemblyResult(gg.result, 'goldengate'); }
+  if (gg.bins.length === 0) {
+    h += '<div style="padding:.8rem;text-align:center;color:#8a7f72;font-size:.78rem;border:1px dashed #d5cec0;border-radius:5px;margin-bottom:.5rem;">No bins yet. Click \u201c+ Add Bin\u201d to create assembly positions (e.g. Promoter \u2192 RBS \u2192 CDS \u2192 Terminator).</div>';
+  } else {
+    var comboCount = 1;
+    gg.bins.forEach(function(bin, bi) {
+      comboCount *= Math.max(1, bin.fragments.length);
+      var binColors = ['#4682B4', '#2ecc71', '#e67e22', '#9b59b6', '#e74c3c', '#1abc9c'];
+      var bc = binColors[bi % binColors.length];
+      h += '<div style="border:1px solid #d5cec0;border-left:3px solid ' + bc + ';border-radius:5px;margin-bottom:.5rem;overflow:hidden;">';
+      // Bin header
+      h += '<div style="display:flex;align-items:center;gap:.4rem;padding:.4rem .6rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;">';
+      h += '<span style="font-size:.72rem;color:' + bc + ';font-weight:700;min-width:18px;">B' + (bi + 1) + '</span>';
+      h += '<input type="text" value="' + esc(bin.name) + '" onchange="_adGGBinRename(' + bi + ',this.value)" style="flex:1;padding:.2rem .4rem;border:1px solid transparent;border-radius:3px;background:transparent;font-size:.8rem;font-weight:500;color:#4a4139;min-width:0;" onfocus="this.style.borderColor=\x27#d5cec0\x27;this.style.background=\x27#fff\x27" onblur="this.style.borderColor=\x27transparent\x27;this.style.background=\x27transparent\x27" />';
+      h += '<span style="font-size:.68rem;color:#8a7f72;">' + bin.fragments.length + ' part' + (bin.fragments.length !== 1 ? 's' : '') + '</span>';
+      if (bi > 0) h += '<button onclick="_adGGBinMove(' + bi + ',-1)" style="padding:.1rem .3rem;font-size:.65rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">\u25c0</button>';
+      if (bi < gg.bins.length - 1) h += '<button onclick="_adGGBinMove(' + bi + ',1)" style="padding:.1rem .3rem;font-size:.65rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">\u25b6</button>';
+      h += '<button onclick="_adGGBinRemove(' + bi + ')" style="padding:.1rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Remove bin">\u2715</button>';
+      h += '</div>';
+
+      // Fragments in this bin
+      if (bin.fragments.length > 0) {
+        bin.fragments.forEach(function(f, fi) {
+          h += '<div style="display:flex;align-items:center;gap:.4rem;padding:.3rem .6rem .3rem 1.4rem;border-bottom:1px solid #f0ebe3;font-size:.78rem;">';
+          h += '<span style="color:#8a7f72;min-width:14px;font-size:.68rem;">' + (fi + 1) + '.</span>';
+          h += '<span style="color:#4a4139;flex:1;">' + esc(f.name) + '</span>';
+          h += '<span style="color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;">' + f.seq.length + ' bp</span>';
+          h += '<button onclick="_adGGFragRemove(' + bi + ',' + fi + ')" style="padding:0 .25rem;font-size:.64rem;color:#c0392b;border:none;background:none;cursor:pointer;">\u2715</button>';
+          h += '</div>';
+        });
+      }
+
+      // Add part buttons
+      h += '<div style="display:flex;gap:.3rem;padding:.35rem .6rem .35rem 1.4rem;background:#faf8f4;">';
+      h += '<button onclick="_adGGFragFromLoaded(' + bi + ')" style="padding:.2rem .4rem;font-size:.66rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;background:#fff;cursor:pointer;">+ Loaded</button>';
+      h += '<button onclick="_adOpenLib(\x27gg-bin-' + bi + '\x27)" style="padding:.2rem .4rem;font-size:.66rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;">\ud83d\udcc2 Library</button>';
+      h += '<button onclick="_adGGFragPaste(' + bi + ')" style="padding:.2rem .4rem;font-size:.66rem;color:#4682B4;border:1px solid #4682B4;border-radius:3px;background:#fff;cursor:pointer;">+ Paste</button>';
+      h += '</div>';
+
+      // Library picker for this bin
+      if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'gg-bin-' + bi) {
+        h += '<div style="padding:0 .6rem .4rem .6rem;">' + _clRenderLibPicker('gg-bin-' + bi) + '</div>';
+      }
+
+      h += '</div>';
+    });
+
+    // Combinatorial count
+    if (comboCount > 1) {
+      h += '<div style="font-size:.78rem;color:#4a4139;margin-bottom:.5rem;padding:.35rem .6rem;background:#f3eef8;border:1px solid #d5cec0;border-radius:4px;">\u2728 <strong>' + comboCount + ' possible combination' + (comboCount > 1 ? 's' : '') + '</strong> \u2014 all share the same overhang scheme, compatible in a single reaction.</div>';
+    }
+  }
+
+  // Add bin button
+  h += '<div style="margin-bottom:.7rem;">';
+  h += '<button onclick="_adGGAddBin()" style="padding:.35rem .7rem;font-size:.75rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:#fff;cursor:pointer;">+ Add Bin</button>';
+  h += '</div>';
+
+  // Design button
+  var canDesign = gg.bins.length >= 1 && gg.bins.every(function(b) { return b.fragments.length > 0; });
+  h += '<button onclick="_adGGDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (gg.designing ? 'opacity:.6;pointer-events:none;' : '') + (!canDesign ? 'opacity:.5;pointer-events:none;' : '') + '">' + (gg.designing ? '\u23f3 Designing\u2026' : '\u2728 Design Golden Gate Assembly') + '</button>';
+
+  if (gg.result) { h += _clRenderGGResult(gg.result); }
+  return h;
+}
+
+/* ── Golden Gate result renderer ──────────────────────────── */
+function _clRenderGGResult(r) {
+  var h = '<div style="margin-top:.8rem;">';
+
+  if (r.warnings && r.warnings.length > 0) {
+    h += '<div style="background:#fdf2e9;border:1px solid #e8a838;border-radius:5px;padding:.5rem .7rem;margin-bottom:.6rem;">';
+    r.warnings.forEach(function(w) { h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(w) + '</div>'; });
+    h += '</div>';
+  }
+
+  h += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.5rem;">Enzyme: <strong style="color:#4a4139;">' + esc(r.enzyme.name) + '</strong> (site: ' + esc(r.enzyme.site) + ')</div>';
+
+  // Overhang map
+  if (r.overhang_map && r.overhang_map.length > 0) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Overhang Scheme</div>';
+    h += '<div style="display:flex;gap:.3rem;flex-wrap:wrap;margin-bottom:.6rem;">';
+    r.overhang_map.forEach(function(om) {
+      h += '<div style="padding:.25rem .5rem;background:#f3eef8;border:1px solid #d5cec0;border-radius:4px;font-size:.72rem;">';
+      h += '<span style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-weight:600;color:#8E44AD;">' + esc(om.overhang) + '</span>';
+      h += ' <span style="color:#8a7f72;">' + esc(om.label) + '</span>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // Per-bin primers
+  if (r.bins && r.bins.length > 0) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.4rem;">Primers by Bin</div>';
+    r.bins.forEach(function(bin, bi) {
+      var binColors = ['#4682B4', '#2ecc71', '#e67e22', '#9b59b6', '#e74c3c', '#1abc9c'];
+      var bc = binColors[bi % binColors.length];
+      h += '<div style="border:1px solid #e8e2d8;border-left:3px solid ' + bc + ';border-radius:5px;margin-bottom:.5rem;overflow:hidden;">';
+      h += '<div style="padding:.35rem .6rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;display:flex;align-items:center;gap:.4rem;">';
+      h += '<span style="font-size:.78rem;font-weight:600;color:#4a4139;">' + esc(bin.name) + '</span>';
+      h += '<span style="font-size:.68rem;color:#8a7f72;">overhang: <span style="font-family:\'SF Mono\',Monaco,Consolas,monospace;color:#8E44AD;">' + esc(bin.left_overhang) + '</span> \u2192 <span style="font-family:\'SF Mono\',Monaco,Consolas,monospace;color:#8E44AD;">' + esc(bin.right_overhang) + '</span></span>';
+      if (bin.num_options > 1) h += '<span style="font-size:.68rem;color:#5b7a5e;font-weight:600;">' + bin.num_options + ' options</span>';
+      h += '</div>';
+
+      bin.fragments.forEach(function(frag) {
+        h += '<div style="padding:.3rem .6rem;border-bottom:1px solid #f0ebe3;">';
+        h += '<div style="font-size:.76rem;font-weight:500;color:#4a4139;margin-bottom:.3rem;">' + esc(frag.name) + ' <span style="font-weight:400;color:#8a7f72;">(' + frag.length + ' bp)</span></div>';
+        h += _clRenderTailedPrimer('Fwd', frag.fwd_primer, '#2980b9', 'ad-ggf-' + bi + '-' + frag.name.replace(/\s/g, ''), null);
+        h += _clRenderTailedPrimer('Rev', frag.rev_primer, '#8e44ad', 'ad-ggr-' + bi + '-' + frag.name.replace(/\s/g, ''), null);
+        h += '</div>';
+      });
+      h += '</div>';
+    });
+  }
+
+  // Vector primers
+  if (r.vector_primers) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Vector Primers (' + esc(r.vector_name || 'Vector') + ')</div>';
+    h += _clRenderTailedPrimer('Vector Fwd', r.vector_primers.fwd, '#2980b9', 'ad-gg-vec-fwd', null);
+    h += _clRenderTailedPrimer('Vector Rev', r.vector_primers.rev, '#8e44ad', 'ad-gg-vec-rev', null);
+  }
+
+  // Summary
+  h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;padding:.5rem .7rem;background:#faf8f4;border:1px solid #e8e2d8;border-radius:5px;margin-top:.5rem;">';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Product: <strong style="color:#4a4139;">' + (r.product_length || 0).toLocaleString() + ' bp</strong></span>';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Bins: <strong style="color:#4a4139;">' + (r.num_bins || 0) + '</strong></span>';
+  if (r.combo_count > 1) h += '<span style="font-size:.78rem;color:#8E44AD;font-weight:600;">' + r.combo_count + ' combinations</span>';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Primers: <strong style="color:#4a4139;">' + (r.primers || []).length + '</strong></span>';
+  h += '<button onclick="_adCopyAllPrimers(\x27goldengate\x27)" style="margin-left:auto;padding:.3rem .6rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:transparent;cursor:pointer;">\ud83d\udccb Copy All</button>';
+  h += '</div>';
+
+  if (r.primers && r.primers.length > 0) {
+    var saveItems = r.primers.map(function(p) { return { seq: p.full_seq, label: p.name || 'GG primer' }; });
+    h += _clRenderSaveBtn(saveItems);
+  }
+
+  h += '</div>';
   return h;
 }
 
@@ -2496,10 +2866,17 @@ function _clRenderDigestLigateTab() {
   h += '<div style="display:flex;align-items:center;gap:.4rem;margin-bottom:.3rem;">';
   h += '<label style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Vector</label>';
   h += '<button onclick="_adDLLoadVector()" style="padding:.2rem .45rem;font-size:.68rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;background:#fff;cursor:pointer;" title="Use currently loaded sequence as vector">Use loaded</button>';
-  if (dl.vectorSeq) { h += '<span style="font-size:.72rem;color:#4a4139;font-weight:500;">' + esc(dl.vectorName || 'vector') + ' (' + dl.vectorSeq.length + ' bp)</span>'; }
+  h += '<button onclick="_adOpenLib(\x27dl-vector\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;" title="Pick from saved plasmids">\ud83d\udcc2 From library</button>';
+  if (dl.vectorSeq) {
+    h += '<span style="font-size:.72rem;color:#4a4139;font-weight:500;">' + esc(dl.vectorName || 'vector') + ' (' + dl.vectorSeq.length + ' bp)</span>';
+    h += '<button onclick="_adDLClear(\x27vector\x27)" style="padding:.1rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Clear vector">\u2715</button>';
+  }
   h += '</div>';
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'dl-vector') {
+    h += _clRenderLibPicker('dl-vector');
+  }
   if (!dl.vectorSeq) {
-    h += '<textarea oninput="_adDLSet(\x27vectorSeq\x27,this.value)" placeholder="Paste vector sequence or click \'Use loaded\'\u2026" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.76rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:40px;resize:vertical;"></textarea>';
+    h += '<textarea oninput="_adDLSet(\x27vectorSeq\x27,this.value)" placeholder="Paste vector sequence, click \'Use loaded\', or pick from library\u2026" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.76rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:40px;resize:vertical;"></textarea>';
   }
   h += '</div>';
 
@@ -2507,9 +2884,18 @@ function _clRenderDigestLigateTab() {
   h += '<div style="margin-bottom:.6rem;">';
   h += '<div style="display:flex;align-items:center;gap:.4rem;margin-bottom:.3rem;">';
   h += '<label style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Insert</label>';
-  if (dl.insertSeq) { h += '<span style="font-size:.72rem;color:#4a4139;font-weight:500;">' + esc(dl.insertName || 'insert') + ' (' + dl.insertSeq.length + ' bp)</span>'; }
+  h += '<button onclick="_adOpenLib(\x27dl-insert\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;" title="Pick from saved sequences">\ud83d\udcc2 From library</button>';
+  if (dl.insertSeq) {
+    h += '<span style="font-size:.72rem;color:#4a4139;font-weight:500;">' + esc(dl.insertName || 'insert') + ' (' + dl.insertSeq.length + ' bp)</span>';
+    h += '<button onclick="_adDLClear(\x27insert\x27)" style="padding:.1rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Clear insert">\u2715</button>';
+  }
   h += '</div>';
-  h += '<textarea oninput="_adDLSet(\x27insertSeq\x27,this.value)" placeholder="Paste insert sequence\u2026" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.76rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:40px;resize:vertical;">' + esc(dl.insertSeq) + '</textarea>';
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'dl-insert') {
+    h += _clRenderLibPicker('dl-insert');
+  }
+  if (!dl.insertSeq) {
+    h += '<textarea oninput="_adDLSet(\x27insertSeq\x27,this.value)" placeholder="Paste insert sequence or pick from library\u2026" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.76rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:40px;resize:vertical;">' + esc(dl.insertSeq) + '</textarea>';
+  }
   h += '</div>';
 
   // Enzymes
@@ -2655,8 +3041,92 @@ function _clRenderDLResult(r) {
 /* ═══════════════════════════════════════════════════════════
    ASSEMBLY DESIGNER ACTION HANDLERS
    ═══════════════════════════════════════════════════════════ */
-function _adToggle() { _cl.ad.expanded = !_cl.ad.expanded; _clRender(); }
-function _adSetMode(m) { _cl.ad.mode = m; _clRender(); }
+function _adToggle() { _cl.ad.expanded = !_cl.ad.expanded; _cl.ad._libPicker = null; _clRender(); }
+function _adSetMode(m) { _cl.ad.mode = m; _cl.ad._libPicker = null; _clRender(); }
+
+// ── Library picker
+function _adOpenLib(target) {
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === target) {
+    _cl.ad._libPicker = null; // toggle off
+  } else {
+    _cl.ad._libPicker = { target: target, filter: '' };
+  }
+  _clRender();
+  setTimeout(function() { var el = document.getElementById('cl-lib-filter'); if (el) el.focus(); }, 40);
+}
+
+function _adCloseLib() {
+  _cl.ad._libPicker = null;
+  _clRender();
+}
+
+function _adLibFilter(val) {
+  if (_cl.ad._libPicker) {
+    _cl.ad._libPicker.filter = val;
+    _clRender();
+    setTimeout(function() {
+      var el = document.getElementById('cl-lib-filter');
+      if (el) { el.focus(); el.setSelectionRange(val.length, val.length); }
+    }, 20);
+  }
+}
+
+function _adLibPick(target, seqType, seqId) {
+  // Fetch the parsed sequence from the server, then add it
+  _cl.ad._libLoading = true;
+  _clRender();
+  api('GET', '/api/cloning/sequences/' + seqType + '/' + seqId + '/parse')
+    .then(function(data) {
+      _cl.ad._libLoading = false;
+      _cl.ad._libPicker = null;
+      var name = data.name || (seqType + '_' + seqId);
+      var seq = data.seq || '';
+      if (!seq) { toast('Sequence is empty', true); _clRender(); return; }
+
+      if (target === 'gibson') {
+        _cl.ad.gibson.fragments.push({ name: name, seq: seq });
+        toast('Added "' + name + '" (' + seq.length + ' bp)');
+      } else if (target === 'gibson-vector') {
+        _cl.ad.gibson.vector = { name: name, seq: seq, _sourceId: seqType + '_' + seqId };
+        toast('Gibson vector set to "' + name + '" (' + seq.length + ' bp)');
+      } else if (target === 'gg-vector') {
+        _cl.ad.goldengate.vector = { name: name, seq: seq };
+        toast('Vector set to "' + name + '" (' + seq.length + ' bp)');
+      } else if (target.indexOf('gg-bin-') === 0) {
+        var binIdx = parseInt(target.replace('gg-bin-', ''), 10);
+        if (_cl.ad.goldengate.bins[binIdx]) {
+          _cl.ad.goldengate.bins[binIdx].fragments.push({ name: name, seq: seq });
+          toast('Added "' + name + '" to ' + _cl.ad.goldengate.bins[binIdx].name);
+        }
+      } else if (target === 'dl-vector') {
+        _cl.ad.digestligate.vectorSeq = seq;
+        _cl.ad.digestligate.vectorName = name;
+        toast('Vector set to "' + name + '" (' + seq.length + ' bp)');
+      } else if (target === 'dl-insert') {
+        _cl.ad.digestligate.insertSeq = seq;
+        _cl.ad.digestligate.insertName = name;
+        toast('Insert set to "' + name + '" (' + seq.length + ' bp)');
+      }
+      _clRender();
+    })
+    .catch(function(err) {
+      _cl.ad._libLoading = false;
+      toast('Failed to load sequence: ' + (err.message || err), true);
+      _clRender();
+    });
+}
+
+function _adDLClear(which) {
+  if (which === 'vector') {
+    _cl.ad.digestligate.vectorSeq = '';
+    _cl.ad.digestligate.vectorName = '';
+  } else {
+    _cl.ad.digestligate.insertSeq = '';
+    _cl.ad.digestligate.insertName = '';
+  }
+  _cl.ad.digestligate.result = null;
+  _clRender();
+}
 
 // ── Fragment management
 function _adAddFromLoaded(modeKey) {
@@ -2664,9 +3134,10 @@ function _adAddFromLoaded(modeKey) {
   var sel = _cl.lastSelection || { start: 0, end: 0 };
   var seq = _cl.parsed.seq;
   var name = _cl.parsed.name || 'fragment';
-  if (sel.end > sel.start && sel.end - sel.start < seq.length) {
-    seq = seq.substring(sel.start, sel.end);
-    name = name + ' (' + sel.start + '-' + sel.end + ')';
+  var selLen = _clSelLen(sel.start, sel.end);
+  if (selLen > 0 && selLen < seq.length) {
+    seq = _clGetSelSeq(sel.start, sel.end);
+    name = name + ' (' + sel.start + (sel.crossesOrigin ? '\u2192ori\u2192' : '-') + sel.end + ')';
   }
   var frags = _adGetFrags(modeKey);
   frags.push({ name: name, seq: seq });
@@ -2688,7 +3159,6 @@ function _adAddPaste(modeKey) {
 
 function _adGetFrags(modeKey) {
   if (modeKey === 'gibson') return _cl.ad.gibson.fragments;
-  if (modeKey === 'goldengate') return _cl.ad.goldengate.fragments;
   return [];
 }
 
@@ -2714,13 +3184,51 @@ function _adGibsonSet(field, val) {
   else if (field === 'tmTarget') _cl.ad.gibson.tmTarget = parseInt(val, 10) || 62;
 }
 
+function _adGibsonUseAsVec() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  _cl.ad.gibson.vector = {
+    name: _cl.parsed.name || 'vector',
+    seq: _cl.parsed.seq,
+    _sourceId: _cl.selected.type + '_' + _cl.selected.id,
+  };
+  toast('Vector set to "' + (_cl.parsed.name || 'loaded sequence') + '"');
+  _clRender();
+}
+
+function _adGibsonClearVec() {
+  _cl.ad.gibson.vector = null;
+  _cl.ad.gibson.result = null;
+  _clRender();
+}
+
+function _adGibsonAddLoaded() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var sel = _cl.lastSelection || { start: 0, end: 0 };
+  var seq = _cl.parsed.seq;
+  var name = _cl.parsed.name || 'fragment';
+  var selLen = _clSelLen(sel.start, sel.end);
+  if (selLen > 0 && selLen < seq.length) {
+    seq = _clGetSelSeq(sel.start, sel.end);
+    name = name + ' (' + sel.start + (sel.crossesOrigin ? '\u2192ori\u2192' : '-') + sel.end + ')';
+  }
+  _cl.ad.gibson.fragments.push({ name: name, seq: seq });
+  toast('Added "' + name + '" as fragment (' + seq.length + ' bp)');
+  _clRender();
+}
+
 function _adGibsonDesign() {
   var g = _cl.ad.gibson;
-  if (g.fragments.length < 2) { toast('Add at least 2 fragments', true); return; }
+  // Build fragment list: vector first (if set), then inserts
+  var allFrags = [];
+  if (g.vector) {
+    allFrags.push({ name: g.vector.name, seq: g.vector.seq });
+  }
+  g.fragments.forEach(function(f) { allFrags.push({ name: f.name, seq: f.seq }); });
+
+  if (allFrags.length < 2) { toast('Need at least a vector + 1 insert, or 2+ fragments', true); return; }
   g.designing = true; g.result = null; _clRender();
-  var fragData = g.fragments.map(function(f) { return { name: f.name, seq: f.seq }; });
   api('POST', '/api/cloning/design-gibson', {
-    fragments: fragData, circular: true,
+    fragments: allFrags, circular: true,
     overlap_length: g.overlapLen, tm_target: g.tmTarget,
   }).then(function(data) {
     g.designing = false; g.result = data; _clRender();
@@ -2729,20 +3237,100 @@ function _adGibsonDesign() {
   });
 }
 
-// ── Golden Gate
+// ── Golden Gate (bin-based)
 function _adGGSet(field, val) {
   _cl.ad.goldengate[field] = val;
   if (field === 'enzyme') _clRender();
 }
 
+function _adGGAddBin() {
+  var idx = _cl.ad.goldengate.bins.length;
+  var defaults = ['Promoter', 'RBS', 'CDS', 'Terminator', 'Bin ' + (idx + 1)];
+  _cl.ad.goldengate.bins.push({ name: defaults[idx] || 'Bin ' + (idx + 1), fragments: [] });
+  _clRender();
+}
+
+function _adGGBinRename(bi, val) {
+  if (_cl.ad.goldengate.bins[bi]) _cl.ad.goldengate.bins[bi].name = val;
+}
+
+function _adGGBinMove(bi, dir) {
+  var bins = _cl.ad.goldengate.bins;
+  var ni = bi + dir;
+  if (ni < 0 || ni >= bins.length) return;
+  var tmp = bins[bi]; bins[bi] = bins[ni]; bins[ni] = tmp;
+  _clRender();
+}
+
+function _adGGBinRemove(bi) {
+  _cl.ad.goldengate.bins.splice(bi, 1);
+  _cl.ad._libPicker = null;
+  _clRender();
+}
+
+function _adGGFragFromLoaded(bi) {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var sel = _cl.lastSelection || { start: 0, end: 0 };
+  var seq = _cl.parsed.seq;
+  var name = _cl.parsed.name || 'part';
+  var selLen = _clSelLen(sel.start, sel.end);
+  if (selLen > 0 && selLen < seq.length) {
+    seq = _clGetSelSeq(sel.start, sel.end);
+    name = name + ' (' + sel.start + (sel.crossesOrigin ? '\u2192ori\u2192' : '-') + sel.end + ')';
+  }
+  if (_cl.ad.goldengate.bins[bi]) {
+    _cl.ad.goldengate.bins[bi].fragments.push({ name: name, seq: seq });
+    toast('Added "' + name + '" to ' + _cl.ad.goldengate.bins[bi].name);
+  }
+  _clRender();
+}
+
+function _adGGFragPaste(bi) {
+  var raw = prompt('Paste DNA sequence:');
+  if (!raw) return;
+  var seq = _clCleanSeq(raw);
+  if (seq.length < 10) { toast('Sequence too short', true); return; }
+  var name = prompt('Part name:', 'Part ' + (_cl.ad.goldengate.bins[bi].fragments.length + 1));
+  if (!name) name = 'Part';
+  if (_cl.ad.goldengate.bins[bi]) {
+    _cl.ad.goldengate.bins[bi].fragments.push({ name: name, seq: seq });
+    toast('Added "' + name + '" to ' + _cl.ad.goldengate.bins[bi].name);
+  }
+  _clRender();
+}
+
+function _adGGFragRemove(bi, fi) {
+  if (_cl.ad.goldengate.bins[bi]) {
+    _cl.ad.goldengate.bins[bi].fragments.splice(fi, 1);
+    _clRender();
+  }
+}
+
+function _adGGLoadVec() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  _cl.ad.goldengate.vector = { name: _cl.parsed.name || 'vector', seq: _cl.parsed.seq };
+  toast('Vector set to "' + (_cl.parsed.name || 'loaded') + '"');
+  _clRender();
+}
+
+function _adGGClearVec() {
+  _cl.ad.goldengate.vector = null;
+  _clRender();
+}
+
 function _adGGDesign() {
   var gg = _cl.ad.goldengate;
-  if (gg.fragments.length < 2) { toast('Add at least 2 fragments', true); return; }
+  if (gg.bins.length < 1) { toast('Add at least 1 bin with parts', true); return; }
+  for (var i = 0; i < gg.bins.length; i++) {
+    if (gg.bins[i].fragments.length === 0) { toast('Bin "' + gg.bins[i].name + '" has no parts', true); return; }
+  }
   gg.designing = true; gg.result = null; _clRender();
-  var fragData = gg.fragments.map(function(f) { return { name: f.name, seq: f.seq }; });
-  api('POST', '/api/cloning/design-goldengate', {
-    fragments: fragData, enzyme: gg.enzyme, circular: true, tm_target: 62,
-  }).then(function(data) {
+  var binsData = gg.bins.map(function(b) {
+    return { name: b.name, fragments: b.fragments.map(function(f) { return { name: f.name, seq: f.seq }; }) };
+  });
+  var body = { bins: binsData, enzyme: gg.enzyme, circular: true, tm_target: 62 };
+  if (gg.vector) { body.vector = { name: gg.vector.name, seq: gg.vector.seq }; }
+  api('POST', '/api/cloning/design-goldengate', body).then(function(data) {
     gg.designing = false; gg.result = data; _clRender();
   }).catch(function(err) {
     gg.designing = false; toast('Golden Gate design failed: ' + (err.message || err), true); _clRender();
@@ -2831,6 +3419,7 @@ window._clSendToOC = _clSendToOC;
 window._clToggleSidebar = _clToggleSidebar;
 window._clToggleOcSidebar = _clToggleOcSidebar;
 window._clToggleFeatures = _clToggleFeatures;
+window._clReindex = _clReindex;
 window._clSearchToggle = _clSearchToggle;
 window._clSearchRun = _clSearchRun;
 window._clSearchNext = _clSearchNext;
@@ -2893,13 +3482,30 @@ window._saScanFilter = _saScanFilter;
 window._saScanAddFeature = _saScanAddFeature;
 window._adToggle = _adToggle;
 window._adSetMode = _adSetMode;
+window._adOpenLib = _adOpenLib;
+window._adCloseLib = _adCloseLib;
+window._adLibFilter = _adLibFilter;
+window._adLibPick = _adLibPick;
+window._adDLClear = _adDLClear;
 window._adAddFromLoaded = _adAddFromLoaded;
 window._adAddPaste = _adAddPaste;
 window._adFragMove = _adFragMove;
 window._adFragRemove = _adFragRemove;
 window._adGibsonSet = _adGibsonSet;
 window._adGibsonDesign = _adGibsonDesign;
+window._adGibsonUseAsVec = _adGibsonUseAsVec;
+window._adGibsonClearVec = _adGibsonClearVec;
+window._adGibsonAddLoaded = _adGibsonAddLoaded;
 window._adGGSet = _adGGSet;
+window._adGGAddBin = _adGGAddBin;
+window._adGGBinRename = _adGGBinRename;
+window._adGGBinMove = _adGGBinMove;
+window._adGGBinRemove = _adGGBinRemove;
+window._adGGFragFromLoaded = _adGGFragFromLoaded;
+window._adGGFragPaste = _adGGFragPaste;
+window._adGGFragRemove = _adGGFragRemove;
+window._adGGLoadVec = _adGGLoadVec;
+window._adGGClearVec = _adGGClearVec;
 window._adGGDesign = _adGGDesign;
 window._adDLSet = _adDLSet;
 window._adDLLoadVector = _adDLLoadVector;

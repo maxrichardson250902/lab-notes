@@ -148,8 +148,14 @@ class GibsonRequest(BaseModel):
     overlap_length: Optional[int] = 25
     tm_target: Optional[float] = 62.0
 
-class GoldenGateRequest(BaseModel):
+class BinInput(BaseModel):
+    name: str = "Bin"
     fragments: List[FragmentInput]
+
+class GoldenGateRequest(BaseModel):
+    bins: Optional[List[BinInput]] = None          # new: positional bins with multiple fragments each
+    fragments: Optional[List[FragmentInput]] = None # legacy: flat fragment list (converted to 1-per-bin)
+    vector: Optional[FragmentInput] = None          # optional backbone vector
     enzyme: Optional[str] = "BsaI"
     circular: Optional[bool] = True
     tm_target: Optional[float] = 62.0
@@ -368,9 +374,12 @@ def _check_primer_quality(seq: str, tm: float) -> list:
 
 
 def _design_annealing_region(template: str, pos: int, direction: str, tm_target: float,
-                              min_len: int = 18, max_len: int = 28) -> dict:
+                              min_len: int = 18, max_len: int = 28, hard_max_len: int = None) -> dict:
     """Design an annealing region starting from pos in given direction, targeting tm_target.
     direction: 'forward' (5'->3' on top strand) or 'reverse' (5'->3' on bottom strand, upstream)."""
+    if hard_max_len is not None:
+        max_len = min(max_len, hard_max_len) if max_len else hard_max_len
+        max_len = hard_max_len  #  effectively override
     tpl_len = len(template)
     best_seq = ""
     best_tm = 0.0
@@ -386,8 +395,9 @@ def _design_annealing_region(template: str, pos: int, direction: str, tm_target:
             candidate = _reverse_complement("".join(bases))
 
         tm = _calc_tm(candidate)
-        best_seq = candidate
-        best_tm = tm
+        if tm > best_tm:
+            best_seq = candidate
+            best_tm = tm
         if tm >= tm_target:
             break
 
@@ -1387,22 +1397,28 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
             warnings.append(f"Junction {up_name}→{down_name} overlap Tm ({overlap_tm}°C) is low — may reduce assembly efficiency")
         elif overlap_tm > 72:
             warnings.append(f"Junction {up_name}→{down_name} overlap Tm ({overlap_tm}°C) is high")
+        max_fwd_anneal = 60 - len(up_tail)
+        max_rev_anneal = 60 - len(rev_tail)
 
         # Forward primer for downstream fragment: tail = end of upstream, annealing = start of downstream
-        fwd_anneal = _design_annealing_region(down_seq, 0, "forward", tm_target)
+        fwd_anneal = _design_annealing_region(down_seq, 0, "forward", tm_target, max_len=max_fwd_anneal)
         fwd_tail = up_tail
         fwd_full = fwd_tail + fwd_anneal["seq"]
-
+        rev_tail = _reverse_complement(down_tail)
+        max_rev_anneal = 60 - len(rev_tail)
         # Reverse primer for upstream fragment: tail = RC of start of downstream, annealing = RC of end of upstream
         rev_tail = _reverse_complement(down_tail)
-        rev_anneal = _design_annealing_region(up_seq, len(up_seq), "reverse", tm_target)
+        rev_anneal = _design_annealing_region(up_seq, len(up_seq), "reverse", tm_target, max_len=max_rev_anneal)
         rev_full = rev_tail + rev_anneal["seq"]
 
-        if len(fwd_full) > 60:
-            warnings.append(f"Forward primer at {up_name}→{down_name} junction is {len(fwd_full)}bp — consider shorter overlap")
-        if len(rev_full) > 60:
-            warnings.append(f"Reverse primer at {up_name}→{down_name} junction is {len(rev_full)}bp — consider shorter overlap")
+        fwd_full = _ensure_gc_clamp(fwd_full, max_len=60)
+        rev_full = _ensure_gc_clamp(rev_full, max_len=60)
 
+        for seq, name in [(fwd_full, f"{down_name}_Fwd"), (rev_full, f"{up_name}_Rev")]:
+            if _has_hairpin(seq):
+                warnings.append(f"{name} may form hairpin")
+            if _has_self_dimer(seq):
+                warnings.append(f"{name} may form self-dimer")
         fwd_primer = {
             "name": f"{down_name}_Fwd",
             "full_seq": fwd_full, "tail": fwd_tail, "annealing": fwd_anneal["seq"],
@@ -1450,110 +1466,215 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
     }
 
 
-def design_golden_gate(fragments: list, enzyme: str = "BsaI", circular: bool = True,
+def _ensure_gc_clamp(seq,max_len=60): return seq if seq[-1] in "GC" else seq+"G" if len(seq)<max_len else seq
+
+def _has_hairpin(seq,min_stem=4,min_loop=3): n=len(seq); return any(seq[i:i+stem_len]==_reverse_complement(seq[i+stem_len+min_loop:i+stem_len+min_loop+stem_len]) for stem_len in range(min_stem,min(8,n//2)) for i in range(n-stem_len-min_loop-stem_len+1))
+
+def _has_self_dimer(seq,min_match=4): rc=_reverse_complement(seq); n=len(seq); return any(seq[i:i+min_match]==rc[j:j+min_match] for i in range(n-min_match+1) for j in range(n-min_match+1))
+
+def design_golden_gate(bins: list = None, fragments: list = None, vector: dict = None,
+                       enzyme: str = "BsaI", circular: bool = True,
                        tm_target: float = 62.0) -> dict:
-    """Design a Golden Gate assembly with type IIS enzyme."""
-    if len(fragments) < 2:
-        raise HTTPException(400, "Golden Gate assembly requires at least 2 fragments")
+    """Design a Golden Gate assembly with type IIS enzyme.
+
+    Supports positional bins — each bin holds 1+ fragment options.
+    Overhangs are assigned per junction (between bins), so every fragment
+    in a given bin gets the same flanking overhangs, enabling combinatorial
+    assembly in a single reaction.
+
+    If `bins` is None but `fragments` is provided, each fragment becomes a
+    single-option bin (backward compatibility).
+    """
+    # ── Normalise input to bins
+    if bins is None and fragments is not None:
+        bins = [{"name": f.get("name", f"Part {i+1}"), "fragments": [f]} for i, f in enumerate(fragments)]
+    if not bins or len(bins) < 1:
+        raise HTTPException(400, "Golden Gate assembly requires at least 1 bin with fragments")
+    for b in bins:
+        if not b.get("fragments"):
+            raise HTTPException(400, f"Bin '{b.get('name', '?')}' has no fragments")
+
     if enzyme not in TYPE_IIS_ENZYMES:
         raise HTTPException(400, f"Unknown enzyme: {enzyme}. Supported: {', '.join(TYPE_IIS_ENZYMES.keys())}")
 
     enz = TYPE_IIS_ENZYMES[enzyme]
     site = enz["site"]
     rc_site = enz["rc_site"]
-    overhang_len = enz["overhang_len"]
-
-    seqs = []
-    for f in fragments:
-        s = f["seq"].upper().replace(" ", "").replace("\n", "")
-        if len(s) < 20:
-            raise HTTPException(400, f"Fragment '{f['name']}' is too short (min 20bp)")
-        seqs.append(s)
+    spacer = "A"
 
     warnings = []
     internal_sites = []
 
-    # Check for internal enzyme sites
-    for i, s in enumerate(seqs):
-        positions = _check_internal_sites(s, site, rc_site)
-        if positions:
-            internal_sites.append({"fragment": fragments[i]["name"], "positions": positions})
-            warnings.append(f"Fragment '{fragments[i]['name']}' has {len(positions)} internal {enzyme} site(s) — this will cause incorrect digestion")
+    # ── Validate every fragment in every bin & check internal sites
+    for b in bins:
+        for f in b["fragments"]:
+            s = f["seq"].upper().replace(" ", "").replace("\n", "")
+            f["_seq"] = s  # store cleaned version
+            if len(s) < 15:
+                raise HTTPException(400, f"Fragment '{f['name']}' in bin '{b['name']}' is too short (min 15bp)")
+            positions = _check_internal_sites(s, site, rc_site)
+            if positions:
+                internal_sites.append({"fragment": f["name"], "bin": b["name"], "positions": positions})
+                warnings.append(f"'{f['name']}' (bin {b['name']}) has {len(positions)} internal {enzyme} site(s)")
 
-    # Assign overhangs
-    n = len(seqs)
-    junction_count = n if circular else n - 1
-    if junction_count + (1 if circular else 0) > len(GOLDEN_OVERHANGS):
-        raise HTTPException(400, f"Too many fragments — max {len(GOLDEN_OVERHANGS) - (1 if circular else 0)} junctions supported")
+    # Vector check
+    vec_seq = None
+    if vector and vector.get("seq"):
+        vec_seq = vector["seq"].upper().replace(" ", "").replace("\n", "")
+        positions = _check_internal_sites(vec_seq, site, rc_site)
+        # Vector is *expected* to have exactly 2 sites (flanking the insert cassette)
+        # but extra sites are a problem
+        if len(positions) > 2:
+            warnings.append(f"Vector '{vector.get('name', 'vector')}' has {len(positions)} {enzyme} sites — expected ≤2")
 
-    overhangs = GOLDEN_OVERHANGS[:junction_count + (1 if circular else 0)]
+    # ── Assign overhangs to junctions
+    # Junctions: [vec→bin0], bin0→bin1, bin1→bin2, ..., [binN→vec]
+    # With vector & circular: N_bins + 1 overhangs (one per junction including wrap)
+    # Without vector & circular: N_bins overhangs
+    # Without vector & linear: N_bins - 1 overhangs (+ start/end don't need matching)
+    n_bins = len(bins)
+    has_vec = vec_seq is not None
 
-    junctions = []
+    if circular or has_vec:
+        n_junctions = n_bins + (1 if has_vec else 0)
+    else:
+        n_junctions = n_bins - 1
+
+    n_overhangs = n_junctions + (1 if circular or has_vec else 0)
+    if n_overhangs > len(GOLDEN_OVERHANGS):
+        raise HTTPException(400, f"Too many positions — max {len(GOLDEN_OVERHANGS)} overhangs available, need {n_overhangs}")
+    overhangs = GOLDEN_OVERHANGS[:n_overhangs]
+
+    # ── Design primers for every fragment in every bin
+    # Each bin i has:
+    #   left_overhang  = overhangs[i]      (or overhangs[i+1] with vector offset)
+    #   right_overhang = overhangs[i+1]    (wrapping for circular)
+    bin_results = []
     all_primers = []
-    spacer = "A"  # 1bp spacer before enzyme site
 
-    for j in range(junction_count):
-        up_idx = j
-        down_idx = (j + 1) % n
-        up_seq = seqs[up_idx]
-        down_seq = seqs[down_idx]
+    oh_offset = 1 if has_vec else 0  # shift bin overhangs if vector takes position 0
 
-        overhang = overhangs[j]
-        next_overhang = overhangs[(j + 1) % len(overhangs)] if j + 1 < len(overhangs) else overhangs[0]
+    for bi, b in enumerate(bins):
+        left_oh = overhangs[(bi + oh_offset) % len(overhangs)]
+        right_oh = overhangs[(bi + oh_offset + 1) % len(overhangs)]
 
-        # Forward primer for downstream fragment:
-        # 5' spacer + enzyme_site + overhang + annealing_region
-        fwd_anneal = _design_annealing_region(down_seq, 0, "forward", tm_target)
-        fwd_tail = spacer + site + overhang
-        fwd_full = fwd_tail + fwd_anneal["seq"]
+        frag_results = []
+        for f in b["fragments"]:
+            s = f["_seq"]
+            # Forward primer: spacer + site + left_overhang + annealing
+            fwd_anneal = _design_annealing_region(s, 0, "forward", tm_target)
+            fwd_tail = spacer + site + left_oh
+            fwd_full = fwd_tail + fwd_anneal["seq"]
 
-        # Reverse primer for upstream fragment:
-        # 5' spacer + RC(enzyme_site) + RC(next_overhang) + annealing_region
-        rev_anneal = _design_annealing_region(up_seq, len(up_seq), "reverse", tm_target)
-        rev_oh = _reverse_complement(next_overhang) if j + 1 < junction_count or circular else _reverse_complement(overhangs[j])
-        rev_tail = spacer + rc_site + rev_oh
-        rev_full = rev_tail + rev_anneal["seq"]
+            # Reverse primer: spacer + RC(site) + RC(right_overhang) + annealing
+            rev_anneal = _design_annealing_region(s, len(s), "reverse", tm_target)
+            rev_tail = spacer + rc_site + _reverse_complement(right_oh)
+            rev_full = rev_tail + rev_anneal["seq"]
 
-        fwd_primer = {
-            "name": f"{fragments[down_idx]['name']}_Fwd_{enzyme}",
-            "full_seq": fwd_full, "tail": fwd_tail, "annealing": fwd_anneal["seq"],
-            "tm": fwd_anneal["tm"], "length": len(fwd_full),
-            "gc_percent": round(_gc_content(fwd_full) * 100, 1),
-        }
-        rev_primer = {
-            "name": f"{fragments[up_idx]['name']}_Rev_{enzyme}",
-            "full_seq": rev_full, "tail": rev_tail, "annealing": rev_anneal["seq"],
-            "tm": rev_anneal["tm"], "length": len(rev_full),
-            "gc_percent": round(_gc_content(rev_full) * 100, 1),
-        }
+            fwd_primer = {
+                "name": f"{f['name']}_Fwd_{enzyme}",
+                "full_seq": fwd_full, "tail": fwd_tail, "annealing": fwd_anneal["seq"],
+                "tm": fwd_anneal["tm"], "length": len(fwd_full),
+                "gc_percent": round(_gc_content(fwd_full) * 100, 1),
+            }
+            rev_primer = {
+                "name": f"{f['name']}_Rev_{enzyme}",
+                "full_seq": rev_full, "tail": rev_tail, "annealing": rev_anneal["seq"],
+                "tm": rev_anneal["tm"], "length": len(rev_full),
+                "gc_percent": round(_gc_content(rev_full) * 100, 1),
+            }
+            frag_results.append({
+                "name": f["name"],
+                "length": len(s),
+                "fwd_primer": fwd_primer,
+                "rev_primer": rev_primer,
+            })
+            all_primers.append(fwd_primer)
+            all_primers.append(rev_primer)
 
-        junctions.append({
-            "overhang": overhang,
-            "fwd_primer": fwd_primer,
-            "rev_primer": rev_primer,
+        bin_results.append({
+            "name": b["name"],
+            "left_overhang": left_oh,
+            "right_overhang": right_oh,
+            "num_options": len(b["fragments"]),
+            "fragments": frag_results,
         })
-        all_primers.append(fwd_primer)
-        all_primers.append(rev_primer)
 
-    product_seq = "".join(seqs)
-    product_annotations = []
-    offset = 0
-    for i, f in enumerate(fragments):
-        flen = len(seqs[i])
-        product_annotations.append({
-            "name": f["name"], "start": offset, "end": offset + flen,
-            "direction": 1, "color": ["#4682B4", "#2ecc71", "#e67e22", "#9b59b6", "#e74c3c", "#1abc9c"][i % 6],
-            "type": "misc_feature",
-        })
-        offset += flen
+    # ── Vector primers (if provided)
+    vec_primers = None
+    if has_vec:
+        # Vector fwd: after last bin → vector start
+        # Uses overhang[0] on fwd side
+        vec_fwd_anneal = _design_annealing_region(vec_seq, 0, "forward", tm_target)
+        vec_fwd_tail = spacer + site + overhangs[0]
+        vec_fwd_full = vec_fwd_tail + vec_fwd_anneal["seq"]
+
+        # Vector rev: before first bin → vector end
+        vec_rev_oh_idx = oh_offset  # = 1
+        vec_rev_anneal = _design_annealing_region(vec_seq, len(vec_seq), "reverse", tm_target)
+        vec_rev_tail = spacer + rc_site + _reverse_complement(overhangs[vec_rev_oh_idx])
+        vec_rev_full = vec_rev_tail + vec_rev_anneal["seq"]
+
+        vec_primers = {
+            "fwd": {
+                "name": f"{vector.get('name', 'Vector')}_Fwd_{enzyme}",
+                "full_seq": vec_fwd_full, "tail": vec_fwd_tail, "annealing": vec_fwd_anneal["seq"],
+                "tm": vec_fwd_anneal["tm"], "length": len(vec_fwd_full),
+                "gc_percent": round(_gc_content(vec_fwd_full) * 100, 1),
+            },
+            "rev": {
+                "name": f"{vector.get('name', 'Vector')}_Rev_{enzyme}",
+                "full_seq": vec_rev_full, "tail": vec_rev_tail, "annealing": vec_rev_anneal["seq"],
+                "tm": vec_rev_anneal["tm"], "length": len(vec_rev_full),
+                "gc_percent": round(_gc_content(vec_rev_full) * 100, 1),
+            },
+        }
+        all_primers.append(vec_primers["fwd"])
+        all_primers.append(vec_primers["rev"])
+
+    # ── Combinatorial stats
+    combo_count = 1
+    for b in bins:
+        combo_count *= len(b["fragments"])
+
+    if combo_count > 1:
+        warnings.insert(0, f"Combinatorial assembly: {combo_count} possible construct{'s' if combo_count > 1 else ''}")
+
+    # ── Build default product (first fragment from each bin)
+    default_seqs = []
+    for b in bins:
+        default_seqs.append(b["fragments"][0]["_seq"])
+    if has_vec:
+        product_seq = vec_seq + "".join(default_seqs)
+    else:
+        product_seq = "".join(default_seqs)
+
+    # ── Overhang map for display
+    overhang_map = []
+    for i in range(len(overhangs)):
+        if has_vec and i == 0:
+            label = f"Vector → {bins[0]['name']}" if len(bins) > 0 else "Vector start"
+        elif has_vec:
+            left_name = bins[i - 1]["name"] if i - 1 < len(bins) else "Vector"
+            right_name = bins[i]["name"] if i < len(bins) else "Vector"
+            label = f"{left_name} → {right_name}"
+        else:
+            left_name = bins[i]["name"] if i < len(bins) else bins[-1]["name"]
+            right_name = bins[(i + 1) % len(bins)]["name"] if (i + 1) < len(bins) else bins[0]["name"]
+            label = f"{left_name} → {right_name}"
+        overhang_map.append({"overhang": overhangs[i], "label": label})
 
     return {
         "enzyme": {"name": enzyme, "site": site, "cut_offset": enz["cut_offset"]},
-        "junctions": junctions,
+        "bins": bin_results,
+        "overhang_map": overhang_map,
+        "vector_primers": vec_primers,
+        "vector_name": vector.get("name", "Vector") if vector else None,
         "primers": all_primers,
         "product_length": len(product_seq),
         "product_seq": product_seq,
-        "product_annotations": product_annotations,
+        "combo_count": combo_count,
+        "num_bins": n_bins,
         "warnings": warnings,
         "internal_sites": internal_sites,
     }
@@ -1737,6 +1858,15 @@ def list_sequences():
             "FROM plasmids WHERE gb_file IS NOT NULL AND gb_file != '' "
             "ORDER BY name"
         ).fetchall()
+        # Kit parts
+        try:
+            kit_parts = conn.execute(
+                "SELECT id, name, kit_name, part_type, description, gb_file, created "
+                "FROM kit_parts WHERE gb_file IS NOT NULL AND gb_file != '' "
+                "ORDER BY kit_name, name"
+            ).fetchall()
+        except Exception:
+            kit_parts = []  # table may not exist yet
 
     items = []
     for p in primers:
@@ -1751,22 +1881,28 @@ def list_sequences():
         fpath = os.path.join(GB_DIR, f"plasmid_{d['id']}.gb")
         d["has_file"] = os.path.isfile(fpath)
         items.append(d)
+    for p in kit_parts:
+        d = dict(p)
+        d["type"] = "kitpart"
+        fpath = os.path.join(GB_DIR, f"kitpart_{d['id']}.gb")
+        d["has_file"] = os.path.isfile(fpath)
+        items.append(d)
 
     return {"items": items}
 
 
 @router.get("/cloning/sequences/{seq_type}/{seq_id}/parse")
 def parse_sequence(seq_type: str, seq_id: int):
-    if seq_type not in ("primer", "plasmid"):
-        raise HTTPException(400, "seq_type must be 'primer' or 'plasmid'")
+    if seq_type not in ("primer", "plasmid", "kitpart"):
+        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', or 'kitpart'")
     fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
     return parse_genbank(fpath)
 
 
 @router.get("/cloning/sequences/{seq_type}/{seq_id}/raw")
 def raw_sequence(seq_type: str, seq_id: int):
-    if seq_type not in ("primer", "plasmid"):
-        raise HTTPException(400, "seq_type must be 'primer' or 'plasmid'")
+    if seq_type not in ("primer", "plasmid", "kitpart"):
+        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', or 'kitpart'")
     fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
     if not os.path.isfile(fpath):
         raise HTTPException(404, "GenBank file not found")
@@ -1835,6 +1971,92 @@ def update_features(seq_type: str, seq_id: int, body: UpdateFeaturesRequest):
         f.write(output.getvalue())
 
     return {"ok": True, "count": len(body.annotations)}
+
+
+class ReindexRequest(BaseModel):
+    new_origin: int
+
+
+@router.post("/cloning/sequences/{seq_type}/{seq_id}/reindex")
+def reindex_sequence(seq_type: str, seq_id: int, body: ReindexRequest):
+    """Reindex a circular sequence — rotate so new_origin becomes position 0.
+    Remaps all feature coordinates and rewrites the .gb file."""
+    if seq_type not in ("primer", "plasmid", "kitpart"):
+        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', or 'kitpart'")
+    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
+    if not os.path.isfile(fpath):
+        raise HTTPException(404, "GenBank file not found")
+
+    from Bio import SeqIO as _SeqIO
+    from Bio.Seq import Seq
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    from io import StringIO
+
+    records = list(_SeqIO.parse(fpath, "genbank"))
+    if not records:
+        raise HTTPException(400, "No records found in GenBank file")
+    rec = records[0]
+    seq_str = str(rec.seq)
+    slen = len(seq_str)
+
+    topology = rec.annotations.get("topology", "linear")
+    if topology != "circular":
+        raise HTTPException(400, "Reindexing is only supported for circular sequences")
+
+    origin = body.new_origin % slen
+    if origin == 0:
+        return parse_genbank(fpath)  # no change needed
+
+    # Rotate sequence
+    new_seq = seq_str[origin:] + seq_str[:origin]
+    rec.seq = Seq(new_seq)
+
+    # Remap features
+    new_features = []
+    for feat in rec.features:
+        start = int(feat.location.start)
+        end = int(feat.location.end)
+        new_start = (start - origin) % slen
+        new_end = (end - origin) % slen
+
+        # Skip source features — we'll regenerate
+        if feat.type == "source":
+            continue
+
+        # If the feature doesn't wrap origin after reindex, keep it simple
+        if new_start < new_end:
+            new_feat = SeqFeature(
+                FeatureLocation(new_start, new_end, strand=feat.location.strand),
+                type=feat.type,
+                qualifiers=dict(feat.qualifiers),
+            )
+            new_features.append(new_feat)
+        else:
+            # Feature now wraps origin — BioPython can't represent this in a simple
+            # FeatureLocation, so store as-is (start < end by using the larger span)
+            # This is a known GenBank limitation for wrapped features
+            new_feat = SeqFeature(
+                FeatureLocation(new_start, slen, strand=feat.location.strand),
+                type=feat.type,
+                qualifiers=dict(feat.qualifiers),
+            )
+            new_features.append(new_feat)
+
+    # Rebuild feature list with source
+    rec.features = [SeqFeature(
+        FeatureLocation(0, slen),
+        type="source",
+        qualifiers={"mol_type": ["other DNA"], "organism": ["synthetic construct"]},
+    )] + new_features
+
+    # Write back
+    output = StringIO()
+    _SeqIO.write(rec, output, "genbank")
+    with open(fpath, "w") as f:
+        f.write(output.getvalue())
+
+    # Return freshly parsed data
+    return parse_genbank(fpath)
 
 
 # ---------------------------------------------------------------------------
@@ -1937,9 +2159,22 @@ def gibson_endpoint(body: GibsonRequest):
 @router.post("/cloning/design-goldengate")
 def goldengate_endpoint(body: GoldenGateRequest):
     """Design a Golden Gate assembly with type IIS enzyme."""
-    frags = [{"name": f.name, "seq": f.seq, "start": f.start, "end": f.end} for f in body.fragments]
+    bins_data = None
+    frags_data = None
+    vec_data = None
+
+    if body.bins:
+        bins_data = [{"name": b.name, "fragments": [{"name": f.name, "seq": f.seq} for f in b.fragments]} for b in body.bins]
+    elif body.fragments:
+        frags_data = [{"name": f.name, "seq": f.seq} for f in body.fragments]
+
+    if body.vector and body.vector.seq:
+        vec_data = {"name": body.vector.name, "seq": body.vector.seq}
+
     return design_golden_gate(
-        fragments=frags,
+        bins=bins_data,
+        fragments=frags_data,
+        vector=vec_data,
         enzyme=body.enzyme or "BsaI",
         circular=body.circular if body.circular is not None else True,
         tm_target=body.tm_target or 62.0,
