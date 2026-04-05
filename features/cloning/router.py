@@ -278,7 +278,48 @@ def _calc_tm(seq: str) -> float:
         return float((a + t) * 2 + (g + c) * 4)
     return round(64.9 + 41 * (g + c - 16.4) / length, 1)
 
+# Nearest-Neighbor thermodynamics for DNA/DNA (SantaLucia 1998)
+# Values are (Delta H in kcal/mol, Delta S in cal/K/mol)
+NN_THERMO = {
+    "AA": (-7.9, -22.2), "TT": (-7.9, -22.2),
+    "AT": (-7.2, -20.4), "TA": (-7.2, -21.3),
+    "CA": (-8.5, -22.7), "TG": (-8.5, -22.7),
+    "GT": (-8.4, -22.4), "AC": (-8.4, -22.4),
+    "CT": (-7.8, -21.0), "AG": (-7.8, -21.0),
+    "GA": (-8.2, -22.2), "TC": (-8.2, -22.2),
+    "CG": (-10.6, -27.2), "GC": (-9.8, -24.4),
+    "GG": (-8.0, -19.9), "CC": (-8.0, -19.9),
+}
 
+def _calc_delta_g(seq: str, temp_c: float = 60.0) -> float:
+    """Calculate the Gibbs Free Energy (ΔG) in kcal/mol for a given sequence."""
+    seq = seq.upper()
+    if len(seq) < 2:
+        return 0.0
+
+    dH, dS = 0.0, 0.0
+    for i in range(len(seq) - 1):
+        pair = seq[i:i+2]
+        if pair in NN_THERMO:
+            h, s = NN_THERMO[pair]
+            dH += h
+            dS += s
+
+    # Basic initiation parameters
+    if seq[0] in "GC":
+        dH += 0.1; dS -= 2.8
+    else:
+        dH += 2.3; dS += 4.1
+
+    if seq[-1] in "GC":
+        dH += 0.1; dS -= 2.8
+    else:
+        dH += 2.3; dS += 4.1
+
+    # ΔG = ΔH - TΔS (convert temperature to Kelvin and dS to kcal)
+    temp_k = temp_c + 273.15
+    dG = dH - (temp_k * dS / 1000.0)
+    return round(dG, 2)
 def _get_seq_region(template: str, start: int, length: int) -> str:
     """Get a region from template, wrapping around for circular sequences."""
     tpl_len = len(template)
@@ -305,9 +346,7 @@ def _check_primer_quality(seq: str, tm: float) -> list:
 
     # GC content
     gc = _gc_content(s) * 100
-    if gc < 40:
-        checks.append({"level": "warn", "rule": "GC Content", "detail": f"{gc:.0f}% — 40-60% recommended"})
-    elif gc > 60:
+    if gc < 40 or gc > 60:
         checks.append({"level": "warn", "rule": "GC Content", "detail": f"{gc:.0f}% — 40-60% recommended"})
     else:
         checks.append({"level": "pass", "rule": "GC Content", "detail": f"{gc:.0f}%"})
@@ -319,7 +358,7 @@ def _check_primer_quality(seq: str, tm: float) -> list:
         if gc_clamp == 0:
             checks.append({"level": "warn", "rule": "GC Clamp", "detail": f"3' end is {last2} — no G/C in last 2 bases"})
         elif gc_clamp == 2 and length >= 5 and sum(1 for b in s[-5:] if b in "GC") >= 4:
-            checks.append({"level": "warn", "rule": "GC Clamp", "detail": f"Strong 3' GC run — may cause mispriming"})
+            checks.append({"level": "warn", "rule": "GC Clamp", "detail": "Strong 3' GC run — may cause mispriming"})
         else:
             checks.append({"level": "pass", "rule": "GC Clamp", "detail": f"3' end: ...{last2}"})
 
@@ -335,40 +374,38 @@ def _check_primer_quality(seq: str, tm: float) -> list:
             max_run_len = run
             max_run_base = base
     if max_run_len >= 4:
-        checks.append({"level": "warn", "rule": "Homopolymer", "detail": f"{max_run_len}\u00d7 {max_run_base} run detected"})
+        checks.append({"level": "warn", "rule": "Homopolymer", "detail": f"{max_run_len}× {max_run_base} run detected"})
     else:
-        checks.append({"level": "pass", "rule": "Homopolymer", "detail": "No runs \u22654"})
+        checks.append({"level": "pass", "rule": "Homopolymer", "detail": "No runs ≥4"})
 
     # Tm
     if tm < 55:
-        checks.append({"level": "error", "rule": "Tm", "detail": f"{tm}\u00b0C — below 55\u00b0C, too low"})
-    elif tm < 58:
-        checks.append({"level": "warn", "rule": "Tm", "detail": f"{tm}\u00b0C — slightly low, 58-65\u00b0C ideal"})
-    elif tm > 72:
-        checks.append({"level": "warn", "rule": "Tm", "detail": f"{tm}\u00b0C — above 72\u00b0C, quite high"})
-    elif tm > 68:
-        checks.append({"level": "warn", "rule": "Tm", "detail": f"{tm}\u00b0C — slightly high, 58-65\u00b0C ideal"})
+        checks.append({"level": "error", "rule": "Tm", "detail": f"{tm}°C — below 55°C, too low"})
+    elif tm < 58 or tm > 68:
+        checks.append({"level": "warn", "rule": "Tm", "detail": f"{tm}°C — 58-65°C ideal"})
     else:
-        checks.append({"level": "pass", "rule": "Tm", "detail": f"{tm}\u00b0C"})
+        checks.append({"level": "pass", "rule": "Tm", "detail": f"{tm}°C"})
 
-    # Basic self-complementarity check at 3' end
+    # Self-complementarity
     if length >= 6:
         tail = s[-6:]
         rc_tail = _reverse_complement(tail)
-        # Check if RC of 3' end appears in the primer
         if rc_tail in s:
             checks.append({"level": "warn", "rule": "Self-dimer", "detail": "3' end complement found within primer"})
         else:
             checks.append({"level": "pass", "rule": "Self-dimer", "detail": "No obvious 3' self-dimer"})
 
-    # 3' end stability: last 5 bases deltaG (simplified: count GC)
+    # NEW: 3' End Thermodynamic Stability (Energy Density)
     if length >= 5:
         last5 = s[-5:]
-        last5_gc = sum(1 for b in last5 if b in "GC")
-        if last5_gc <= 1:
-            checks.append({"level": "warn", "rule": "3' Stability", "detail": f"Weak 3' end ({last5_gc}/5 GC) — may reduce priming efficiency"})
+        # Calculate ΔG at 37°C which is the standard baseline for 3' end stability analysis
+        last5_dg = _calc_delta_g(last5, temp_c=37.0)
+        if last5_dg > -4.0:
+            checks.append({"level": "warn", "rule": "3' Stability (ΔG)", "detail": f"Weak 3' end ({last5_dg} kcal/mol) — may reduce priming efficiency"})
+        elif last5_dg < -10.0:
+            checks.append({"level": "warn", "rule": "3' Stability (ΔG)", "detail": f"Over-stable 3' end ({last5_dg} kcal/mol) — may cause mispriming"})
         else:
-            checks.append({"level": "pass", "rule": "3' Stability", "detail": f"{last5_gc}/5 GC in last 5 bases"})
+            checks.append({"level": "pass", "rule": "3' Stability (ΔG)", "detail": f"{last5_dg} kcal/mol"})
 
     return checks
 
@@ -404,6 +441,7 @@ def _design_annealing_region(template: str, pos: int, direction: str, tm_target:
     return {
         "seq": best_seq,
         "tm": best_tm,
+        "delta_g": _calc_delta_g(best_seq, best_tm), # NEW
         "length": len(best_seq),
         "gc_percent": round(_gc_content(best_seq) * 100, 1),
         "quality": quality,
