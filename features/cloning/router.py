@@ -378,8 +378,7 @@ def _design_annealing_region(template: str, pos: int, direction: str, tm_target:
     """Design an annealing region starting from pos in given direction, targeting tm_target.
     direction: 'forward' (5'->3' on top strand) or 'reverse' (5'->3' on bottom strand, upstream)."""
     if hard_max_len is not None:
-        max_len = min(max_len, hard_max_len) if max_len else hard_max_len
-        max_len = hard_max_len  #  effectively override
+        max_len = hard_max_len
     tpl_len = len(template)
     best_seq = ""
     best_tm = 0.0
@@ -1397,17 +1396,16 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
             warnings.append(f"Junction {up_name}→{down_name} overlap Tm ({overlap_tm}°C) is low — may reduce assembly efficiency")
         elif overlap_tm > 72:
             warnings.append(f"Junction {up_name}→{down_name} overlap Tm ({overlap_tm}°C) is high")
-        max_fwd_anneal = 60 - len(up_tail)
-        max_rev_anneal = 60 - len(rev_tail)
 
         # Forward primer for downstream fragment: tail = end of upstream, annealing = start of downstream
-        fwd_anneal = _design_annealing_region(down_seq, 0, "forward", tm_target, max_len=max_fwd_anneal)
         fwd_tail = up_tail
+        max_fwd_anneal = 60 - len(fwd_tail)
+        fwd_anneal = _design_annealing_region(down_seq, 0, "forward", tm_target, max_len=max_fwd_anneal)
         fwd_full = fwd_tail + fwd_anneal["seq"]
-        rev_tail = _reverse_complement(down_tail)
-        max_rev_anneal = 60 - len(rev_tail)
+
         # Reverse primer for upstream fragment: tail = RC of start of downstream, annealing = RC of end of upstream
         rev_tail = _reverse_complement(down_tail)
+        max_rev_anneal = 60 - len(rev_tail)
         rev_anneal = _design_annealing_region(up_seq, len(up_seq), "reverse", tm_target, max_len=max_rev_anneal)
         rev_full = rev_tail + rev_anneal["seq"]
 
@@ -1466,11 +1464,37 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
     }
 
 
-def _ensure_gc_clamp(seq,max_len=60): return seq if seq[-1] in "GC" else seq+"G" if len(seq)<max_len else seq
+def _ensure_gc_clamp(seq, max_len=60):
+    """Append a G to the 3' end if it doesn't already end with G or C."""
+    if seq[-1] in "GC":
+        return seq
+    if len(seq) < max_len:
+        return seq + "G"
+    return seq
 
-def _has_hairpin(seq,min_stem=4,min_loop=3): n=len(seq); return any(seq[i:i+stem_len]==_reverse_complement(seq[i+stem_len+min_loop:i+stem_len+min_loop+stem_len]) for stem_len in range(min_stem,min(8,n//2)) for i in range(n-stem_len-min_loop-stem_len+1))
 
-def _has_self_dimer(seq,min_match=4): rc=_reverse_complement(seq); n=len(seq); return any(seq[i:i+min_match]==rc[j:j+min_match] for i in range(n-min_match+1) for j in range(n-min_match+1))
+def _has_hairpin(seq, min_stem=4, min_loop=3):
+    """Check whether seq can form a hairpin (stem-loop)."""
+    n = len(seq)
+    for stem_len in range(min_stem, min(8, n // 2)):
+        for i in range(n - 2 * stem_len - min_loop + 1):
+            stem = seq[i:i + stem_len]
+            loop_start = i + stem_len + min_loop
+            complement = seq[loop_start:loop_start + stem_len]
+            if stem == _reverse_complement(complement):
+                return True
+    return False
+
+
+def _has_self_dimer(seq, min_match=4):
+    """Check whether the primer can form a self-dimer (3' overlap with its own RC)."""
+    rc = _reverse_complement(seq)
+    n = len(seq)
+    for i in range(n - min_match + 1):
+        kmer = seq[i:i + min_match]
+        if kmer in rc:
+            return True
+    return False
 
 def design_golden_gate(bins: list = None, fragments: list = None, vector: dict = None,
                        enzyme: str = "BsaI", circular: bool = True,

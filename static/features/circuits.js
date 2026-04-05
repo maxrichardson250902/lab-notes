@@ -66,18 +66,10 @@ var _cdScriptsLoaded = false;
 function _cdEnsureScripts() {
   if (_cdScriptsLoaded) return Promise.resolve();
   var chain = Promise.resolve();
-  if (!window.React) chain = chain.then(function() { return _loadScript('https://unpkg.com/react@18/umd/react.production.min.js'); });
-  if (!window.ReactDOM) chain = chain.then(function() { return _loadScript('https://unpkg.com/react-dom@18/umd/react-dom.production.min.js'); });
   if (!window.seqviz) chain = chain.then(function() { return _loadScript('https://unpkg.com/seqviz'); });
   return chain.then(function() {
       _cdScriptsLoaded = true;
       _cd.seqvizReady = true;
-      var mod = window.seqviz || {};
-      // SeqViz = React component. Viewer = vanilla JS wrapper (creates own root — don't use).
-      _cd._seqvizComponent = (typeof mod.SeqViz === 'function') ? mod.SeqViz
-                           : (typeof mod.default === 'function') ? mod.default
-                           : null;
-      if (!_cd._seqvizComponent) console.warn('[circuits] Could not resolve SeqViz component');
     })
     .catch(function(e) { console.error('SeqViz load failed:', e); });
 }
@@ -442,7 +434,6 @@ function _cdOpenSeqPanel(idx, pasteMode) {
   _cd.seqPanelTarget = idx;
   _cd.seqPanelOpen = true;
   _cd.browseSel = { start: 0, end: 0, crossesOrigin: false };
-  _cd._seqvizRoot = null; // DOM will be recreated, old root is invalid
   _cdRenderSeqPanel(!!pasteMode);
   // Load sequences if not loaded
   if (!_cd.sequences.length) {
@@ -481,7 +472,7 @@ function _cdRenderSeqPanel(pasteMode) {
     + '</div>'
     // Right: viewer + controls
     + '<div style="flex:1;display:flex;flex-direction:column;overflow:hidden">'
-    + '<div id="cd-seqviz-mount" style="flex:1;overflow:hidden;min-height:200px"></div>'
+    + '<div id="cd-seqviz-mount" style="flex:1;overflow:auto;min-height:350px;height:350px;position:relative"></div>'
     + '<div id="cd-seq-controls" style="padding:10px 16px;border-top:1px solid #d5cec0;background:#f0ebe3">'
     + '<div id="cd-sel-info" style="margin-bottom:8px;font-size:.85rem;color:#8a7f72">Select a sequence from the sidebar, then drag to select a region</div>'
     + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
@@ -598,27 +589,25 @@ function _cdLoadSequence(stype, sid) {
 // ── SeqViz rendering ───────────────────────────────────────────────────
 function _cdRenderSeqViz(parsed) {
   var el = document.getElementById('cd-seqviz-mount');
-  if (!el || !parsed) return;
-  var SeqViz = _cd._seqvizComponent;
-  if (!SeqViz) { console.warn('SeqViz component not resolved'); return; }
+  if (!el || !parsed || !window.seqviz || typeof window.seqviz.Viewer !== 'function') return;
 
+  el.innerHTML = '';
   var annotations = (parsed.annotations || []).map(function(a) {
     return { name: a.name, start: a.start, end: a.end, direction: a.direction || 1, color: a.color || '#95A5A6' };
   });
-  var props = {
-    name: parsed.name, seq: parsed.seq, annotations: annotations,
-    style: { height: '100%', width: '100%' },
-    viewer: 'both', showComplement: true, showIndex: true,
-    onSelection: _cdOnSelection,
-  };
   try {
-    var reactEl = window.React.createElement(SeqViz, props);
-    // Reuse root if already created on this element, otherwise create new
-    if (!_cd._seqvizRoot) {
-      el.innerHTML = '';
-      _cd._seqvizRoot = window.ReactDOM.createRoot(el);
-    }
-    _cd._seqvizRoot.render(reactEl);
+    var viewer = window.seqviz.Viewer('cd-seqviz-mount', {
+      name: parsed.name,
+      seq: parsed.seq,
+      annotations: annotations,
+      style: { height: '100%', width: '100%' },
+      viewer: 'both',
+      showComplement: true,
+      showIndex: true,
+      onSelection: _cdOnSelection,
+    });
+    viewer.render();
+    _cd._viewer = viewer; // keep ref for setState on re-renders
   } catch (err) {
     console.error('[circuits] SeqViz render error:', err);
     el.innerHTML = '<div style="padding:20px;color:#C0392B">SeqViz error: ' + esc(err.message) + '</div>';
