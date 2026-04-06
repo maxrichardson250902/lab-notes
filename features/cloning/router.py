@@ -467,85 +467,90 @@ def design_kld_primers(template_seq, insertion_pos, insert_seq, tm_target=62.0, 
     insert_seq = insert_seq.upper().replace(" ", "").replace("\n", "")
     tpl_len = len(template_seq)
     ins_len = len(insert_seq)
-    warnings = []
 
-    if not template_seq:
-        raise HTTPException(400, "Template sequence is empty")
-    if not insert_seq:
-        raise HTTPException(400, "Insert sequence is empty")
-    if insertion_pos < 0 or insertion_pos > tpl_len:
-        raise HTTPException(400, f"Insertion position {insertion_pos} out of range (0-{tpl_len})")
+    if not template_seq or not insert_seq:
+        raise HTTPException(400, "Template or Insert sequence is empty")
 
-    # Find optimal split point
-    best_split = ins_len // 2
-    best_score = -1.0
+    best_overall_score = -float('inf')
+    best_split_data = None
+
+    # Iteratively try every possible split point to find the best primer pair
     for sp in range(1, ins_len):
-        score = _score_split(insert_seq, sp)
-        mid_penalty = abs(sp - ins_len / 2) / max(ins_len, 1) * 0.05
-        adjusted = score - mid_penalty
-        if adjusted > best_score:
-            best_score = adjusted
-            best_split = sp
+        fwd_tail = insert_seq[:sp]
+        rev_tail = _reverse_complement(insert_seq[sp:])
+        
+        # Remaining room for annealing regions (must be at least 12bp)
+        f_max_ann = max_len - len(fwd_tail)
+        r_max_ann = max_len - len(rev_tail)
+        
+        if f_max_ann < 12 or r_max_ann < 12:
+            continue
+            
+        # Generate all candidates for this split point
+        # Using the expanded range (12 to max) as discussed
+        f_cands = _generate_primer_candidates(
+            template_seq, insertion_pos, "forward", fwd_tail, tm_target,
+            min_len=12, max_len=f_max_ann, max_total=max_len
+        )
+        r_cands = _generate_primer_candidates(
+            template_seq, insertion_pos, "reverse", rev_tail, tm_target,
+            min_len=12, max_len=r_max_ann, max_total=max_len
+        )
+        
+        if not f_cands or not r_cands:
+            continue
+            
+        # Score the "best" (top of the list) pair for this split
+        f = f_cands[0]
+        r = r_cands[0]
+        
+        # Scoring metrics:
+        # 1. Tm Error: How far are they from the target?
+        tm_error = abs(f['tm'] - tm_target) + abs(r['tm'] - tm_target)
+        # 2. Tm Delta: How well do they match each other?
+        tm_delta = abs(f['tm'] - r['tm'])
+        # 3. Junction Quality: GC content at the split (ligation point)
+        junction_gc = _score_split(insert_seq, sp)
+        # 4. Secondary Structure Penalties
+        ss_penalty = 0
+        if f.get('hairpin') or r.get('hairpin'): ss_penalty += 20
+        if f.get('homodimer_dg', 0) < -7.0: ss_penalty += 10
+        if r.get('homodimer_dg', 0) < -7.0: ss_penalty += 10
+        
+        # Total Score (Higher is better)
+        # We prioritize secondary structure avoidance and Tm matching
+        score = (junction_gc * 10) - (tm_error * 1.5) - (tm_delta * 2) - ss_penalty
+        
+        if score > best_overall_score:
+            best_overall_score = score
+            best_split_data = {
+                "fwd_cands": f_cands,
+                "rev_cands": r_cands,
+                "split": sp,
+                "gc": junction_gc
+            }
 
-    fwd_tail = insert_seq[:best_split]
-    rev_tail_raw = insert_seq[best_split:]
-    rev_tail = _reverse_complement(rev_tail_raw)
-    split_gc_score = round(_score_split(insert_seq, best_split), 3)
+    if not best_split_data:
+        raise HTTPException(400, "Could not find a viable split point for the given constraints.")
 
-    # Forward primer: tail = first half of insert, annealing into template downstream
-    fwd_max_anneal = max_len - len(fwd_tail)
-    if fwd_max_anneal < 15:
-        warnings.append(f"Forward tail ({len(fwd_tail)}bp) very long — annealing limited to {fwd_max_anneal}bp")
+    # Apply the alternatives logic (with the Tm 55 filter) to the winners
+    fwd_primer = _pick_best_with_alternatives(best_split_data["fwd_cands"], "Forward", max_alternatives=None)
+    rev_primer = _pick_best_with_alternatives(best_split_data["rev_cands"], "Reverse", max_alternatives=None)
 
-    fwd_candidates = _generate_primer_candidates(
-        template_seq, insertion_pos, "forward", fwd_tail, tm_target,
-        min_len=max(10, min(15, fwd_max_anneal)), max_total=max_len,
-    )
-    fwd_primer = _pick_best_with_alternatives(fwd_candidates, "Forward")
-
-    # Reverse primer: tail = RC of second half of insert, annealing into template upstream
-    rev_max_anneal = max_len - len(rev_tail)
-    if rev_max_anneal < 15:
-        warnings.append(f"Reverse tail ({len(rev_tail)}bp) very long — annealing limited to {rev_max_anneal}bp")
-
-    rev_candidates = _generate_primer_candidates(
-        template_seq, insertion_pos, "reverse", rev_tail, tm_target,
-        min_len=max(10, min(15, rev_max_anneal)), max_total=max_len,
-    )
-    rev_primer = _pick_best_with_alternatives(rev_candidates, "Reverse")
-
-    # Warnings from primer checks
-    if fwd_primer:
-        if fwd_primer.get("tm", 0) < tm_target - 5:
-            warnings.append(f"Forward annealing Tm ({fwd_primer['tm']}°C) below target range")
-        if fwd_primer.get("tm", 0) > tm_target + 5:
-            warnings.append(f"Forward annealing Tm ({fwd_primer['tm']}°C) above target range")
-        if fwd_primer.get("hairpin"):
-            warnings.append("Forward primer may form hairpin")
-        if fwd_primer.get("homodimer_dg", 0) < -7.0:
-            warnings.append(f"Forward primer has strong self-dimer (ΔG = {fwd_primer['homodimer_dg']} kcal/mol)")
-    if rev_primer:
-        if rev_primer.get("tm", 0) < tm_target - 5:
-            warnings.append(f"Reverse annealing Tm ({rev_primer['tm']}°C) below target range")
-        if rev_primer.get("tm", 0) > tm_target + 5:
-            warnings.append(f"Reverse annealing Tm ({rev_primer['tm']}°C) above target range")
-        if rev_primer.get("hairpin"):
-            warnings.append("Reverse primer may form hairpin")
-        if rev_primer.get("homodimer_dg", 0) < -7.0:
-            warnings.append(f"Reverse primer has strong self-dimer (ΔG = {rev_primer['homodimer_dg']} kcal/mol)")
-
-    if split_gc_score < 0.25:
-        warnings.append("Low GC at insert split junction — ligation efficiency may be reduced")
-    if ins_len > max_len * 2 - 30:
-        warnings.append(f"Insert ({ins_len}bp) is long — tails may crowd out annealing regions")
+    # Collect warnings for the UI
+    warnings = []
+    if best_split_data["gc"] < 0.25:
+        warnings.append("Low GC at split junction — ligation efficiency may be reduced.")
+    if abs(fwd_primer['tm'] - rev_primer['tm']) > 3:
+        warnings.append(f"Tm mismatch: Forward ({fwd_primer['tm']}°C) vs Reverse ({rev_primer['tm']}°C)")
 
     product = template_seq[:insertion_pos] + insert_seq + template_seq[insertion_pos:]
 
     return {
         "forward": fwd_primer,
         "reverse": rev_primer,
-        "split_position": best_split,
-        "split_gc_score": split_gc_score,
+        "split_position": best_split_data["split"],
+        "split_gc_score": round(best_split_data["gc"], 3),
         "insert_length": ins_len,
         "warnings": warnings,
         "product_length": len(product),
