@@ -1096,9 +1096,10 @@ function _clRenderKLDResult(r) {
     var ss = r.search_stats;
     h += '<div style="font-size:.66rem;color:#8a7f72;margin-top:.3rem;padding:.25rem .5rem;display:flex;gap:.8rem;flex-wrap:wrap;">';
     h += '\ud83d\udd0d <span>Searched <strong>' + ss.junction_pairs.toLocaleString() + '</strong> junction pairs</span>';
-    h += '<span>\u00d7 <strong>' + ss.split_points + '</strong> split points</span>';
+    h += '<span>\u00d7 <strong>' + ss.split_points + '</strong> splits</span>';
     h += '<span>= <strong>' + ss.pairs_scored.toLocaleString() + '</strong> combos scored</span>';
-    h += '<span>(<strong>' + ss.candidates_generated.toLocaleString() + '</strong> primer candidates)</span>';
+    h += '<span>(<strong>' + ss.candidates_generated.toLocaleString() + '</strong> candidates)</span>';
+    if (ss.shortlist_refined) h += '<span>\u2192 top <strong>' + ss.shortlist_refined + '</strong> refined with full \u0394G</span>';
     h += '</div>';
   }
 
