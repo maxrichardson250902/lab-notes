@@ -411,7 +411,7 @@ def _check_primer_quality(seq: str, tm: float) -> list:
 
 
 def _design_annealing_region(template: str, pos: int, direction: str, tm_target: float,
-                              min_len: int = 18, max_len: int = 28, hard_max_len: int = None) -> dict:
+                              min_len: int = 18, max_len: int = 40, hard_max_len: int = None) -> dict:
     """Design an annealing region starting from pos in given direction, targeting tm_target.
     direction: 'forward' (5'->3' on top strand) or 'reverse' (5'->3' on bottom strand, upstream)."""
     if hard_max_len is not None:
@@ -1549,7 +1549,7 @@ def _calc_homodimer_dg(seq: str, temp_c: float = 60.0) -> float:
 
 
 def _generate_primer_candidates(template: str, pos: int, direction: str, tail: str,
-                                 tm_target: float, min_len: int = 18, max_len: int = 28,
+                                 tm_target: float, min_len: int = 18, max_len: int = 40,
                                  max_total: int = 60) -> list:
     """Generate multiple primer candidates with different annealing lengths.
     Returns a list of candidate dicts sorted by score (best first), each containing
