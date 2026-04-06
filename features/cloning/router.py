@@ -1413,13 +1413,19 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
 
         # Forward primer for downstream fragment: tail = end of upstream, annealing = start of downstream
         fwd_tail = up_tail
-        fwd_candidates = _generate_primer_candidates(down_seq, 0, "forward", fwd_tail, tm_target, max_total=60)
-        fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{down_name}_Fwd")
+        fwd_candidates = _generate_primer_candidates(
+            template=down_seq, pos=0, direction="forward", tail=fwd_tail, 
+            tm_target=tm_target, min_len=12, max_len=60, max_total=60
+        )
+        fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{down_name}_Fwd", max_alternatives=None)
 
         # Reverse primer for upstream fragment: tail = RC of start of downstream, annealing = RC of end of upstream
         rev_tail = _reverse_complement(down_tail)
-        rev_candidates = _generate_primer_candidates(up_seq, len(up_seq), "reverse", rev_tail, tm_target, max_total=60)
-        rev_primer = _pick_best_with_alternatives(rev_candidates, f"{up_name}_Rev")
+        rev_candidates = _generate_primer_candidates(
+            template=up_seq, pos=len(up_seq), direction="reverse", tail=rev_tail, 
+            tm_target=tm_target, min_len=12, max_len=60, max_total=60
+        )
+        rev_primer = _pick_best_with_alternatives(rev_candidates, f"{up_name}_Rev", max_alternatives=None)
 
         for p, pname in [(fwd_primer, f"{down_name}_Fwd"), (rev_primer, f"{up_name}_Rev")]:
             if p and p.get("hairpin"):
@@ -1619,7 +1625,8 @@ def _pick_best_with_alternatives(candidates: list, name: str, max_alternatives: 
     best["name"] = name
     alts = []
     for c in candidates[1:]:
-        if len(alts) >= max_alternatives:
+        # Allow max_alternatives to be None to return an unlimited list
+        if max_alternatives is not None and len(alts) >= max_alternatives:
             break
         alt = dict(c)
         alt["name"] = name
