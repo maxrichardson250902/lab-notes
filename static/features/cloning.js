@@ -66,6 +66,9 @@ var _cl = {
 };
 
 /* ── script loader ─────────────────────────────────────────── */
+var _altExpanded = {};  // track which primer alt sections are expanded
+window._altExpanded = _altExpanded;
+
 var _scriptsLoaded = false;
 var _scriptsLoading = false;
 
@@ -1023,7 +1026,16 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData) {
   h += '<div style="border:1px solid #e8e2d8;border-radius:5px;overflow:hidden;margin-bottom:.5rem;border-left:3px solid ' + accentColor + ';">';
   h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.4rem .65rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;">';
   h += '<div><span style="font-weight:600;font-size:.8rem;color:#4a4139;">' + esc(label) + '</span>';
-  h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + p.length + 'bp \u00b7 Tm ' + p.tm + '\u00b0C \u00b7 GC ' + p.gc_percent + '%</span></div>';
+  h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + p.length + 'bp \u00b7 Tm ' + p.tm + '\u00b0C \u00b7 GC ' + p.gc_percent + '%</span>';
+  // Show dimer/hairpin badges if data is present
+  if (typeof p.homodimer_dg === 'number') {
+    var dimerColor = p.homodimer_dg < -7 ? '#c0392b' : p.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
+    h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (p.homodimer_dg < -7 ? '#fde8e8' : p.homodimer_dg < -5 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + p.homodimer_dg + '</span>';
+  }
+  if (p.hairpin) {
+    h += '<span style="font-size:.66rem;margin-left:.3rem;padding:.1rem .35rem;border-radius:3px;background:#fde8e8;color:#c0392b;">hairpin</span>';
+  }
+  h += '</div>';
   h += '<div style="display:flex;gap:.3rem;">';
   if (featureData) {
     var stashIdx = window._featStash.length;
@@ -1036,7 +1048,57 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData) {
   h += '<div style="display:flex;align-items:baseline;gap:.4rem;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">5\u2032 tail:</span><span style="color:' + accentColor + ';word-break:break-all;">' + esc(p.tail) + '</span><span style="font-size:.62rem;color:#8a7f72;">(' + p.tail.length + 'bp)</span></div>';
   h += '<div style="display:flex;align-items:baseline;gap:.4rem;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">anneal:</span><span style="color:#4a4139;font-weight:500;word-break:break-all;">' + esc(p.annealing) + '</span><span style="font-size:.62rem;color:#8a7f72;">(' + p.annealing.length + 'bp)</span></div>';
   h += '<div style="display:flex;align-items:baseline;gap:.4rem;margin-top:.25rem;padding-top:.25rem;border-top:1px solid #f0ebe3;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">full:</span><span style="word-break:break-all;"><span style="color:' + accentColor + ';">' + esc(p.tail) + '</span><span style="color:#4a4139;font-weight:600;">' + esc(p.annealing) + '</span></span></div>';
-  h += '</div></div>';
+  h += '</div>';
+
+  // Alternatives section
+  if (p.alternatives && p.alternatives.length > 0) {
+    var altKey = copyKey + '-alts';
+    var isCollapsed = !!window._altExpanded[altKey];  // inverted: starts expanded, click to collapse
+    h += '<div style="border-top:1px solid #e8e2d8;">';
+    h += '<button onclick="_adToggleAlts(\x27' + esc(altKey) + '\x27)" style="display:flex;align-items:center;gap:.3rem;width:100%;padding:.35rem .65rem;font-size:.72rem;color:#5b7a5e;border:none;background:#eef4ee;cursor:pointer;text-align:left;font-weight:500;">';
+    h += '<span style="font-size:.6rem;">' + (isCollapsed ? '\u25B6' : '\u25BC') + '</span>';
+    h += (p.alternatives.length + 1) + ' primer options \u2014 compare Tm vs dimer trade-offs';
+    h += '</button>';
+    if (!isCollapsed) {
+      h += '<div style="padding:.4rem .65rem .5rem;background:#faf8f4;">';
+      h += '<table style="width:100%;border-collapse:collapse;font-size:.72rem;">';
+      h += '<thead><tr style="border-bottom:2px solid #d5cec0;">';
+      h += '<th style="text-align:left;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Annealing</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Len</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Tm</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">GC%</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Dimer \u0394G</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Hairpin</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Score</th>';
+      h += '<th style="text-align:right;padding:.3rem .3rem;"></th>';
+      h += '</tr></thead><tbody>';
+      // Recommended (current) primer as first row
+      var allOptions = [p].concat(p.alternatives);
+      allOptions.forEach(function(opt, oi) {
+        var isRec = (oi === 0);
+        var dimerC = opt.homodimer_dg < -7 ? '#c0392b' : opt.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
+        var rowBg = isRec ? 'background:#eef4ee;' : '';
+        h += '<tr style="border-bottom:1px solid #f0ebe3;' + rowBg + '">';
+        h += '<td style="padding:.3rem .3rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;word-break:break-all;max-width:180px;overflow:hidden;text-overflow:ellipsis;" title="' + esc(opt.annealing) + '">';
+        if (isRec) h += '<span style="font-size:.6rem;background:#5b7a5e;color:#fff;padding:.1rem .25rem;border-radius:2px;margin-right:.3rem;">\u2605</span>';
+        h += esc(opt.annealing.length > 22 ? opt.annealing.slice(0, 22) + '\u2026' : opt.annealing) + '</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;">' + opt.length + '</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;font-weight:' + (isRec ? '600' : '400') + ';">' + opt.tm + '\u00b0C</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;">' + opt.gc_percent + '%</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;color:' + dimerC + ';font-weight:500;">' + (typeof opt.homodimer_dg === 'number' ? opt.homodimer_dg : '-') + '</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;">' + (opt.hairpin ? '\u26a0\ufe0f' : '\u2705') + '</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;color:#8a7f72;">' + (typeof opt.score === 'number' ? opt.score : '-') + '</td>';
+        h += '<td style="text-align:right;padding:.3rem .3rem;"><button onclick="navigator.clipboard.writeText(\x27' + esc(opt.full_seq) + '\x27).then(function(){toast(\x27Primer copied\x27)})" style="padding:.15rem .4rem;font-size:.66rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy</button></td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table>';
+      h += '<div style="font-size:.64rem;color:#8a7f72;margin-top:.3rem;">\u2605 = recommended (lowest score is best) \u00b7 Dimer \u0394G: green > -5, amber -5 to -7, red < -7 kcal/mol</div>';
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+
+  h += '</div>';
   return h;
 }
 
@@ -3370,6 +3432,12 @@ function _adDLDesign() {
   });
 }
 
+// ── Toggle primer alternatives
+function _adToggleAlts(key) {
+  window._altExpanded[key] = !window._altExpanded[key];
+  _clRender();
+}
+
 // ── Copy all primers
 function _adCopyAllPrimers(mode) {
   var result = null;
@@ -3511,6 +3579,7 @@ window._adDLSet = _adDLSet;
 window._adDLLoadVector = _adDLLoadVector;
 window._adDLDesign = _adDLDesign;
 window._adCopyAllPrimers = _adCopyAllPrimers;
+window._adToggleAlts = _adToggleAlts;
 window._adCopyPrimer = _adCopyPrimer;
 
 registerView('cloning', renderCloning);

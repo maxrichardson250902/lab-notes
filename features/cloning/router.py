@@ -492,74 +492,58 @@ def design_kld_primers(template_seq, insertion_pos, insert_seq, tm_target=62.0, 
     rev_tail = _reverse_complement(rev_tail_raw)
     split_gc_score = round(_score_split(insert_seq, best_split), 3)
 
-    # Forward annealing
+    # Forward primer: tail = first half of insert, annealing into template downstream
     fwd_max_anneal = max_len - len(fwd_tail)
     if fwd_max_anneal < 15:
-        warnings.append(f"Forward tail ({len(fwd_tail)}bp) very long \u2014 annealing limited to {fwd_max_anneal}bp")
-        fwd_max_anneal = max(fwd_max_anneal, 10)
+        warnings.append(f"Forward tail ({len(fwd_tail)}bp) very long — annealing limited to {fwd_max_anneal}bp")
 
-    fwd_anneal = ""
-    fwd_tm = 0.0
-    for anneal_len in range(15, min(31, fwd_max_anneal + 1)):
-        candidate = _get_seq_region(template_seq, insertion_pos, anneal_len)
-        tm = _calc_tm(candidate)
-        fwd_anneal = candidate
-        fwd_tm = tm
-        if tm >= tm_target:
-            break
+    fwd_candidates = _generate_primer_candidates(
+        template_seq, insertion_pos, "forward", fwd_tail, tm_target,
+        min_len=max(10, min(15, fwd_max_anneal)), max_total=max_len,
+    )
+    fwd_primer = _pick_best_with_alternatives(fwd_candidates, "Forward")
 
-    # Reverse annealing
+    # Reverse primer: tail = RC of second half of insert, annealing into template upstream
     rev_max_anneal = max_len - len(rev_tail)
     if rev_max_anneal < 15:
-        warnings.append(f"Reverse tail ({len(rev_tail)}bp) very long \u2014 annealing limited to {rev_max_anneal}bp")
-        rev_max_anneal = max(rev_max_anneal, 10)
+        warnings.append(f"Reverse tail ({len(rev_tail)}bp) very long — annealing limited to {rev_max_anneal}bp")
 
-    rev_anneal = ""
-    rev_tm = 0.0
-    for anneal_len in range(15, min(31, rev_max_anneal + 1)):
-        bases = []
-        for i in range(anneal_len):
-            bases.append(template_seq[(insertion_pos - 1 - i) % tpl_len])
-        candidate = _reverse_complement("".join(bases))
-        tm = _calc_tm(candidate)
-        rev_anneal = candidate
-        rev_tm = tm
-        if tm >= tm_target:
-            break
+    rev_candidates = _generate_primer_candidates(
+        template_seq, insertion_pos, "reverse", rev_tail, tm_target,
+        min_len=max(10, min(15, rev_max_anneal)), max_total=max_len,
+    )
+    rev_primer = _pick_best_with_alternatives(rev_candidates, "Reverse")
 
-    fwd_full = fwd_tail + fwd_anneal
-    rev_full = rev_tail + rev_anneal
+    # Warnings from primer checks
+    if fwd_primer:
+        if fwd_primer.get("tm", 0) < tm_target - 5:
+            warnings.append(f"Forward annealing Tm ({fwd_primer['tm']}°C) below target range")
+        if fwd_primer.get("tm", 0) > tm_target + 5:
+            warnings.append(f"Forward annealing Tm ({fwd_primer['tm']}°C) above target range")
+        if fwd_primer.get("hairpin"):
+            warnings.append("Forward primer may form hairpin")
+        if fwd_primer.get("homodimer_dg", 0) < -7.0:
+            warnings.append(f"Forward primer has strong self-dimer (ΔG = {fwd_primer['homodimer_dg']} kcal/mol)")
+    if rev_primer:
+        if rev_primer.get("tm", 0) < tm_target - 5:
+            warnings.append(f"Reverse annealing Tm ({rev_primer['tm']}°C) below target range")
+        if rev_primer.get("tm", 0) > tm_target + 5:
+            warnings.append(f"Reverse annealing Tm ({rev_primer['tm']}°C) above target range")
+        if rev_primer.get("hairpin"):
+            warnings.append("Reverse primer may form hairpin")
+        if rev_primer.get("homodimer_dg", 0) < -7.0:
+            warnings.append(f"Reverse primer has strong self-dimer (ΔG = {rev_primer['homodimer_dg']} kcal/mol)")
 
-    if len(fwd_full) > max_len:
-        warnings.append(f"Forward primer ({len(fwd_full)}bp) exceeds {max_len}bp limit")
-    if len(rev_full) > max_len:
-        warnings.append(f"Reverse primer ({len(rev_full)}bp) exceeds {max_len}bp limit")
-    if fwd_tm < tm_target - 5:
-        warnings.append(f"Forward annealing Tm ({fwd_tm}\u00b0C) below target range")
-    if fwd_tm > tm_target + 5:
-        warnings.append(f"Forward annealing Tm ({fwd_tm}\u00b0C) above target range")
-    if rev_tm < tm_target - 5:
-        warnings.append(f"Reverse annealing Tm ({rev_tm}\u00b0C) below target range")
-    if rev_tm > tm_target + 5:
-        warnings.append(f"Reverse annealing Tm ({rev_tm}\u00b0C) above target range")
     if split_gc_score < 0.25:
-        warnings.append("Low GC at insert split junction \u2014 ligation efficiency may be reduced")
+        warnings.append("Low GC at insert split junction — ligation efficiency may be reduced")
     if ins_len > max_len * 2 - 30:
-        warnings.append(f"Insert ({ins_len}bp) is long \u2014 tails may crowd out annealing regions")
+        warnings.append(f"Insert ({ins_len}bp) is long — tails may crowd out annealing regions")
 
     product = template_seq[:insertion_pos] + insert_seq + template_seq[insertion_pos:]
 
     return {
-        "forward": {
-            "full_seq": fwd_full, "tail": fwd_tail, "annealing": fwd_anneal,
-            "tm": fwd_tm, "length": len(fwd_full),
-            "gc_percent": round(_gc_content(fwd_full) * 100, 1),
-        },
-        "reverse": {
-            "full_seq": rev_full, "tail": rev_tail, "annealing": rev_anneal,
-            "tm": rev_tm, "length": len(rev_full),
-            "gc_percent": round(_gc_content(rev_full) * 100, 1),
-        },
+        "forward": fwd_primer,
+        "reverse": rev_primer,
         "split_position": best_split,
         "split_gc_score": split_gc_score,
         "insert_length": ins_len,
@@ -601,6 +585,10 @@ def evaluate_custom_primer(template_seq, start, end, direction):
         "tm": tm,
         "length": len(primer_seq),
         "gc_percent": round(_gc_content(primer_seq) * 100, 1),
+        "delta_g": _calc_delta_g(primer_seq, temp_c=tm if tm > 0 else 60.0),
+        "homodimer_dg": _calc_homodimer_dg(primer_seq, temp_c=60.0),
+        "hairpin": _has_hairpin(primer_seq),
+        "self_dimer": _has_self_dimer(primer_seq),
         "quality": quality,
     }
 
@@ -615,49 +603,39 @@ def design_pcr_primers(template_seq, target_start, target_end, tm_target=62.0):
     if target_start < 0 or target_end > tpl_len or target_start >= target_end:
         raise HTTPException(400, f"Invalid target region ({target_start}-{target_end}), template is {tpl_len}bp")
 
-    # Design forward primer starting at target_start
-    fwd = _design_annealing_region(template_seq, target_start, "forward", tm_target)
+    # Design forward primer candidates at target_start (no tail for PCR)
+    fwd_candidates = _generate_primer_candidates(template_seq, target_start, "forward", "", tm_target)
+    fwd = _pick_best_with_alternatives(fwd_candidates, "Forward")
 
-    # Design reverse primer ending at target_end
-    rev = _design_annealing_region(template_seq, target_end, "reverse", tm_target)
+    # Design reverse primer candidates at target_end
+    rev_candidates = _generate_primer_candidates(template_seq, target_end, "reverse", "", tm_target)
+    rev = _pick_best_with_alternatives(rev_candidates, "Reverse")
 
-    # Amplicon: from fwd primer start to rev primer end
-    amplicon_length = target_end - target_start + rev["length"]
-    # Actually, the fwd primer starts at target_start and the rev primer
-    # anneals ending at target_end, so amplicon = target region + overhangs
-    # More precisely, amplicon = distance between the two primer 3' ends
-    amplicon_length = (target_end - target_start)
-    # But the primers extend outward, so actual amplicon includes primer regions
-    # Fwd starts at target_start, Rev ends at target_end
-    # The PCR product goes from fwd 5' end to rev 5' end
-    # Fwd 5' = target_start, Fwd 3' = target_start + fwd_len
-    # Rev 5' = target_end, Rev 3' = target_end - rev_len (on top strand)
-    # Product = target_start to target_end = target region
     total_amplicon = target_end - target_start
 
     # Tm difference between primers
     tm_diff = abs(fwd["tm"] - rev["tm"])
     warnings = []
     if tm_diff > 5:
-        warnings.append(f"Tm difference between primers is {tm_diff:.1f}\u00b0C \u2014 ideally <5\u00b0C")
+        warnings.append(f"Tm difference between primers is {tm_diff:.1f}°C — ideally <5°C")
+    if fwd.get("hairpin"):
+        warnings.append("Forward primer may form hairpin")
+    if fwd.get("homodimer_dg", 0) < -7.0:
+        warnings.append(f"Forward primer has strong self-dimer (ΔG = {fwd['homodimer_dg']} kcal/mol)")
+    if rev.get("hairpin"):
+        warnings.append("Reverse primer may form hairpin")
+    if rev.get("homodimer_dg", 0) < -7.0:
+        warnings.append(f"Reverse primer has strong self-dimer (ΔG = {rev['homodimer_dg']} kcal/mol)")
+
+    # Add seq alias and position for frontend compatibility
+    fwd["seq"] = fwd["full_seq"]
+    fwd["position"] = target_start
+    rev["seq"] = rev["full_seq"]
+    rev["position"] = target_end
 
     return {
-        "forward": {
-            "seq": fwd["seq"],
-            "tm": fwd["tm"],
-            "length": fwd["length"],
-            "gc_percent": fwd["gc_percent"],
-            "position": target_start,
-            "quality": fwd["quality"],
-        },
-        "reverse": {
-            "seq": rev["seq"],
-            "tm": rev["tm"],
-            "length": rev["length"],
-            "gc_percent": rev["gc_percent"],
-            "position": target_end,
-            "quality": rev["quality"],
-        },
+        "forward": fwd,
+        "reverse": rev,
         "amplicon_length": total_amplicon,
         "target_length": target_end - target_start,
         "tm_diff": round(tm_diff, 1),
@@ -694,24 +672,22 @@ def design_seq_primers(template_seq, region_start, region_end, read_length=900, 
 
     idx = 0
     while pos < region_end:
-        # Design a forward primer at this position
-        p = _design_annealing_region(template_seq, pos, "forward", tm_target)
+        # Design primer candidates at this position (no tail for sequencing primers)
+        candidates = _generate_primer_candidates(template_seq, pos, "forward", "", tm_target)
+        best = _pick_best_with_alternatives(candidates, f"Seq_{idx + 1}")
         read_start = pos
         read_end = min(pos + read_length, tpl_len)
 
-        primers.append({
-            "index": idx + 1,
-            "position": pos,
-            "direction": "forward",
-            "seq": p["seq"],
-            "tm": p["tm"],
-            "length": p["length"],
-            "gc_percent": p["gc_percent"],
-            "quality": p["quality"],
-            "read_covers": f"{read_start}-{read_end}",
-            "effective_start": pos + 50,
-            "effective_end": min(pos + read_length, tpl_len),
-        })
+        if best:
+            # Add seq alias and sequencing-specific fields for frontend compatibility
+            best["seq"] = best["full_seq"]
+            best["index"] = idx + 1
+            best["position"] = pos
+            best["direction"] = "forward"
+            best["read_covers"] = f"{read_start}-{read_end}"
+            best["effective_start"] = pos + 50
+            best["effective_end"] = min(pos + read_length, tpl_len)
+            primers.append(best)
 
         pos += step
         idx += 1
@@ -1437,36 +1413,19 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
 
         # Forward primer for downstream fragment: tail = end of upstream, annealing = start of downstream
         fwd_tail = up_tail
-        max_fwd_anneal = 60 - len(fwd_tail)
-        fwd_anneal = _design_annealing_region(down_seq, 0, "forward", tm_target, max_len=max_fwd_anneal)
-        fwd_full = fwd_tail + fwd_anneal["seq"]
+        fwd_candidates = _generate_primer_candidates(down_seq, 0, "forward", fwd_tail, tm_target, max_total=60)
+        fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{down_name}_Fwd")
 
         # Reverse primer for upstream fragment: tail = RC of start of downstream, annealing = RC of end of upstream
         rev_tail = _reverse_complement(down_tail)
-        max_rev_anneal = 60 - len(rev_tail)
-        rev_anneal = _design_annealing_region(up_seq, len(up_seq), "reverse", tm_target, max_len=max_rev_anneal)
-        rev_full = rev_tail + rev_anneal["seq"]
+        rev_candidates = _generate_primer_candidates(up_seq, len(up_seq), "reverse", rev_tail, tm_target, max_total=60)
+        rev_primer = _pick_best_with_alternatives(rev_candidates, f"{up_name}_Rev")
 
-        fwd_full = _ensure_gc_clamp(fwd_full, max_len=60)
-        rev_full = _ensure_gc_clamp(rev_full, max_len=60)
-
-        for seq, name in [(fwd_full, f"{down_name}_Fwd"), (rev_full, f"{up_name}_Rev")]:
-            if _has_hairpin(seq):
-                warnings.append(f"{name} may form hairpin")
-            if _has_self_dimer(seq):
-                warnings.append(f"{name} may form self-dimer")
-        fwd_primer = {
-            "name": f"{down_name}_Fwd",
-            "full_seq": fwd_full, "tail": fwd_tail, "annealing": fwd_anneal["seq"],
-            "tm": fwd_anneal["tm"], "length": len(fwd_full),
-            "gc_percent": round(_gc_content(fwd_full) * 100, 1),
-        }
-        rev_primer = {
-            "name": f"{up_name}_Rev",
-            "full_seq": rev_full, "tail": rev_tail, "annealing": rev_anneal["seq"],
-            "tm": rev_anneal["tm"], "length": len(rev_full),
-            "gc_percent": round(_gc_content(rev_full) * 100, 1),
-        }
+        for p, pname in [(fwd_primer, f"{down_name}_Fwd"), (rev_primer, f"{up_name}_Rev")]:
+            if p and p.get("hairpin"):
+                warnings.append(f"{pname} may form hairpin")
+            if p and p.get("homodimer_dg", 0) < -7.0:
+                warnings.append(f"{pname} has strong self-dimer (ΔG = {p['homodimer_dg']} kcal/mol)")
 
         junctions.append({
             "name": f"{up_name}→{down_name}",
@@ -1533,6 +1492,141 @@ def _has_self_dimer(seq, min_match=4):
         if kmer in rc:
             return True
     return False
+
+def _calc_homodimer_dg(seq: str, temp_c: float = 60.0) -> float:
+    """Calculate the most stable self-dimer ΔG by sliding the primer against its own RC.
+    In a self-dimer, two copies of the same primer align antiparallel. This is
+    equivalent to aligning seq against reverse_complement(seq) and finding positions
+    where bases are IDENTICAL (meaning the original bases are Watson-Crick pairs).
+    Returns the most negative (most stable) ΔG found across all alignments."""
+    seq = seq.upper()
+    rc = _reverse_complement(seq)
+    n = len(seq)
+    if n < 4:
+        return 0.0
+
+    best_dg = 0.0  # 0 = no interaction; more negative = worse dimer
+
+    # Slide rc across seq in all possible alignments (at least 4bp overlap)
+    for offset in range(-(n - 4), n - 3):
+        # Determine overlap region
+        if offset < 0:
+            s_start = 0
+            r_start = -offset
+        else:
+            s_start = offset
+            r_start = 0
+        overlap_len = min(n - s_start, n - r_start)
+        if overlap_len < 4:
+            continue
+
+        # Find contiguous matched stretches and compute ΔG
+        match_dh = 0.0
+        match_ds = 0.0
+        match_count = 0
+
+        for i in range(overlap_len - 1):
+            sb = seq[s_start + i]
+            rb = rc[r_start + i]
+            sb2 = seq[s_start + i + 1]
+            rb2 = rc[r_start + i + 1]
+            # Self-dimer base pair: seq base equals RC base → original bases are complementary
+            if sb == rb and sb2 == rb2:
+                pair = sb + sb2
+                if pair in NN_THERMO:
+                    h, s = NN_THERMO[pair]
+                    match_dh += h
+                    match_ds += s
+                match_count += 1
+
+        if match_count >= 2:
+            temp_k = temp_c + 273.15
+            dg = match_dh - (temp_k * match_ds / 1000.0)
+            if dg < best_dg:
+                best_dg = dg
+
+    return round(best_dg, 2)
+
+
+def _generate_primer_candidates(template: str, pos: int, direction: str, tail: str,
+                                 tm_target: float, min_len: int = 18, max_len: int = 28,
+                                 max_total: int = 60) -> list:
+    """Generate multiple primer candidates with different annealing lengths.
+    Returns a list of candidate dicts sorted by score (best first), each containing
+    full primer properties including dimer/hairpin/ΔG analysis."""
+    tpl_len = len(template)
+    candidates = []
+
+    # Constrain annealing length so total primer doesn't exceed max_total
+    tail_len = len(tail)
+    effective_max = min(max_len, max_total - tail_len)
+    if effective_max < min_len:
+        effective_max = min_len  # at least try one
+
+    for anneal_len in range(min_len, effective_max + 1):
+        if direction == "forward":
+            anneal_seq = _get_seq_region(template, pos, anneal_len)
+        else:
+            bases = []
+            for i in range(anneal_len):
+                bases.append(template[(pos - 1 - i) % tpl_len])
+            anneal_seq = _reverse_complement("".join(bases))
+
+        full_seq = tail + anneal_seq
+        tm = _calc_tm(anneal_seq)
+        gc = round(_gc_content(full_seq) * 100, 1)
+        dg = _calc_delta_g(anneal_seq, temp_c=tm if tm > 0 else 60.0)
+        homodimer_dg = _calc_homodimer_dg(full_seq, temp_c=60.0)
+        hairpin = _has_hairpin(full_seq)
+        self_dimer = _has_self_dimer(full_seq)
+        quality = _check_primer_quality(anneal_seq, tm)
+
+        # Score: lower is better
+        # Penalise Tm deviation, strong homodimers, hairpins, poor GC
+        tm_penalty = abs(tm - tm_target) * 2.0
+        dimer_penalty = max(0, -homodimer_dg - 5.0) * 3.0  # penalise ΔG < -5 kcal/mol
+        hairpin_penalty = 5.0 if hairpin else 0.0
+        gc_penalty = max(0, abs(gc - 50) - 10) * 0.5  # penalise GC outside 40-60
+        score = tm_penalty + dimer_penalty + hairpin_penalty + gc_penalty
+
+        candidates.append({
+            "full_seq": full_seq,
+            "tail": tail,
+            "annealing": anneal_seq,
+            "tm": tm,
+            "length": len(full_seq),
+            "gc_percent": gc,
+            "delta_g": dg,
+            "homodimer_dg": homodimer_dg,
+            "hairpin": hairpin,
+            "self_dimer": self_dimer,
+            "quality": quality,
+            "score": round(score, 2),
+        })
+
+    # Sort by score (best first)
+    candidates.sort(key=lambda c: c["score"])
+    return candidates
+
+
+def _pick_best_with_alternatives(candidates: list, name: str, max_alternatives: int = 5) -> dict:
+    """From a sorted list of candidates, pick the best and attach ALL other candidates
+    as alternatives so the user can compare trade-offs.
+    Returns the best candidate dict with a 'name' and 'alternatives' key added."""
+    if not candidates:
+        return None
+    best = dict(candidates[0])
+    best["name"] = name
+    alts = []
+    for c in candidates[1:]:
+        if len(alts) >= max_alternatives:
+            break
+        alt = dict(c)
+        alt["name"] = name
+        alts.append(alt)
+    best["alternatives"] = alts
+    return best
+
 
 def design_golden_gate(bins: list = None, fragments: list = None, vector: dict = None,
                        enzyme: str = "BsaI", circular: bool = True,
@@ -1624,27 +1718,22 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
         for f in b["fragments"]:
             s = f["_seq"]
             # Forward primer: spacer + site + left_overhang + annealing
-            fwd_anneal = _design_annealing_region(s, 0, "forward", tm_target)
             fwd_tail = spacer + site + left_oh
-            fwd_full = fwd_tail + fwd_anneal["seq"]
+            fwd_candidates = _generate_primer_candidates(s, 0, "forward", fwd_tail, tm_target)
+            fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{f['name']}_Fwd_{enzyme}")
 
             # Reverse primer: spacer + RC(site) + RC(right_overhang) + annealing
-            rev_anneal = _design_annealing_region(s, len(s), "reverse", tm_target)
             rev_tail = spacer + rc_site + _reverse_complement(right_oh)
-            rev_full = rev_tail + rev_anneal["seq"]
+            rev_candidates = _generate_primer_candidates(s, len(s), "reverse", rev_tail, tm_target)
+            rev_primer = _pick_best_with_alternatives(rev_candidates, f"{f['name']}_Rev_{enzyme}")
 
-            fwd_primer = {
-                "name": f"{f['name']}_Fwd_{enzyme}",
-                "full_seq": fwd_full, "tail": fwd_tail, "annealing": fwd_anneal["seq"],
-                "tm": fwd_anneal["tm"], "length": len(fwd_full),
-                "gc_percent": round(_gc_content(fwd_full) * 100, 1),
-            }
-            rev_primer = {
-                "name": f"{f['name']}_Rev_{enzyme}",
-                "full_seq": rev_full, "tail": rev_tail, "annealing": rev_anneal["seq"],
-                "tm": rev_anneal["tm"], "length": len(rev_full),
-                "gc_percent": round(_gc_content(rev_full) * 100, 1),
-            }
+            # Add hairpin/dimer warnings
+            for p, pname in [(fwd_primer, f"{f['name']}_Fwd"), (rev_primer, f"{f['name']}_Rev")]:
+                if p and p.get("hairpin"):
+                    warnings.append(f"{pname} may form hairpin")
+                if p and p.get("homodimer_dg", 0) < -7.0:
+                    warnings.append(f"{pname} has strong self-dimer (ΔG = {p['homodimer_dg']} kcal/mol)")
+
             frag_results.append({
                 "name": f["name"],
                 "length": len(s),
@@ -1666,31 +1755,17 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
     vec_primers = None
     if has_vec:
         # Vector fwd: after last bin → vector start
-        # Uses overhang[0] on fwd side
-        vec_fwd_anneal = _design_annealing_region(vec_seq, 0, "forward", tm_target)
         vec_fwd_tail = spacer + site + overhangs[0]
-        vec_fwd_full = vec_fwd_tail + vec_fwd_anneal["seq"]
+        vec_fwd_candidates = _generate_primer_candidates(vec_seq, 0, "forward", vec_fwd_tail, tm_target)
+        vec_fwd = _pick_best_with_alternatives(vec_fwd_candidates, f"{vector.get('name', 'Vector')}_Fwd_{enzyme}")
 
         # Vector rev: before first bin → vector end
         vec_rev_oh_idx = oh_offset  # = 1
-        vec_rev_anneal = _design_annealing_region(vec_seq, len(vec_seq), "reverse", tm_target)
         vec_rev_tail = spacer + rc_site + _reverse_complement(overhangs[vec_rev_oh_idx])
-        vec_rev_full = vec_rev_tail + vec_rev_anneal["seq"]
+        vec_rev_candidates = _generate_primer_candidates(vec_seq, len(vec_seq), "reverse", vec_rev_tail, tm_target)
+        vec_rev = _pick_best_with_alternatives(vec_rev_candidates, f"{vector.get('name', 'Vector')}_Rev_{enzyme}")
 
-        vec_primers = {
-            "fwd": {
-                "name": f"{vector.get('name', 'Vector')}_Fwd_{enzyme}",
-                "full_seq": vec_fwd_full, "tail": vec_fwd_tail, "annealing": vec_fwd_anneal["seq"],
-                "tm": vec_fwd_anneal["tm"], "length": len(vec_fwd_full),
-                "gc_percent": round(_gc_content(vec_fwd_full) * 100, 1),
-            },
-            "rev": {
-                "name": f"{vector.get('name', 'Vector')}_Rev_{enzyme}",
-                "full_seq": vec_rev_full, "tail": vec_rev_tail, "annealing": vec_rev_anneal["seq"],
-                "tm": vec_rev_anneal["tm"], "length": len(vec_rev_full),
-                "gc_percent": round(_gc_content(vec_rev_full) * 100, 1),
-            },
-        }
+        vec_primers = {"fwd": vec_fwd, "rev": vec_rev}
         all_primers.append(vec_primers["fwd"])
         all_primers.append(vec_primers["rev"])
 
@@ -1835,31 +1910,31 @@ def design_digest_ligate(vector: dict, insert: dict, enzyme1: str, enzyme2: str 
     primers = []
     if design_primers and compatible:
         # Forward primer: RE site + annealing to insert start
-        fwd_anneal = _design_annealing_region(ins_seq, 0, "forward", tm_target)
         e1_info_dict = enzyme_info.get(enzyme1, {})
         e1_site = e1_info_dict.get("site", "")
         fwd_tail = "GA" + e1_site  # spacer + recognition site
-        fwd_full = fwd_tail + fwd_anneal["seq"]
-        primers.append({
-            "name": f"{ins_name}_Fwd_{enzyme1}",
-            "full_seq": fwd_full, "tail": fwd_tail, "annealing": fwd_anneal["seq"],
-            "tm": fwd_anneal["tm"], "length": len(fwd_full),
-            "gc_percent": round(_gc_content(fwd_full) * 100, 1),
-        })
+        fwd_candidates = _generate_primer_candidates(ins_seq, 0, "forward", fwd_tail, tm_target)
+        fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{ins_name}_Fwd_{enzyme1}")
+        if fwd_primer:
+            primers.append(fwd_primer)
+            if fwd_primer.get("hairpin"):
+                warnings.append(f"{ins_name}_Fwd may form hairpin")
+            if fwd_primer.get("homodimer_dg", 0) < -7.0:
+                warnings.append(f"{ins_name}_Fwd has strong self-dimer (ΔG = {fwd_primer['homodimer_dg']} kcal/mol)")
 
         # Reverse primer: RE site + annealing to insert end
-        rev_anneal = _design_annealing_region(ins_seq, len(ins_seq), "reverse", tm_target)
         e2_name = enzyme2 or enzyme1
         e2_info_dict = enzyme_info.get(e2_name, {})
         e2_site = e2_info_dict.get("site", "")
         rev_tail = "GA" + _reverse_complement(e2_site) if e2_site else "GA"
-        rev_full = rev_tail + rev_anneal["seq"]
-        primers.append({
-            "name": f"{ins_name}_Rev_{e2_name}",
-            "full_seq": rev_full, "tail": rev_tail, "annealing": rev_anneal["seq"],
-            "tm": rev_anneal["tm"], "length": len(rev_full),
-            "gc_percent": round(_gc_content(rev_full) * 100, 1),
-        })
+        rev_candidates = _generate_primer_candidates(ins_seq, len(ins_seq), "reverse", rev_tail, tm_target)
+        rev_primer = _pick_best_with_alternatives(rev_candidates, f"{ins_name}_Rev_{e2_name}")
+        if rev_primer:
+            primers.append(rev_primer)
+            if rev_primer.get("hairpin"):
+                warnings.append(f"{ins_name}_Rev may form hairpin")
+            if rev_primer.get("homodimer_dg", 0) < -7.0:
+                warnings.append(f"{ins_name}_Rev has strong self-dimer (ΔG = {rev_primer['homodimer_dg']} kcal/mol)")
 
     # Build ligation product
     product_seq = vec_seq  # simplified: backbone + insert
