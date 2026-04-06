@@ -482,28 +482,19 @@ def design_kld_primers(body: dict):
     search_range = range(start_pos, end_pos + 1) if optimize else [start_pos]
 
     for t_junction in search_range:
-        # For KLD: 
-        # Rev primer anneals UPSTREAM of the cut (template[:t_junction])
-        # Fwd primer anneals DOWNSTREAM of the cut (template[end_pos + (t_junction - start_pos):])
-        # Wait, the most common 'chop' use case:
-        # User wants to remove everything between START and END.
-        # If optimizing is OFF: we remove exactly start -> end.
-        # If optimizing is ON: we assume the user is looking for the best site *within* that range
-        # to perform a clean insertion, OR we shift the fixed-width window.
-        
-        # Let's implement: Remove sequence between 'start' and 'end' 
-        # BUT if optimize is ON, we allow the 'cut' to move anywhere in that range.
-        
-        actual_start = t_junction if optimize else start_pos
+        # actual_start is where the REVERSE primer anneals (facing left)
+        # actual_end is where the FORWARD primer anneals (facing right)
+        # The sequence between them is what gets DELETED.
+        actual_start = t_junction
         actual_end = t_junction if optimize else end_pos
 
-        # Iteratively try every split point of the INSERT sequence
         ins_len = len(insert_seq)
-        # If insert is empty (pure deletion), we just have one 'split' point
         split_points = range(ins_len + 1) if ins_len > 0 else [0]
 
         for sp in split_points:
+            # The Forward primer gets the END of the insert
             fwd_tail = insert_seq[sp:]
+            # The Reverse primer gets the START of the insert (RC'd)
             rev_tail = _reverse_complement(insert_seq[:sp])
             
             f_max_ann = max_len - len(fwd_tail)
@@ -511,12 +502,12 @@ def design_kld_primers(body: dict):
             
             if f_max_ann < 12 or r_max_ann < 12: continue
             
-            # Fwd primer anneals starting at 'actual_end'
+            # Fwd anneals to the template AFTER the deleted region
             f_cands = _generate_primer_candidates(
                 template_seq, actual_end, "forward", fwd_tail, tm_target,
                 min_len=12, max_len=f_max_ann, max_total=max_len
             )
-            # Rev primer anneals starting at 'actual_start'
+            # Rev anneals to the template BEFORE the deleted region
             r_cands = _generate_primer_candidates(
                 template_seq, actual_start, "reverse", rev_tail, tm_target,
                 min_len=12, max_len=r_max_ann, max_total=max_len
@@ -2367,10 +2358,16 @@ def digest_ligate_endpoint(body: DigestLigateRequest):
 # ---------------------------------------------------------------------------
 @router.post("/cloning/design-kld-primers")
 def kld_endpoint(body: KLDRequest):
+    # We map the Pydantic model fields to the new design_kld_primers function.
+    # We use 'start_pos' and 'end_pos' for the range logic.
     return design_kld_primers(
         template_seq=body.template_seq,
-        insertion_pos=body.insertion_pos,
         insert_seq=body.insert_seq,
+        # Use start/end if provided, otherwise fallback to insertion_pos
+        start_pos=getattr(body, 'start_pos', body.insertion_pos),
+        end_pos=getattr(body, 'end_pos', body.insertion_pos),
+        # Use the optimize flag if your KLDRequest model has it, else False
+        optimize=getattr(body, 'optimize', False),
         tm_target=body.annealing_tm_target or 62.0,
         max_len=body.max_primer_length or 60,
     )
