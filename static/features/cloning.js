@@ -42,7 +42,9 @@ var _cl = {
         maxLen: 60,
         optimize: false,
         result: null, 
-        designing: false 
+        designing: false,
+        selectedFwdIdx: 0,
+        selectedRevIdx: 0
     },
   },
   // Sequence analysis
@@ -129,6 +131,8 @@ function _clSelectSequence(type, id) {
   _cl.pd.pcr.result = null;
   _cl.pd.seq.result = null;
   _cl.pd.kld.result = null;
+  _cl.pd.kld.selectedFwdIdx = 0;
+  _cl.pd.kld.selectedRevIdx = 0;
   _cl.pd._viewingProduct = false;
   _cl.pd._productPreview = null;
   _cl.pd._productBaseBody = null;
@@ -199,12 +203,17 @@ function _clRenderSeqViz() {
       var r = pd.kld.result;
       var rStart = parseInt(r.start_used, 10);
       var rEnd = parseInt(r.end_used, 10);
+      // Use selected primer annealing length for map markers
+      var selF = _pdKldGetSelected('fwd');
+      var selR = _pdKldGetSelected('rev');
+      var fwdAnnLen = selF ? selF.annealing.length : r.forward.annealing.length;
+      var revAnnLen = selR ? selR.annealing.length : r.reverse.annealing.length;
       if (!isNaN(rEnd)) {
-        var fAnnEnd = (rEnd + r.forward.annealing.length) % seqLen;
+        var fAnnEnd = (rEnd + fwdAnnLen) % seqLen;
         annotations.push({ name: 'Fwd anneal', start: rEnd, end: fAnnEnd > rEnd ? fAnnEnd : fAnnEnd || seqLen, direction: 1, color: '#2980b9' });
       }
       if (!isNaN(rStart)) {
-        var rAnnStart = ((rStart - r.reverse.annealing.length) % seqLen + seqLen) % seqLen;
+        var rAnnStart = ((rStart - revAnnLen) % seqLen + seqLen) % seqLen;
         annotations.push({ name: 'Rev anneal', start: rAnnStart, end: rStart, direction: -1, color: '#8e44ad' });
       }
     }
@@ -1001,7 +1010,35 @@ h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Li
     h += '</div>';
   }
 
-  h += '<div style="margin-top:.6rem;"><button onclick="_pdKldDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (k.designing ? 'opacity:.6;pointer-events:none;' : '') + '">' + (k.designing ? '\u23f3 Designing\u2026' : '\u2702\ufe0f Design KLD Primers') + '</button></div>';
+  // Complexity estimate
+  var kldS = parseInt(k.startPos, 10) || 0;
+  var kldE = parseInt(k.endPos || k.startPos, 10) || 0;
+  var kldRange = Math.max(1, Math.abs(kldE - kldS) + 1);
+  var kldInsLen = _clCleanSeq(k.insertSeq || '').length;
+  var kldSplits = kldInsLen > 0 ? kldInsLen + 1 : 1;
+  if (k.optimize && kldRange > 1) {
+    var kldPairs = kldRange * (kldRange + 1) / 2;
+    var kldTotal = kldPairs * kldSplits;
+    var kldEst = Math.ceil(kldRange * kldSplits * 2 / 800); // rough: ~800 candidate gen calls/sec
+    h += '<div style="font-size:.72rem;color:#8a7f72;margin-top:.5rem;padding:.4rem .6rem;background:#eef4ee;border-radius:4px;border:1px solid #d5cec0;">';
+    h += '\ud83d\udd0d Search space: <strong style="color:#4a4139;">' + kldRange + '</strong> positions \u00d7 <strong style="color:#4a4139;">' + kldSplits + '</strong> splits = <strong style="color:#4a4139;">' + kldPairs.toLocaleString() + '</strong> junction pairs \u00b7 ~' + kldTotal.toLocaleString() + ' combos';
+    if (kldEst > 2) h += ' \u00b7 est. <strong style="color:#5b7a5e;">~' + kldEst + 's</strong>';
+    h += '</div>';
+  }
+
+  h += '<div style="margin-top:.6rem;">';
+  h += '<button onclick="_pdKldDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (k.designing ? 'opacity:.6;pointer-events:none;' : '') + '">' + (k.designing ? '\u23f3 Designing\u2026' : '\u2702\ufe0f Design KLD Primers') + '</button>';
+  h += '</div>';
+
+  // Progress bar during design
+  if (k.designing) {
+    h += '<div id="cl-kld-progress-wrap" style="margin-top:.5rem;">';
+    h += '<div style="height:6px;background:#e8e2d8;border-radius:3px;overflow:hidden;">';
+    h += '<div id="cl-kld-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#5b7a5e,#2980b9);border-radius:3px;transition:width 0.3s ease;"></div>';
+    h += '</div>';
+    h += '<div id="cl-kld-progress-text" style="font-size:.68rem;color:#8a7f72;margin-top:.2rem;">Generating primer candidates\u2026</div>';
+    h += '</div>';
+  }
 
   if (k.result) { h += _clRenderKLDResult(k.result); }
   return h;
@@ -1019,22 +1056,27 @@ function _clRenderKLDResult(r) {
   var kldStart = parseInt(r.start_used, 10) || parseInt(_cl.pd.kld.startPos, 10) || 0;
   var kldEnd = parseInt(r.end_used, 10) || parseInt(_cl.pd.kld.endPos, 10) || 0;
   var kldSeqLen = _cl.parsed ? _cl.parsed.length : 99999;
+
+  // Get selected primers (may differ from best if user clicked an alternative)
+  var selFwd = _pdKldGetSelected('fwd');
+  var selRev = _pdKldGetSelected('rev');
   
   h += _clRenderTailedPrimer('Forward', r.forward, '#2980b9', 'kld-fwd', {
     name: 'KLD Fwd anneal', 
     start: kldEnd, 
-    end: Math.min(kldEnd + r.forward.annealing.length, kldSeqLen),
+    end: Math.min(kldEnd + (selFwd ? selFwd.annealing.length : r.forward.annealing.length), kldSeqLen),
     direction: 1, color: '#2980b9', type: 'primer_bind'
-  });
+  }, { direction: 'fwd', selectedIdx: _cl.pd.kld.selectedFwdIdx });
   
   // Reverse
-  var revAnnStart = ((kldStart - r.reverse.annealing.length) % kldSeqLen + kldSeqLen) % kldSeqLen;
+  var revAnnLen = selRev ? selRev.annealing.length : r.reverse.annealing.length;
+  var revAnnStart = ((kldStart - revAnnLen) % kldSeqLen + kldSeqLen) % kldSeqLen;
   h += _clRenderTailedPrimer('Reverse', r.reverse, '#8e44ad', 'kld-rev', {
     name: 'KLD Rev anneal', 
     start: revAnnStart, 
     end: kldStart,
     direction: -1, color: '#8e44ad', type: 'primer_bind'
-  });
+  }, { direction: 'rev', selectedIdx: _cl.pd.kld.selectedRevIdx });
 
   h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;padding:.5rem .7rem;background:#faf8f4;border:1px solid #e8e2d8;border-radius:5px;margin-top:.5rem;">';
   if (r.insert_length > 0) {
@@ -1049,10 +1091,21 @@ function _clRenderKLDResult(r) {
   h += '<button onclick="_pdGenerateProduct(\x27kld\x27)" style="padding:.3rem .6rem;font-size:.72rem;background:#8E44AD;color:#fff;border:none;border-radius:4px;cursor:pointer;" title="Generate circularised KLD product as new .gb plasmid">\ud83d\udd04 Generate Circular Product</button>';
   h += '</div>';
 
+  // Search stats
+  if (r.search_stats) {
+    var ss = r.search_stats;
+    h += '<div style="font-size:.66rem;color:#8a7f72;margin-top:.3rem;padding:.25rem .5rem;display:flex;gap:.8rem;flex-wrap:wrap;">';
+    h += '\ud83d\udd0d <span>Searched <strong>' + ss.junction_pairs.toLocaleString() + '</strong> junction pairs</span>';
+    h += '<span>\u00d7 <strong>' + ss.split_points + '</strong> split points</span>';
+    h += '<span>= <strong>' + ss.pairs_scored.toLocaleString() + '</strong> combos scored</span>';
+    h += '<span>(<strong>' + ss.candidates_generated.toLocaleString() + '</strong> primer candidates)</span>';
+    h += '</div>';
+  }
+
   var posLabel = kldEnd > kldStart ? kldStart + '-' + kldEnd : String(kldStart);
   h += _clRenderSaveBtn([
-    { seq: r.forward.full_seq, label: 'FWD KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at ' + posLabel },
-    { seq: r.reverse.full_seq, label: 'REV KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at ' + posLabel },
+    { seq: selFwd ? selFwd.full_seq : r.forward.full_seq, label: 'FWD KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at ' + posLabel },
+    { seq: selRev ? selRev.full_seq : r.reverse.full_seq, label: 'REV KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at ' + posLabel },
   ]);
   h += '</div>';
   return h;
@@ -1095,18 +1148,26 @@ function _clRenderSinglePrimer(label, p, accentColor, copyKey, featureData) {
 }
 
 // Tailed primer card (for KLD — shows tail + annealing split)
-function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData) {
+// selectInfo: optional { direction: 'fwd'|'rev', selectedIdx: N } for clickable row selection
+function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData, selectInfo) {
+  // If selectInfo is provided and a non-best primer is selected, show that primer's data in the header
+  var displayPrimer = p;
+  if (selectInfo && selectInfo.selectedIdx > 0 && p.alternatives) {
+    var allOpts = [p].concat(p.alternatives);
+    if (allOpts[selectInfo.selectedIdx]) displayPrimer = allOpts[selectInfo.selectedIdx];
+  }
+
   var h = '';
   h += '<div style="border:1px solid #e8e2d8;border-radius:5px;overflow:hidden;margin-bottom:.5rem;border-left:3px solid ' + accentColor + ';">';
   h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.4rem .65rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;">';
   h += '<div><span style="font-weight:600;font-size:.8rem;color:#4a4139;">' + esc(label) + '</span>';
-  h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + p.length + 'bp \u00b7 Tm ' + p.tm + '\u00b0C \u00b7 GC ' + p.gc_percent + '%</span>';
+  h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + displayPrimer.length + 'bp \u00b7 Tm ' + displayPrimer.tm + '\u00b0C \u00b7 GC ' + displayPrimer.gc_percent + '%</span>';
   // Show dimer/hairpin badges if data is present
-  if (typeof p.homodimer_dg === 'number') {
-    var dimerColor = p.homodimer_dg < -9.5 ? '#c0392b' : p.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
-    h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (p.homodimer_dg < -7 ? '#fde8e8' : p.homodimer_dg < -5 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + p.homodimer_dg + '</span>';
+  if (typeof displayPrimer.homodimer_dg === 'number') {
+    var dimerColor = displayPrimer.homodimer_dg < -9.5 ? '#c0392b' : displayPrimer.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
+    h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (displayPrimer.homodimer_dg < -7 ? '#fde8e8' : displayPrimer.homodimer_dg < -5 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + displayPrimer.homodimer_dg + '</span>';
   }
-  if (p.hairpin) {
+  if (displayPrimer.hairpin) {
     h += '<span style="font-size:.66rem;margin-left:.3rem;padding:.1rem .35rem;border-radius:3px;background:#fde8e8;color:#c0392b;">hairpin</span>';
   }
   h += '</div>';
@@ -1119,19 +1180,20 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData) {
   h += '<button onclick="_pdCopy(\x27' + esc(copyKey) + '\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy</button>';
   h += '</div></div>';
   h += '<div style="padding:.45rem .65rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.78rem;line-height:1.7;">';
-  h += '<div style="display:flex;align-items:baseline;gap:.4rem;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">5\u2032 tail:</span><span style="color:' + accentColor + ';word-break:break-all;">' + esc(p.tail) + '</span><span style="font-size:.62rem;color:#8a7f72;">(' + p.tail.length + 'bp)</span></div>';
-  h += '<div style="display:flex;align-items:baseline;gap:.4rem;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">anneal:</span><span style="color:#4a4139;font-weight:500;word-break:break-all;">' + esc(p.annealing) + '</span><span style="font-size:.62rem;color:#8a7f72;">(' + p.annealing.length + 'bp)</span></div>';
-  h += '<div style="display:flex;align-items:baseline;gap:.4rem;margin-top:.25rem;padding-top:.25rem;border-top:1px solid #f0ebe3;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">full:</span><span style="word-break:break-all;"><span style="color:' + accentColor + ';">' + esc(p.tail) + '</span><span style="color:#4a4139;font-weight:600;">' + esc(p.annealing) + '</span></span></div>';
+  h += '<div style="display:flex;align-items:baseline;gap:.4rem;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">5\u2032 tail:</span><span style="color:' + accentColor + ';word-break:break-all;">' + esc(displayPrimer.tail) + '</span><span style="font-size:.62rem;color:#8a7f72;">(' + displayPrimer.tail.length + 'bp)</span></div>';
+  h += '<div style="display:flex;align-items:baseline;gap:.4rem;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">anneal:</span><span style="color:#4a4139;font-weight:500;word-break:break-all;">' + esc(displayPrimer.annealing) + '</span><span style="font-size:.62rem;color:#8a7f72;">(' + displayPrimer.annealing.length + 'bp)</span></div>';
+  h += '<div style="display:flex;align-items:baseline;gap:.4rem;margin-top:.25rem;padding-top:.25rem;border-top:1px solid #f0ebe3;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">full:</span><span style="word-break:break-all;"><span style="color:' + accentColor + ';">' + esc(displayPrimer.tail) + '</span><span style="color:#4a4139;font-weight:600;">' + esc(displayPrimer.annealing) + '</span></span></div>';
   h += '</div>';
 
   // Alternatives section
   if (p.alternatives && p.alternatives.length > 0) {
     var altKey = copyKey + '-alts';
     var isCollapsed = !!window._altExpanded[altKey];  // inverted: starts expanded, click to collapse
+    var selIdx = selectInfo ? selectInfo.selectedIdx : 0;
     h += '<div style="border-top:1px solid #e8e2d8;">';
     h += '<button onclick="_adToggleAlts(\x27' + esc(altKey) + '\x27)" style="display:flex;align-items:center;gap:.3rem;width:100%;padding:.35rem .65rem;font-size:.72rem;color:#5b7a5e;border:none;background:#eef4ee;cursor:pointer;text-align:left;font-weight:500;">';
     h += '<span style="font-size:.6rem;">' + (isCollapsed ? '\u25B6' : '\u25BC') + '</span>';
-    h += (p.alternatives.length + 1) + ' primer options \u2014 compare Tm vs dimer trade-offs';
+    h += (p.alternatives.length + 1) + ' primer options' + (selectInfo ? ' \u2014 click to show on map' : ' \u2014 compare Tm vs dimer trade-offs');
     h += '</button>';
     if (!isCollapsed) {
       h += '<div style="padding:.4rem .65rem .5rem;background:#faf8f4;">';
@@ -1150,23 +1212,27 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData) {
       var allOptions = [p].concat(p.alternatives);
       allOptions.forEach(function(opt, oi) {
         var isRec = (oi === 0);
+        var isSel = (oi === selIdx);
         var dimerC = opt.homodimer_dg < -7 ? '#c0392b' : opt.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
-        var rowBg = isRec ? 'background:#eef4ee;' : '';
-        h += '<tr style="border-bottom:1px solid #f0ebe3;' + rowBg + '">';
+        var rowBg = isSel ? 'background:#dbeafe;' : isRec ? 'background:#eef4ee;' : '';
+        var rowCursor = selectInfo ? 'cursor:pointer;' : '';
+        var rowClick = selectInfo ? ' onclick="_pdKldSelectPrimer(\x27' + selectInfo.direction + '\x27,' + oi + ')"' : '';
+        h += '<tr style="border-bottom:1px solid #f0ebe3;' + rowBg + rowCursor + '"' + rowClick + '>';
         h += '<td style="padding:.3rem .3rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;word-break:break-all;max-width:180px;overflow:hidden;text-overflow:ellipsis;" title="' + esc(opt.annealing) + '">';
-        if (isRec) h += '<span style="font-size:.6rem;background:#5b7a5e;color:#fff;padding:.1rem .25rem;border-radius:2px;margin-right:.3rem;">\u2605</span>';
+        if (isSel) h += '<span style="font-size:.6rem;background:#2563eb;color:#fff;padding:.1rem .25rem;border-radius:2px;margin-right:.3rem;">\u25C9</span>';
+        else if (isRec) h += '<span style="font-size:.6rem;background:#5b7a5e;color:#fff;padding:.1rem .25rem;border-radius:2px;margin-right:.3rem;">\u2605</span>';
         h += esc(opt.annealing.length > 22 ? opt.annealing.slice(0, 22) + '\u2026' : opt.annealing) + '</td>';
         h += '<td style="text-align:center;padding:.3rem .3rem;">' + opt.length + '</td>';
-        h += '<td style="text-align:center;padding:.3rem .3rem;font-weight:' + (isRec ? '600' : '400') + ';">' + opt.tm + '\u00b0C</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;font-weight:' + (isSel ? '600' : '400') + ';">' + opt.tm + '\u00b0C</td>';
         h += '<td style="text-align:center;padding:.3rem .3rem;">' + opt.gc_percent + '%</td>';
         h += '<td style="text-align:center;padding:.3rem .3rem;color:' + dimerC + ';font-weight:500;">' + (typeof opt.homodimer_dg === 'number' ? opt.homodimer_dg : '-') + '</td>';
         h += '<td style="text-align:center;padding:.3rem .3rem;">' + (opt.hairpin ? '\u26a0\ufe0f' : '\u2705') + '</td>';
         h += '<td style="text-align:center;padding:.3rem .3rem;color:#8a7f72;">' + (typeof opt.score === 'number' ? opt.score : '-') + '</td>';
-        h += '<td style="text-align:right;padding:.3rem .3rem;"><button onclick="navigator.clipboard.writeText(\x27' + esc(opt.full_seq) + '\x27).then(function(){toast(\x27Primer copied\x27)})" style="padding:.15rem .4rem;font-size:.66rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy</button></td>';
+        h += '<td style="text-align:right;padding:.3rem .3rem;"><button onclick="event.stopPropagation();navigator.clipboard.writeText(\x27' + esc(opt.full_seq) + '\x27).then(function(){toast(\x27Primer copied\x27)})" style="padding:.15rem .4rem;font-size:.66rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy</button></td>';
         h += '</tr>';
       });
       h += '</tbody></table>';
-      h += '<div style="font-size:.64rem;color:#8a7f72;margin-top:.3rem;">\u2605 = recommended (lowest score is best) \u00b7 Dimer \u0394G: green > -5, amber -5 to -7, red < -7 kcal/mol</div>';
+      h += '<div style="font-size:.64rem;color:#8a7f72;margin-top:.3rem;">' + (selectInfo ? '\u25C9 = selected on map \u00b7 ' : '') + '\u2605 = recommended (lowest score is best) \u00b7 Dimer \u0394G: green > -5, amber -5 to -7, red < -7 kcal/mol</div>';
       h += '</div>';
     }
     h += '</div>';
@@ -1311,37 +1377,93 @@ function _pdSeqDesign() {
   
   // 3. UI State
   k.designing = true; 
-  k.result = null; 
+  k.result = null;
+  k.selectedFwdIdx = 0;
+  k.selectedRevIdx = 0;
   _clRender();
 
-  // 4. API Call - Use the exact keys your Python KLDRequest model expects
+  // 4. Animate progress bar
+  var range = Math.abs(e - s) + 1;
+  var splits = insert.length > 0 ? insert.length + 1 : 1;
+  var isOpt = !!k.optimize;
+  // Estimate: ~800 candidate gen calls/sec, each position×split = 2 calls
+  var estCalls = isOpt ? range * splits * 2 : splits * 2;
+  var estMs = Math.max(1500, Math.ceil(estCalls / 800 * 1000));
+  var progressStart = Date.now();
+  var progressMessages = [
+    'Generating primer candidates\u2026',
+    'Testing insert split points\u2026',
+    'Scoring junction pairs\u2026',
+    'Evaluating dimer \u0394G\u2026',
+    'Comparing Tm balance\u2026',
+    'Finding optimal combination\u2026'
+  ];
+  window._kldProgressIv = setInterval(function() {
+    var elapsed = Date.now() - progressStart;
+    var pct = Math.min(92, (elapsed / estMs) * 90); // cap at 92% until response arrives
+    var bar = document.getElementById('cl-kld-progress-bar');
+    var txt = document.getElementById('cl-kld-progress-text');
+    if (bar) bar.style.width = pct.toFixed(1) + '%';
+    if (txt) {
+      var msgIdx = Math.min(Math.floor(pct / 18), progressMessages.length - 1);
+      var secLeft = Math.max(1, Math.ceil((estMs - elapsed) / 1000));
+      txt.textContent = progressMessages[msgIdx] + ' (~' + secLeft + 's remaining)';
+    }
+  }, 200);
+
+  // 5. API Call
   api('POST', '/api/cloning/design-kld-primers', {
-    template_seq: _cl.parsed.sequence || _cl.parsed.seq, // Handle different property names
+    template_seq: _cl.parsed.sequence || _cl.parsed.seq,
     insert_seq: insert,
     start_pos: s,
     end_pos: e,
-    optimize: !!k.optimize,
+    optimize: isOpt,
     annealing_tm_target: parseInt(k.tmTarget, 10) || 62,
     max_primer_length: parseInt(k.maxLen, 10) || 60
   }).then(function(data) {
+    clearInterval(window._kldProgressIv);
     k.designing = false; 
     k.result = data; 
     _clRender();
     setTimeout(function() { _clRenderSeqViz(); }, 50);
   }).catch(function(err) { 
+    clearInterval(window._kldProgressIv);
     k.designing = false; 
     toast('Error: ' + (err.message || err), true); 
     _clRender(); 
   });
 }
+
+// ── KLD primer selection (click alternative to show on map)
+function _pdKldSelectPrimer(direction, idx) {
+  if (direction === 'fwd') {
+    _cl.pd.kld.selectedFwdIdx = idx;
+  } else {
+    _cl.pd.kld.selectedRevIdx = idx;
+  }
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+// Helper: get the currently selected KLD primer for a direction
+function _pdKldGetSelected(direction) {
+  var r = _cl.pd.kld.result;
+  if (!r) return null;
+  var primer = direction === 'fwd' ? r.forward : r.reverse;
+  var idx = direction === 'fwd' ? _cl.pd.kld.selectedFwdIdx : _cl.pd.kld.selectedRevIdx;
+  if (idx === 0) return primer; // best/recommended
+  var allOptions = [primer].concat(primer.alternatives || []);
+  return allOptions[idx] || primer;
+}
+
 // ── Copy
 function _pdCopy(key) {
   var seq = '';
   if (key === 'custom' && _cl.pd.custom.result) seq = _cl.pd.custom.result.primer_seq;
   else if (key === 'pcr-fwd' && _cl.pd.pcr.result) seq = _cl.pd.pcr.result.forward.seq;
   else if (key === 'pcr-rev' && _cl.pd.pcr.result) seq = _cl.pd.pcr.result.reverse.seq;
-  else if (key === 'kld-fwd' && _cl.pd.kld.result) seq = _cl.pd.kld.result.forward.full_seq;
-  else if (key === 'kld-rev' && _cl.pd.kld.result) seq = _cl.pd.kld.result.reverse.full_seq;
+  else if (key === 'kld-fwd' && _cl.pd.kld.result) { var sp = _pdKldGetSelected('fwd'); seq = sp ? sp.full_seq : ''; }
+  else if (key === 'kld-rev' && _cl.pd.kld.result) { var sp2 = _pdKldGetSelected('rev'); seq = sp2 ? sp2.full_seq : ''; }
   else if (key.indexOf('seq-') === 0 && _cl.pd.seq.result) {
     var idx = parseInt(key.replace('seq-', ''), 10) - 1;
     if (_cl.pd.seq.result.primers[idx]) seq = _cl.pd.seq.result.primers[idx].seq;
@@ -1359,8 +1481,9 @@ function _pdCopyBoth(mode) {
     var r = _cl.pd.pcr.result;
     text = 'Forward: ' + r.forward.seq + '\nReverse: ' + r.reverse.seq;
   } else if (mode === 'kld' && _cl.pd.kld.result) {
-    var r2 = _cl.pd.kld.result;
-    text = 'Forward: ' + r2.forward.full_seq + '\nReverse: ' + r2.reverse.full_seq;
+    var sf = _pdKldGetSelected('fwd');
+    var sr = _pdKldGetSelected('rev');
+    text = 'Forward: ' + (sf ? sf.full_seq : '') + '\nReverse: ' + (sr ? sr.full_seq : '');
   } else if (mode === 'seq' && _cl.pd.seq.result) {
     text = _cl.pd.seq.result.primers.map(function(p) { return 'Seq#' + p.index + ' (pos ' + p.position + '): ' + p.seq; }).join('\n');
   }
@@ -3632,6 +3755,7 @@ window._pdSeqSet = _pdSeqSet;
 window._pdSeqDesign = _pdSeqDesign;
 window._pdKldSet = _pdKldSet;
 window._pdKldDesign = _pdKldDesign;
+window._pdKldSelectPrimer = _pdKldSelectPrimer;
 window._pdCopy = _pdCopy;
 window._pdCopyBoth = _pdCopyBoth;
 window._pdSavePrimers = _pdSavePrimers;
