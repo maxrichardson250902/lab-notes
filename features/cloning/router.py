@@ -40,11 +40,14 @@ class UpdateProject(BaseModel):
     sequences: Optional[str] = None
     notes: Optional[str] = None
     status: Optional[str] = None
-
 class KLDRequest(BaseModel):
     template_seq: str
-    insertion_pos: int
     insert_seq: str
+    # Keep insertion_pos for safety, but add the new ones
+    insertion_pos: Optional[int] = 0 
+    start_pos: Optional[int] = None
+    end_pos: Optional[int] = None
+    optimize: Optional[bool] = False
     annealing_tm_target: Optional[float] = 62.0
     max_primer_length: Optional[int] = 60
 
