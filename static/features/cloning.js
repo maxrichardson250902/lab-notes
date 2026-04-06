@@ -40,6 +40,7 @@ var _cl = {
         insertSeq: '', 
         tmTarget: 62, 
         maxLen: 60,
+        mgConc: 1.5,
         optimize: false,
         exhaustive: false,
         result: null, 
@@ -997,13 +998,16 @@ h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Li
   }
   h += '</div>';
 
-  // Row 3: Tm and Max Length
-  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
+  // Row 3: Tm, Max Length, Mg2+
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
   h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Tm Target (\u00b0C)</label>';
   h += '  <input type="number" min="50" max="75" value="' + k.tmTarget + '" oninput="_pdKldSet(\x27tmTarget\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
   
   h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Max Length (bp)</label>';
   h += '  <input type="number" min="30" max="100" value="' + k.maxLen + '" oninput="_pdKldSet(\x27maxLen\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Mg\u00b2\u207a (mM)</label>';
+  h += '  <input type="number" min="0" max="10" step="0.5" value="' + k.mgConc + '" oninput="_pdKldSet(\x27mgConc\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
   h += '</div>';
 
   h += '<label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Insert Sequence</label>';
@@ -1178,8 +1182,8 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData, sele
   h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + displayPrimer.length + 'bp \u00b7 Tm ' + displayPrimer.tm + '\u00b0C \u00b7 GC ' + displayPrimer.gc_percent + '%</span>';
   // Show dimer/hairpin badges if data is present
   if (typeof displayPrimer.homodimer_dg === 'number') {
-    var dimerColor = displayPrimer.homodimer_dg < -12 ? '#c0392b' : displayPrimer.homodimer_dg < -9 ? '#e67e22' : '#5b7a5e';
-    h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (displayPrimer.homodimer_dg < -12 ? '#fde8e8' : displayPrimer.homodimer_dg < -9 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + displayPrimer.homodimer_dg + '</span>';
+    var dimerColor = displayPrimer.homodimer_dg < -9 ? '#c0392b' : displayPrimer.homodimer_dg < -6 ? '#e67e22' : '#5b7a5e';
+    h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (displayPrimer.homodimer_dg < -9 ? '#fde8e8' : displayPrimer.homodimer_dg < -6 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + displayPrimer.homodimer_dg + '</span>';
   }
   if (displayPrimer.hairpin) {
     h += '<span style="font-size:.66rem;margin-left:.3rem;padding:.1rem .35rem;border-radius:3px;background:#fde8e8;color:#c0392b;">hairpin</span>';
@@ -1227,7 +1231,7 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData, sele
       allOptions.forEach(function(opt, oi) {
         var isRec = (oi === 0);
         var isSel = (oi === selIdx);
-        var dimerC = opt.homodimer_dg < -12 ? '#c0392b' : opt.homodimer_dg < -9 ? '#e67e22' : '#5b7a5e';
+        var dimerC = opt.homodimer_dg < -9 ? '#c0392b' : opt.homodimer_dg < -6 ? '#e67e22' : '#5b7a5e';
         var rowBg = isSel ? 'background:#dbeafe;' : isRec ? 'background:#eef4ee;' : '';
         var rowCursor = selectInfo ? 'cursor:pointer;' : '';
         var rowClick = selectInfo ? ' onclick="_pdKldSelectPrimer(\x27' + selectInfo.direction + '\x27,' + oi + ')"' : '';
@@ -1246,7 +1250,7 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData, sele
         h += '</tr>';
       });
       h += '</tbody></table>';
-      h += '<div style="font-size:.64rem;color:#8a7f72;margin-top:.3rem;">' + (selectInfo ? '\u25C9 = selected on map \u00b7 ' : '') + '\u2605 = recommended (lowest score is best) \u00b7 Dimer \u0394G: green > -9, amber -9 to -12, red < -12 kcal/mol</div>';
+      h += '<div style="font-size:.64rem;color:#8a7f72;margin-top:.3rem;">' + (selectInfo ? '\u25C9 = selected on map \u00b7 ' : '') + '\u2605 = recommended (lowest score is best) \u00b7 Dimer \u0394G: green > -6, amber -6 to -9, red < -9 kcal/mol</div>';
       h += '</div>';
     }
     h += '</div>';
@@ -1470,7 +1474,8 @@ function _pdSeqDesign() {
     optimize: isOpt,
     exhaustive: isExhaustive,
     annealing_tm_target: parseInt(k.tmTarget, 10) || 62,
-    max_primer_length: parseInt(k.maxLen, 10) || 60
+    max_primer_length: parseInt(k.maxLen, 10) || 60,
+    mg_conc: parseFloat(k.mgConc) || 1.5
   }).then(function(data) {
     clearInterval(window._kldProgressIv);
     k.designing = false; 
