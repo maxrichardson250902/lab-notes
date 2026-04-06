@@ -568,33 +568,48 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
 
             combos_done = 0
             total_combos = n_junction_pairs * len(split_points)
-            for si, sp in enumerate(split_points):
-                t_sp = time.time()
-                fwd_tail = insert_seq[sp:]
-                rev_tail = _reverse_complement(insert_seq[:sp])
-                f_max_ann = max_len - len(fwd_tail)
-                r_max_ann = max_len - len(rev_tail)
-                if f_max_ann < 12 or r_max_ann < 12:
-                    combos_done += n_junction_pairs
-                    continue
+            errors = 0
+            try:
+                for si, sp in enumerate(split_points):
+                    t_sp = time.time()
+                    fwd_tail = insert_seq[sp:]
+                    rev_tail = _reverse_complement(insert_seq[:sp])
+                    f_max_ann = max_len - len(fwd_tail)
+                    r_max_ann = max_len - len(rev_tail)
+                    if f_max_ann < 12 or r_max_ann < 12:
+                        combos_done += n_junction_pairs
+                        continue
 
-                for s in positions:
-                    for e in positions:
-                        if e < s:
-                            continue
-                        _score_combo(s, e, sp)
-                        combos_done += 1
+                    for s in positions:
+                        for e in positions:
+                            if e < s:
+                                continue
+                            try:
+                                _score_combo(s, e, sp)
+                            except Exception as combo_err:
+                                errors += 1
+                                if errors <= 3:
+                                    print(f"[KLD] ERROR in combo s={s} e={e} sp={sp}: {combo_err}", flush=True)
+                            combos_done += 1
 
-                t_done = time.time()
-                if (si + 1) % max(1, len(split_points) // 10) == 0 or si == len(split_points) - 1:
-                    pct = combos_done / max(1, total_combos) * 100
-                    print(f"[KLD]   split {si+1}/{len(split_points)}: "
-                          f"{t_done-t_sp:.2f}s  {pct:.0f}% done  "
-                          f"elapsed={t_done-t0:.1f}s  best={best_overall_score:.1f}", flush=True)
+                    t_done = time.time()
+                    if (si + 1) % max(1, len(split_points) // 10) == 0 or si == len(split_points) - 1:
+                        pct = combos_done / max(1, total_combos) * 100
+                        print(f"[KLD]   split {si+1}/{len(split_points)}: "
+                              f"{t_done-t_sp:.2f}s  {pct:.0f}% done  "
+                              f"elapsed={t_done-t0:.1f}s  best={best_overall_score:.1f}"
+                              f"{'  errors='+str(errors) if errors else ''}", flush=True)
+            except Exception as ex:
+                import traceback
+                print(f"[KLD] EXHAUSTIVE FAILED: {ex}", flush=True)
+                traceback.print_exc()
 
             search_stats["exhaustive"] = True
+            if errors:
+                search_stats["errors"] = errors
             print(f"[KLD] exhaustive done in {time.time()-t0:.2f}s  "
-                  f"baseline_score={baseline_score:.1f} -> final_score={best_overall_score:.1f}", flush=True)
+                  f"baseline_score={baseline_score:.1f} -> final_score={best_overall_score:.1f}"
+                  f"{'  errors='+str(errors) if errors else ''}", flush=True)
 
         else:
             # ── STANDARD OPTIMIZE: lightweight scan + shortlist + refine
