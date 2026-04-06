@@ -1018,11 +1018,8 @@ h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Li
   var kldSplits = kldInsLen > 0 ? kldInsLen + 1 : 1;
   if (k.optimize && kldRange > 1) {
     var kldPairs = kldRange * (kldRange + 1) / 2;
-    var kldTotal = kldPairs * kldSplits;
-    var kldEst = Math.ceil(kldRange * kldSplits * 2 / 800); // rough: ~800 candidate gen calls/sec
     h += '<div style="font-size:.72rem;color:#8a7f72;margin-top:.5rem;padding:.4rem .6rem;background:#eef4ee;border-radius:4px;border:1px solid #d5cec0;">';
-    h += '\ud83d\udd0d Search space: <strong style="color:#4a4139;">' + kldRange + '</strong> positions \u00d7 <strong style="color:#4a4139;">' + kldSplits + '</strong> splits = <strong style="color:#4a4139;">' + kldPairs.toLocaleString() + '</strong> junction pairs \u00b7 ~' + kldTotal.toLocaleString() + ' combos';
-    if (kldEst > 2) h += ' \u00b7 est. <strong style="color:#5b7a5e;">~' + kldEst + 's</strong>';
+    h += '\ud83d\udd0d Baseline + <strong style="color:#4a4139;">' + kldPairs.toLocaleString() + '</strong> junction pairs \u00d7 <strong style="color:#4a4139;">' + kldSplits + '</strong> splits \u00d7 top-3 annealing \u2192 refine top 50';
     h += '</div>';
   }
 
@@ -1036,7 +1033,7 @@ h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Li
     h += '<div style="height:6px;background:#e8e2d8;border-radius:3px;overflow:hidden;">';
     h += '<div id="cl-kld-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#5b7a5e,#2980b9);border-radius:3px;transition:width 0.3s ease;"></div>';
     h += '</div>';
-    h += '<div id="cl-kld-progress-text" style="font-size:.68rem;color:#8a7f72;margin-top:.2rem;">Generating primer candidates\u2026</div>';
+    h += '<div id="cl-kld-progress-text" style="font-size:.68rem;color:#8a7f72;margin-top:.2rem;">Running baseline analysis\u2026</div>';
     h += '</div>';
   }
 
@@ -1387,28 +1384,39 @@ function _pdSeqDesign() {
   var range = Math.abs(e - s) + 1;
   var splits = insert.length > 0 ? insert.length + 1 : 1;
   var isOpt = !!k.optimize;
-  // Estimate: ~800 candidate gen calls/sec, each position×split = 2 calls
-  var estCalls = isOpt ? range * splits * 2 : splits * 2;
-  var estMs = Math.max(1500, Math.ceil(estCalls / 800 * 1000));
+  // Estimate: baseline (splits×2 full calls) + optimize scan (range×splits×2 lightweight)
+  // Lightweight calls are ~10x faster than full, so weigh accordingly
+  var baselineCalls = splits * 2;
+  var scanCalls = isOpt ? range * splits * 2 : 0;
+  var refineCalls = isOpt ? 100 : 0; // ~50 shortlist × 2 full calls
+  var estMs = Math.max(2000, Math.ceil((baselineCalls / 400 + scanCalls / 4000 + refineCalls / 400) * 1000));
   var progressStart = Date.now();
   var progressMessages = [
-    'Generating primer candidates\u2026',
+    'Running baseline analysis\u2026',
+    'Scanning junction positions\u2026',
     'Testing insert split points\u2026',
-    'Scoring junction pairs\u2026',
-    'Evaluating dimer \u0394G\u2026',
-    'Comparing Tm balance\u2026',
-    'Finding optimal combination\u2026'
+    'Scoring primer pairs\u2026',
+    'Refining top candidates\u2026',
+    'Final thermodynamic analysis\u2026'
   ];
   window._kldProgressIv = setInterval(function() {
     var elapsed = Date.now() - progressStart;
-    var pct = Math.min(92, (elapsed / estMs) * 90); // cap at 92% until response arrives
+    // Asymptotic curve: approaches 95% but never reaches it
+    // Fast at first, slows as it gets closer — never looks stuck
+    var pct = 95 * (1 - Math.exp(-elapsed / (estMs * 0.7)));
     var bar = document.getElementById('cl-kld-progress-bar');
     var txt = document.getElementById('cl-kld-progress-text');
     if (bar) bar.style.width = pct.toFixed(1) + '%';
     if (txt) {
       var msgIdx = Math.min(Math.floor(pct / 18), progressMessages.length - 1);
-      var secLeft = Math.max(1, Math.ceil((estMs - elapsed) / 1000));
-      txt.textContent = progressMessages[msgIdx] + ' (~' + secLeft + 's remaining)';
+      var elapsedSec = Math.floor(elapsed / 1000);
+      if (elapsed < estMs) {
+        var secLeft = Math.max(1, Math.ceil((estMs - elapsed) / 1000));
+        txt.textContent = progressMessages[msgIdx] + ' (~' + secLeft + 's remaining)';
+      } else {
+        // Past the estimate — show elapsed instead of misleading countdown
+        txt.textContent = progressMessages[msgIdx] + ' (' + elapsedSec + 's elapsed, still working\u2026)';
+      }
     }
   }, 200);
 
