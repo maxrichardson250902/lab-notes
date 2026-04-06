@@ -82,6 +82,8 @@ class ProductPreviewRequest(BaseModel):
     template_topology: Optional[str] = "circular"
     # KLD fields
     insertion_pos: Optional[int] = None
+    start_pos: Optional[int] = None
+    end_pos: Optional[int] = None
     insert_seq: Optional[str] = None
     insert_label: Optional[str] = "insert"
     # PCR fields
@@ -96,6 +98,8 @@ class SaveProductRequest(BaseModel):
     template_topology: Optional[str] = "circular"
     product_name: str
     insertion_pos: Optional[int] = None
+    start_pos: Optional[int] = None
+    end_pos: Optional[int] = None
     insert_seq: Optional[str] = None
     insert_label: Optional[str] = "insert"
     target_start: Optional[int] = None
@@ -464,15 +468,14 @@ def _score_split(insert_seq: str, pos: int) -> float:
         return 0.0
     return sum(1 for b in window if b in "GC") / len(window)
 
-def design_kld_primers(body: dict):
-    # Expecting: template, insert, start_pos, end_pos, optimize, tm_target
-    template_seq = body.get("template", "").upper().replace(" ", "")
-    insert_seq = body.get("insert", "").upper().replace(" ", "")
-    start_pos = int(body.get("start_pos", 0))
-    end_pos = int(body.get("end_pos", start_pos)) # Default to same as start (insertion)
-    tm_target = float(body.get("tm_target", 62.0))
-    optimize = body.get("optimize", False)
-    max_len = 60
+def design_kld_primers(template_seq: str, insert_seq: str = "",
+                       start_pos: int = 0, end_pos: int = None,
+                       optimize: bool = False, tm_target: float = 62.0,
+                       max_len: int = 60):
+    template_seq = template_seq.upper().replace(" ", "").replace("\n", "")
+    insert_seq = (insert_seq or "").upper().replace(" ", "").replace("\n", "")
+    if end_pos is None:
+        end_pos = start_pos
 
     if not template_seq:
         raise HTTPException(400, "Template sequence is empty")
@@ -546,14 +549,18 @@ def design_kld_primers(body: dict):
     # Construct result product
     product = template_seq[:best_result["actual_start"]] + insert_seq + template_seq[best_result["actual_end"]:]
 
+    split = best_result["split"]
     return {
         "forward": fwd_primer,
         "reverse": rev_primer,
         "start_used": best_result["actual_start"],
         "end_used": best_result["actual_end"],
-        "insert_split": best_result["split"],
+        "insert_split": split,
+        "split_position": split,
+        "insert_length": len(insert_seq),
+        "split_gc_score": round(_score_split(insert_seq, split), 2) if insert_seq else 0.0,
         "product_length": len(product),
-        "warnings": ["Tm mismatch > 3C"] if abs(fwd_primer['tm'] - rev_primer['tm']) > 3 else []
+        "warnings": ["Tm mismatch > 3°C"] if abs(fwd_primer['tm'] - rev_primer['tm']) > 3 else []
     }
 
 
@@ -726,52 +733,65 @@ def design_seq_primers(template_seq, region_start, region_end, read_length=900, 
 def _build_product(mode, template_seq, annotations, template_name="template",
                    template_topology="circular",
                    insertion_pos=None, insert_seq=None, insert_label="insert",
-                   target_start=None, target_end=None):
+                   target_start=None, target_end=None,
+                   start_pos=None, end_pos=None):
     """Build a product sequence with remapped annotations.
     Returns SeqViz-compatible dict with name, seq, annotations, length, topology."""
     template_seq = template_seq.upper()
     anns = annotations or []
 
     if mode == "kld":
-        if insertion_pos is None or insert_seq is None:
-            raise HTTPException(400, "KLD mode requires insertion_pos and insert_seq")
+        # Support both old single insertion_pos and new start/end range
+        kld_start = start_pos if start_pos is not None else (insertion_pos if insertion_pos is not None else None)
+        kld_end = end_pos if end_pos is not None else kld_start
+        if kld_start is None or insert_seq is None:
+            raise HTTPException(400, "KLD mode requires start_pos (or insertion_pos) and insert_seq")
         insert_seq = insert_seq.upper().replace(" ", "").replace("\n", "")
         ins_len = len(insert_seq)
-        product_seq = template_seq[:insertion_pos] + insert_seq + template_seq[insertion_pos:]
-        product_name = f"{template_name}_KLD_{insert_label}"
+        deleted_len = kld_end - kld_start  # 0 for pure insertion
+        product_seq = template_seq[:kld_start] + insert_seq + template_seq[kld_end:]
+        if deleted_len > 0 and ins_len > 0:
+            product_name = f"{template_name}_KLD_replace_{kld_start}-{kld_end}_{insert_label}"
+        elif deleted_len > 0:
+            product_name = f"{template_name}_KLD_del_{kld_start}-{kld_end}"
+        else:
+            product_name = f"{template_name}_KLD_{insert_label}"
         topology = template_topology  # stays circular
+
+        # Net shift = insert_length - deleted_length
+        net_shift = ins_len - deleted_len
 
         # Remap annotations
         new_anns = []
         for a in anns:
             s, e = a.get("start", 0), a.get("end", 0)
-            if e <= insertion_pos:
-                # Entirely before insertion — unchanged
+            if e <= kld_start:
+                # Entirely before affected region — unchanged
                 new_anns.append(dict(a))
-            elif s >= insertion_pos:
-                # Entirely after insertion — shift by insert length
+            elif s >= kld_end:
+                # Entirely after affected region — shift by net change
                 na = dict(a)
-                na["start"] = s + ins_len
-                na["end"] = e + ins_len
+                na["start"] = s + net_shift
+                na["end"] = e + net_shift
                 new_anns.append(na)
             else:
-                # Spans insertion point — split or extend
-                # Keep the original but mark as disrupted
+                # Overlaps affected region — mark as disrupted
                 na = dict(a)
-                na["end"] = e + ins_len
+                na["end"] = max(na["start"] + 1, e + net_shift)
                 na["name"] = a.get("name", "?") + " (disrupted)"
                 na["color"] = "#e74c3c"
                 new_anns.append(na)
 
-        # Add insert as a feature
-        new_anns.append({
-            "name": insert_label or "insert",
-            "start": insertion_pos,
-            "end": insertion_pos + ins_len,
-            "direction": 1,
-            "color": "#27ae60",
-            "type": "misc_feature",
-        })
+        # Add insert as a feature (only if there's actual insert sequence)
+        if ins_len > 0:
+            new_anns.append({
+                "name": insert_label or "insert",
+                "start": kld_start,
+                "end": kld_start + ins_len,
+                "direction": 1,
+                "color": "#27ae60",
+                "type": "misc_feature",
+            })
 
     elif mode == "pcr":
         if target_start is None or target_end is None:
@@ -2457,6 +2477,8 @@ def product_preview(body: ProductPreviewRequest):
         template_name=body.template_name or "template",
         template_topology=body.template_topology or "circular",
         insertion_pos=body.insertion_pos,
+        start_pos=body.start_pos,
+        end_pos=body.end_pos,
         insert_seq=body.insert_seq,
         insert_label=body.insert_label,
         target_start=body.target_start,
@@ -2474,6 +2496,8 @@ def save_product(body: SaveProductRequest):
         template_name=body.template_name or "template",
         template_topology=body.template_topology or "circular",
         insertion_pos=body.insertion_pos,
+        start_pos=body.start_pos,
+        end_pos=body.end_pos,
         insert_seq=body.insert_seq,
         insert_label=body.insert_label,
         target_start=body.target_start,
