@@ -1346,6 +1346,11 @@ function _pdSeqDesign() {
     _cl.pd.kld.exhaustive = false;
   }
 
+  // Re-render UI when toggles change (so exhaustive checkbox appears/disappears)
+  if (field === 'optimize' || field === 'exhaustive') {
+    _clRender();
+  }
+
   // 3. Map Refresh: If start or end positions change, update the SeqViz map highlights
   if (field === 'startPos' || field === 'endPos' || field === 'optimize' || field === 'exhaustive') {
     clearTimeout(window._pdKldTimer);
