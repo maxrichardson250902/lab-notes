@@ -51,6 +51,7 @@ class KLDRequest(BaseModel):
     exhaustive: Optional[bool] = False
     annealing_tm_target: Optional[float] = 62.0
     max_primer_length: Optional[int] = 60
+    mg_conc: Optional[float] = 1.5
 
 class CustomPrimerRequest(BaseModel):
     template_seq: str
@@ -472,7 +473,8 @@ def _score_split(insert_seq: str, pos: int) -> float:
 def design_kld_primers(template_seq: str, insert_seq: str = "",
                        start_pos: int = 0, end_pos: int = None,
                        optimize: bool = False, exhaustive: bool = False,
-                       tm_target: float = 62.0, max_len: int = 60):
+                       tm_target: float = 62.0, max_len: int = 60,
+                       mg_conc: float = 1.5):
     import time
     t0 = time.time()
     template_seq = template_seq.upper().replace(" ", "").replace("\n", "")
@@ -488,7 +490,8 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
     split_points = list(range(ins_len + 1)) if ins_len > 0 else [0]
 
     print(f"[KLD] start={start_pos} end={end_pos} insert={ins_len}bp optimize={optimize} "
-          f"range={end_pos-start_pos+1} splits={len(split_points)} max_len={max_len}", flush=True)
+          f"exhaustive={exhaustive} range={end_pos-start_pos+1} splits={len(split_points)} "
+          f"max_len={max_len} mg_conc={mg_conc}", flush=True)
 
     best_overall_score = -float('inf')
     best_result = None
@@ -508,10 +511,10 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
 
         f_cands = _generate_primer_candidates(
             template_seq, e, "forward", fwd_tail, tm_target,
-            min_len=12, max_len=f_max_ann, max_total=max_len, lightweight=False)
+            min_len=12, max_len=f_max_ann, max_total=max_len, lightweight=False, mg_conc=mg_conc)
         r_cands = _generate_primer_candidates(
             template_seq, s, "reverse", rev_tail, tm_target,
-            min_len=12, max_len=r_max_ann, max_total=max_len, lightweight=False)
+            min_len=12, max_len=r_max_ann, max_total=max_len, lightweight=False, mg_conc=mg_conc)
         search_stats["candidates_generated"] += len(f_cands) + len(r_cands)
         if not f_cands or not r_cands:
             return
@@ -527,7 +530,7 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
         tm_delta = abs(f['tm'] - r['tm'])
         ss_penalty = 0
         if f.get('hairpin') or r.get('hairpin'): ss_penalty += 25
-        if f.get('homodimer_dg', 0) < -12.0: ss_penalty += 15
+        if f.get('homodimer_dg', 0) < -9.0: ss_penalty += 15
         score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
         search_stats["pairs_scored"] += 1
 
@@ -634,7 +637,7 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                 for pos in positions:
                     cands = _generate_primer_candidates(
                         template_seq, pos, "forward", fwd_tail, tm_target,
-                        min_len=12, max_len=f_max_ann, max_total=max_len, lightweight=True)
+                        min_len=12, max_len=f_max_ann, max_total=max_len, lightweight=True, mg_conc=mg_conc)
                     search_stats["candidates_generated"] += len(cands)
                     if cands:
                         fwd_cache[pos] = cands
@@ -644,7 +647,7 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                 for pos in positions:
                     cands = _generate_primer_candidates(
                         template_seq, pos, "reverse", rev_tail, tm_target,
-                        min_len=12, max_len=r_max_ann, max_total=max_len, lightweight=True)
+                        min_len=12, max_len=r_max_ann, max_total=max_len, lightweight=True, mg_conc=mg_conc)
                     search_stats["candidates_generated"] += len(cands)
                     if cands:
                         rev_cache[pos] = cands
@@ -1687,13 +1690,13 @@ def _ensure_gc_clamp(seq, max_len=60):
     return seq
 
 
-def _has_hairpin(seq, min_stem=4, min_loop=3):
+def _has_hairpin(seq, min_stem=4, min_loop=3, dv_conc=0.0):
     """Check whether seq can form a hairpin (stem-loop).
     Uses primer3 for accuracy, falls back to pattern search."""
     try:
         import primer3
         result = primer3.calc_hairpin(
-            seq.upper(), mv_conc=50, dv_conc=0, dntp_conc=0, dna_conc=250, temp_c=25)
+            seq.upper(), mv_conc=50, dv_conc=dv_conc, dntp_conc=0, dna_conc=250, temp_c=25)
         # Consider it a hairpin if ΔG < -2 kcal/mol (stable enough to form)
         return result.structure_found and result.dg < -2000  # cal/mol
     except Exception:
@@ -1720,7 +1723,7 @@ def _has_self_dimer(seq, min_match=4):
             return True
     return False
 
-def _calc_homodimer_dg(seq: str, temp_c: float = 25.0) -> float:
+def _calc_homodimer_dg(seq: str, temp_c: float = 25.0, dv_conc: float = 0.0) -> float:
     """Calculate self-dimer ΔG using primer3 (same engine as IDT OligoAnalyzer).
     Falls back to NN sliding-window if primer3 is unavailable."""
     seq = seq.upper()
@@ -1729,7 +1732,7 @@ def _calc_homodimer_dg(seq: str, temp_c: float = 25.0) -> float:
     try:
         import primer3
         result = primer3.calc_homodimer(
-            seq, mv_conc=50, dv_conc=0, dntp_conc=0, dna_conc=250, temp_c=temp_c)
+            seq, mv_conc=50, dv_conc=dv_conc, dntp_conc=0, dna_conc=250, temp_c=temp_c)
         return round(result.dg / 1000.0, 2)  # primer3 returns cal/mol
     except Exception:
         pass
@@ -1790,7 +1793,8 @@ def _calc_homodimer_dg(seq: str, temp_c: float = 25.0) -> float:
 
 def _generate_primer_candidates(template: str, pos: int, direction: str, tail: str,
                                  tm_target: float, min_len: int = 18, max_len: int = 40,
-                                 max_total: int = 60, lightweight: bool = False) -> list:
+                                 max_total: int = 60, lightweight: bool = False,
+                                 mg_conc: float = 0.0) -> list:
     """Generate multiple primer candidates with different annealing lengths.
     Returns a list of candidate dicts sorted by score (best first), each containing
     full primer properties including dimer/hairpin/ΔG analysis.
@@ -1838,12 +1842,12 @@ def _generate_primer_candidates(template: str, pos: int, direction: str, tail: s
         else:
             # Full path: complete thermodynamic analysis
             dg = _calc_delta_g(anneal_seq, temp_c=tm if tm > 0 else 60.0)
-            homodimer_dg = _calc_homodimer_dg(full_seq, temp_c=25.0)
-            hairpin = _has_hairpin(full_seq)
+            homodimer_dg = _calc_homodimer_dg(full_seq, temp_c=25.0, dv_conc=mg_conc)
+            hairpin = _has_hairpin(full_seq, dv_conc=mg_conc)
             self_dimer = _has_self_dimer(full_seq)
             quality = _check_primer_quality(anneal_seq, tm)
 
-            dimer_penalty = max(0, -homodimer_dg - 9.0) * 3.0
+            dimer_penalty = max(0, -homodimer_dg - 6.0) * 3.0
             hairpin_penalty = 5.0 if hairpin else 0.0
             score = tm_penalty + dimer_penalty + hairpin_penalty + gc_penalty
 
@@ -2621,6 +2625,7 @@ def kld_endpoint(body: KLDRequest):
         exhaustive=body.exhaustive,
         tm_target=body.annealing_tm_target or 62.0,
         max_len=body.max_primer_length or 60,
+        mg_conc=body.mg_conc if body.mg_conc is not None else 1.5,
     )
 
 
