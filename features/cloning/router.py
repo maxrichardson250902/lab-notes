@@ -1615,22 +1615,32 @@ def _generate_primer_candidates(template: str, pos: int, direction: str, tail: s
     return candidates
 
 
-def _pick_best_with_alternatives(candidates: list, name: str, max_alternatives: int = 5) -> dict:
+def _pick_best_with_alternatives(candidates: list, name: str, max_alternatives: int = None) -> dict:
     """From a sorted list of candidates, pick the best and attach ALL other candidates
-    as alternatives so the user can compare trade-offs.
+    as alternatives (filtered by Tm >= 55) so the user can compare trade-offs.
     Returns the best candidate dict with a 'name' and 'alternatives' key added."""
     if not candidates:
         return None
+        
+    # Always keep the absolute best candidate to prevent returning None 
+    # if the sequence is highly AT-rich and nothing hits 55°C.
     best = dict(candidates[0])
     best["name"] = name
     alts = []
+    
     for c in candidates[1:]:
+        # Filter out alternatives with a Tm below 55°C
+        if c.get("tm", 0) < 55.0:
+            continue
+            
         # Allow max_alternatives to be None to return an unlimited list
         if max_alternatives is not None and len(alts) >= max_alternatives:
             break
+            
         alt = dict(c)
         alt["name"] = name
         alts.append(alt)
+        
     best["alternatives"] = alts
     return best
 
