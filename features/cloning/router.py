@@ -461,99 +461,105 @@ def _score_split(insert_seq: str, pos: int) -> float:
         return 0.0
     return sum(1 for b in window if b in "GC") / len(window)
 
+def design_kld_primers(body: dict):
+    # Expecting: template, insert, start_pos, end_pos, optimize, tm_target
+    template_seq = body.get("template", "").upper().replace(" ", "")
+    insert_seq = body.get("insert", "").upper().replace(" ", "")
+    start_pos = int(body.get("start_pos", 0))
+    end_pos = int(body.get("end_pos", start_pos)) # Default to same as start (insertion)
+    tm_target = float(body.get("tm_target", 62.0))
+    optimize = body.get("optimize", False)
+    max_len = 60
 
-def design_kld_primers(template_seq, insertion_pos, insert_seq, tm_target=62.0, max_len=60):
-    template_seq = template_seq.upper().replace(" ", "").replace("\n", "")
-    insert_seq = insert_seq.upper().replace(" ", "").replace("\n", "")
-    tpl_len = len(template_seq)
-    ins_len = len(insert_seq)
-
-    if not template_seq or not insert_seq:
-        raise HTTPException(400, "Template or Insert sequence is empty")
+    if not template_seq:
+        raise HTTPException(400, "Template sequence is empty")
 
     best_overall_score = -float('inf')
-    best_split_data = None
+    best_result = None
 
-    # Iteratively try every possible split point to find the best primer pair
-    for sp in range(1, ins_len):
-        fwd_tail = insert_seq[:sp]
-        rev_tail = _reverse_complement(insert_seq[sp:])
+    # Determine the range of template junctions to test
+    # If not optimizing, we only check the specific start/end provided
+    search_range = range(start_pos, end_pos + 1) if optimize else [start_pos]
+
+    for t_junction in search_range:
+        # For KLD: 
+        # Rev primer anneals UPSTREAM of the cut (template[:t_junction])
+        # Fwd primer anneals DOWNSTREAM of the cut (template[end_pos + (t_junction - start_pos):])
+        # Wait, the most common 'chop' use case:
+        # User wants to remove everything between START and END.
+        # If optimizing is OFF: we remove exactly start -> end.
+        # If optimizing is ON: we assume the user is looking for the best site *within* that range
+        # to perform a clean insertion, OR we shift the fixed-width window.
         
-        # Remaining room for annealing regions (must be at least 12bp)
-        f_max_ann = max_len - len(fwd_tail)
-        r_max_ann = max_len - len(rev_tail)
+        # Let's implement: Remove sequence between 'start' and 'end' 
+        # BUT if optimize is ON, we allow the 'cut' to move anywhere in that range.
         
-        if f_max_ann < 12 or r_max_ann < 12:
-            continue
+        actual_start = t_junction if optimize else start_pos
+        actual_end = t_junction if optimize else end_pos
+
+        # Iteratively try every split point of the INSERT sequence
+        ins_len = len(insert_seq)
+        # If insert is empty (pure deletion), we just have one 'split' point
+        split_points = range(ins_len + 1) if ins_len > 0 else [0]
+
+        for sp in split_points:
+            fwd_tail = insert_seq[sp:]
+            rev_tail = _reverse_complement(insert_seq[:sp])
             
-        # Generate all candidates for this split point
-        # Using the expanded range (12 to max) as discussed
-        f_cands = _generate_primer_candidates(
-            template_seq, insertion_pos, "forward", fwd_tail, tm_target,
-            min_len=12, max_len=f_max_ann, max_total=max_len
-        )
-        r_cands = _generate_primer_candidates(
-            template_seq, insertion_pos, "reverse", rev_tail, tm_target,
-            min_len=12, max_len=r_max_ann, max_total=max_len
-        )
-        
-        if not f_cands or not r_cands:
-            continue
+            f_max_ann = max_len - len(fwd_tail)
+            r_max_ann = max_len - len(rev_tail)
             
-        # Score the "best" (top of the list) pair for this split
-        f = f_cands[0]
-        r = r_cands[0]
-        
-        # Scoring metrics:
-        # 1. Tm Error: How far are they from the target?
-        tm_error = abs(f['tm'] - tm_target) + abs(r['tm'] - tm_target)
-        # 2. Tm Delta: How well do they match each other?
-        tm_delta = abs(f['tm'] - r['tm'])
-        # 3. Junction Quality: GC content at the split (ligation point)
-        junction_gc = _score_split(insert_seq, sp)
-        # 4. Secondary Structure Penalties
-        ss_penalty = 0
-        if f.get('hairpin') or r.get('hairpin'): ss_penalty += 20
-        if f.get('homodimer_dg', 0) < -9.5: ss_penalty += 10
-        if r.get('homodimer_dg', 0) < -9.5: ss_penalty += 10
-        
-        # Total Score (Higher is better)
-        # We prioritize secondary structure avoidance and Tm matching
-        score = (junction_gc * 10) - (tm_error * 1.5) - (tm_delta * 2) - ss_penalty
-        
-        if score > best_overall_score:
-            best_overall_score = score
-            best_split_data = {
-                "fwd_cands": f_cands,
-                "rev_cands": r_cands,
-                "split": sp,
-                "gc": junction_gc
-            }
+            if f_max_ann < 12 or r_max_ann < 12: continue
+            
+            # Fwd primer anneals starting at 'actual_end'
+            f_cands = _generate_primer_candidates(
+                template_seq, actual_end, "forward", fwd_tail, tm_target,
+                min_len=12, max_len=f_max_ann, max_total=max_len
+            )
+            # Rev primer anneals starting at 'actual_start'
+            r_cands = _generate_primer_candidates(
+                template_seq, actual_start, "reverse", rev_tail, tm_target,
+                min_len=12, max_len=r_max_ann, max_total=max_len
+            )
+            
+            if not f_cands or not r_cands: continue
+            
+            f, r = f_cands[0], r_cands[0]
+            
+            # Scoring
+            tm_err = abs(f['tm'] - tm_target) + abs(r['tm'] - tm_target)
+            tm_delta = abs(f['tm'] - r['tm'])
+            ss_penalty = 0
+            if f.get('hairpin') or r.get('hairpin'): ss_penalty += 25
+            if f.get('homodimer_dg', 0) < -8.0: ss_penalty += 15
+            
+            score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
+            
+            if score > best_overall_score:
+                best_overall_score = score
+                best_result = {
+                    "fwd_all": f_cands, "rev_all": r_cands,
+                    "actual_start": actual_start, "actual_end": actual_end,
+                    "split": sp
+                }
 
-    if not best_split_data:
-        raise HTTPException(400, "Could not find a viable split point for the given constraints.")
+    if not best_result:
+        raise HTTPException(400, "No viable primers found in this range.")
 
-    # Apply the alternatives logic (with the Tm 55 filter) to the winners
-    fwd_primer = _pick_best_with_alternatives(best_split_data["fwd_cands"], "Forward", max_alternatives=None)
-    rev_primer = _pick_best_with_alternatives(best_split_data["rev_cands"], "Reverse", max_alternatives=None)
+    fwd_primer = _pick_best_with_alternatives(best_result["fwd_all"], "Forward", max_alternatives=None)
+    rev_primer = _pick_best_with_alternatives(best_result["rev_all"], "Reverse", max_alternatives=None)
 
-    # Collect warnings for the UI
-    warnings = []
-    if best_split_data["gc"] < 0.25:
-        warnings.append("Low GC at split junction — ligation efficiency may be reduced.")
-    if abs(fwd_primer['tm'] - rev_primer['tm']) > 3:
-        warnings.append(f"Tm mismatch: Forward ({fwd_primer['tm']}°C) vs Reverse ({rev_primer['tm']}°C)")
-
-    product = template_seq[:insertion_pos] + insert_seq + template_seq[insertion_pos:]
+    # Construct result product
+    product = template_seq[:best_result["actual_start"]] + insert_seq + template_seq[best_result["actual_end"]:]
 
     return {
         "forward": fwd_primer,
         "reverse": rev_primer,
-        "split_position": best_split_data["split"],
-        "split_gc_score": round(best_split_data["gc"], 3),
-        "insert_length": ins_len,
-        "warnings": warnings,
+        "start_used": best_result["actual_start"],
+        "end_used": best_result["actual_end"],
+        "insert_split": best_result["split"],
         "product_length": len(product),
+        "warnings": ["Tm mismatch > 3C"] if abs(fwd_primer['tm'] - rev_primer['tm']) > 3 else []
     }
 
 
