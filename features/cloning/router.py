@@ -480,65 +480,125 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
     if not template_seq:
         raise HTTPException(400, "Template sequence is empty")
 
+    ins_len = len(insert_seq)
+    split_points = list(range(ins_len + 1)) if ins_len > 0 else [0]
+
     best_overall_score = -float('inf')
     best_result = None
 
-    # Determine the range of template junctions to test
-    # If not optimizing, we only check the specific start/end provided
-    search_range = range(start_pos, end_pos + 1) if optimize else [start_pos]
+    # Stats for the response
+    search_stats = {"junction_pairs": 0, "split_points": len(split_points),
+                    "candidates_generated": 0, "pairs_scored": 0}
 
-    for t_junction in search_range:
-        # actual_start is where the REVERSE primer anneals (facing left)
-        # actual_end is where the FORWARD primer anneals (facing right)
-        # The sequence between them is what gets DELETED.
-        actual_start = t_junction
-        actual_end = t_junction if optimize else end_pos
-
-        ins_len = len(insert_seq)
-        split_points = range(ins_len + 1) if ins_len > 0 else [0]
-
+    if not optimize:
+        # ── Non-optimised: use exact start/end, only vary the insert split
         for sp in split_points:
-            # The Forward primer gets the END of the insert
             fwd_tail = insert_seq[sp:]
-            # The Reverse primer gets the START of the insert (RC'd)
             rev_tail = _reverse_complement(insert_seq[:sp])
-            
             f_max_ann = max_len - len(fwd_tail)
             r_max_ann = max_len - len(rev_tail)
-            
-            if f_max_ann < 12 or r_max_ann < 12: continue
-            
-            # Fwd anneals to the template AFTER the deleted region
+            if f_max_ann < 12 or r_max_ann < 12:
+                continue
+
             f_cands = _generate_primer_candidates(
-                template_seq, actual_end, "forward", fwd_tail, tm_target,
-                min_len=12, max_len=f_max_ann, max_total=max_len
-            )
-            # Rev anneals to the template BEFORE the deleted region
+                template_seq, end_pos, "forward", fwd_tail, tm_target,
+                min_len=12, max_len=f_max_ann, max_total=max_len)
             r_cands = _generate_primer_candidates(
-                template_seq, actual_start, "reverse", rev_tail, tm_target,
-                min_len=12, max_len=r_max_ann, max_total=max_len
-            )
-            
-            if not f_cands or not r_cands: continue
-            
+                template_seq, start_pos, "reverse", rev_tail, tm_target,
+                min_len=12, max_len=r_max_ann, max_total=max_len)
+            search_stats["candidates_generated"] += len(f_cands) + len(r_cands)
+            if not f_cands or not r_cands:
+                continue
+
             f, r = f_cands[0], r_cands[0]
-            
-            # Scoring
             tm_err = abs(f['tm'] - tm_target) + abs(r['tm'] - tm_target)
             tm_delta = abs(f['tm'] - r['tm'])
             ss_penalty = 0
             if f.get('hairpin') or r.get('hairpin'): ss_penalty += 25
             if f.get('homodimer_dg', 0) < -8.0: ss_penalty += 15
-            
             score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
-            
+            search_stats["pairs_scored"] += 1
+
             if score > best_overall_score:
                 best_overall_score = score
                 best_result = {
                     "fwd_all": f_cands, "rev_all": r_cands,
-                    "actual_start": actual_start, "actual_end": actual_end,
-                    "split": sp
+                    "actual_start": start_pos, "actual_end": end_pos,
+                    "split": sp,
                 }
+        search_stats["junction_pairs"] = 1
+    else:
+        # ── Optimised: test ALL (s, e) pairs where start_pos ≤ s ≤ e ≤ end_pos
+        # Key optimisation: decouple fwd/rev candidate generation.
+        #   Forward primer depends only on the END position + tail (from split)
+        #   Reverse primer depends only on the START position + tail (from split)
+        # So we pre-compute candidates per-position per-split, then score all
+        # (s, e) pairs with fast lookups.  This keeps candidate generation at
+        # O(R × S) instead of the naive O(R² × S).
+        positions = list(range(start_pos, end_pos + 1))
+        n_pos = len(positions)
+        n_junction_pairs = n_pos * (n_pos + 1) // 2  # triangular: s ≤ e
+        search_stats["junction_pairs"] = n_junction_pairs
+
+        for sp in split_points:
+            fwd_tail = insert_seq[sp:]
+            rev_tail = _reverse_complement(insert_seq[:sp])
+            f_max_ann = max_len - len(fwd_tail)
+            r_max_ann = max_len - len(rev_tail)
+            if f_max_ann < 12 or r_max_ann < 12:
+                continue
+
+            # Pre-compute forward candidates for each possible end position
+            fwd_cache = {}
+            for pos in positions:
+                cands = _generate_primer_candidates(
+                    template_seq, pos, "forward", fwd_tail, tm_target,
+                    min_len=12, max_len=f_max_ann, max_total=max_len)
+                search_stats["candidates_generated"] += len(cands)
+                if cands:
+                    fwd_cache[pos] = cands
+
+            # Pre-compute reverse candidates for each possible start position
+            rev_cache = {}
+            for pos in positions:
+                cands = _generate_primer_candidates(
+                    template_seq, pos, "reverse", rev_tail, tm_target,
+                    min_len=12, max_len=r_max_ann, max_total=max_len)
+                search_stats["candidates_generated"] += len(cands)
+                if cands:
+                    rev_cache[pos] = cands
+
+            # Score all valid (s, e) pairs from cached results
+            for s in positions:
+                if s not in rev_cache:
+                    continue
+                r_cands = rev_cache[s]
+                r_best = r_cands[0]
+                for e in positions:
+                    if e < s:
+                        continue
+                    if e not in fwd_cache:
+                        continue
+                    f_cands = fwd_cache[e]
+                    f_best = f_cands[0]
+
+                    tm_err = abs(f_best['tm'] - tm_target) + abs(r_best['tm'] - tm_target)
+                    tm_delta = abs(f_best['tm'] - r_best['tm'])
+                    ss_penalty = 0
+                    if f_best.get('hairpin') or r_best.get('hairpin'):
+                        ss_penalty += 25
+                    if f_best.get('homodimer_dg', 0) < -8.0:
+                        ss_penalty += 15
+                    score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
+                    search_stats["pairs_scored"] += 1
+
+                    if score > best_overall_score:
+                        best_overall_score = score
+                        best_result = {
+                            "fwd_all": f_cands, "rev_all": r_cands,
+                            "actual_start": s, "actual_end": e,
+                            "split": sp,
+                        }
 
     if not best_result:
         raise HTTPException(400, "No viable primers found in this range.")
@@ -560,6 +620,7 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
         "insert_length": len(insert_seq),
         "split_gc_score": round(_score_split(insert_seq, split), 2) if insert_seq else 0.0,
         "product_length": len(product),
+        "search_stats": search_stats,
         "warnings": ["Tm mismatch > 3°C"] if abs(fwd_primer['tm'] - rev_primer['tm']) > 3 else []
     }
 
