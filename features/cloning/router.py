@@ -1,2830 +1,3838 @@
-"""Cloning feature — sequence viewer + OpenCloning bridge + primer design suite."""
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
-from typing import Optional, List
-from datetime import datetime
-import os, json, math
+// Cloning feature — sequence viewer + OpenCloning bridge + primer design suite
 
-from core.database import register_table, get_db
+/* ── state ─────────────────────────────────────────────────── */
+var _cl = {
+  sequences: [],
+  selected: null,
+  parsed: null,
+  loading: false,
+  tab: 'viewer',
+  seqvizReady: false,
+  ocUrl: '',
+  viewerInstance: null,
+  showCircular: true,
+  showLinear: true,
+  filter: '',
+  ocFilter: '',
+  sidebarOpen: true,
+  ocSidebarOpen: true,
+  featuresOpen: false,
+  editFeature: null,   // index into parsed.annotations, or 'new' for adding
+  featuresDirty: false, // true when annotations have unsaved edits
+  // Sequence search
+  search: { open: false, query: '', results: null, activeIdx: 0 },
+  lastSelection: { start: 0, end: 0 }, // last SeqViz drag selection
+  // Primer design
+  pd: {
+    expanded: false,
+    mode: 'custom',  // 'custom' | 'pcr' | 'seq' | 'kld'
+    saving: false,
+    // Custom primer
+    custom: { start: '', end: '', direction: 'forward', result: null, designing: false },
+    // PCR primers
+    pcr: { targetStart: '', targetEnd: '', tmTarget: 62, result: null, designing: false },
+    // Sequencing primers
+    seq: { regionStart: '', regionEnd: '', readLen: 900, tmTarget: 62, result: null, designing: false },
+    // KLD
+    kld: { 
+        startPos: '', 
+        endPos: '', 
+        insertSeq: '', 
+        tmTarget: 62, 
+        maxLen: 60,
+        optimize: false,
+        result: null, 
+        designing: false,
+        selectedFwdIdx: 0,
+        selectedRevIdx: 0
+    },
+  },
+  // Sequence analysis
+  sa: {
+    expanded: false,
+    mode: 'orfs',  // 'orfs' | 'restriction' | 'tools'
+    // ORFs
+    orfs: { minLen: 100, result: null, loading: false, showOnMap: true, expandedOrf: null, hiddenOrfs: {} },
+    // Restriction enzymes
+    re: { enzymes: '', result: null, loading: false, showOnMap: true, filterCuts: 'all' },
+    // Seq tools
+    tools: { input: '', result: null, lastOp: '' },
+    // Digest simulator
+    digest: { enzymes: '', result: null, loading: false },
+    // BLAST
+    blast: { seq: '', program: 'blastn', database: 'nt', maxHits: 10, result: null, loading: false, expandedHit: null },
+    // Known features scan
+    scan: { result: null, loading: false, showOnMap: true, filterCat: 'all' },
+  },
+  // Assembly designer
+  ad: {
+    expanded: false,
+    mode: 'gibson',  // 'gibson' | 'goldengate' | 'digestligate'
+    gibson: { fragments: [], vector: null, overlapLen: 25, tmTarget: 62, result: null, designing: false },
+    goldengate: { enzyme: 'BsaI', bins: [], vector: null, result: null, designing: false },
+    digestligate: { enzyme1: '', enzyme2: '', vectorSeq: '', vectorName: '', insertSeq: '', insertName: '', result: null, designing: false },
+    _libPicker: null,   // null or { target: 'gibson'|'goldengate'|'dl-vector'|'dl-insert', filter: '' }
+    _libLoading: false,
+  },
+};
 
-# ---------------------------------------------------------------------------
-# DB table for saved cloning projects / assembly plans
-# ---------------------------------------------------------------------------
-register_table("cloning_projects", """CREATE TABLE IF NOT EXISTS cloning_projects (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL,
-    description TEXT,
-    method      TEXT,
-    sequences   TEXT,
-    notes       TEXT,
-    status      TEXT NOT NULL DEFAULT 'draft',
-    created     TEXT NOT NULL,
-    updated     TEXT NOT NULL
-)""")
+/* ── script loader ─────────────────────────────────────────── */
+var _altExpanded = {};  // track which primer alt sections are expanded
+window._altExpanded = _altExpanded;
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-class CreateProject(BaseModel):
-    name: str
-    description: Optional[str] = ""
-    method: Optional[str] = ""
-    sequences: Optional[str] = "[]"
-    notes: Optional[str] = ""
+var _scriptsLoaded = false;
+var _scriptsLoading = false;
 
-class UpdateProject(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    method: Optional[str] = None
-    sequences: Optional[str] = None
-    notes: Optional[str] = None
-    status: Optional[str] = None
-class KLDRequest(BaseModel):
-    template_seq: str
-    insert_seq: str
-    # Keep insertion_pos for safety, but add the new ones
-    insertion_pos: Optional[int] = 0 
-    start_pos: Optional[int] = None
-    end_pos: Optional[int] = None
-    optimize: Optional[bool] = False
-    annealing_tm_target: Optional[float] = 62.0
-    max_primer_length: Optional[int] = 60
-
-class CustomPrimerRequest(BaseModel):
-    template_seq: str
-    start: int
-    end: int
-    direction: str  # "forward" or "reverse"
-
-class PCRPrimerRequest(BaseModel):
-    template_seq: str
-    target_start: int
-    target_end: int
-    tm_target: Optional[float] = 62.0
-
-class SeqPrimerRequest(BaseModel):
-    template_seq: str
-    region_start: int
-    region_end: int
-    read_length: Optional[int] = 900
-    tm_target: Optional[float] = 62.0
-
-class SavePrimersRequest(BaseModel):
-    primers: List[dict]  # [{seq, use_desc}, ...]
-    plasmid_name: str
-
-class ProductPreviewRequest(BaseModel):
-    mode: str  # "kld" or "pcr"
-    template_seq: str
-    annotations: Optional[List[dict]] = []
-    template_name: Optional[str] = "template"
-    template_topology: Optional[str] = "circular"
-    # KLD fields
-    insertion_pos: Optional[int] = None
-    start_pos: Optional[int] = None
-    end_pos: Optional[int] = None
-    insert_seq: Optional[str] = None
-    insert_label: Optional[str] = "insert"
-    # PCR fields
-    target_start: Optional[int] = None
-    target_end: Optional[int] = None
-
-class SaveProductRequest(BaseModel):
-    mode: str
-    template_seq: str
-    annotations: Optional[List[dict]] = []
-    template_name: Optional[str] = "template"
-    template_topology: Optional[str] = "circular"
-    product_name: str
-    insertion_pos: Optional[int] = None
-    start_pos: Optional[int] = None
-    end_pos: Optional[int] = None
-    insert_seq: Optional[str] = None
-    insert_label: Optional[str] = "insert"
-    target_start: Optional[int] = None
-    target_end: Optional[int] = None
-
-class FindOrfsRequest(BaseModel):
-    seq: str
-    min_length: Optional[int] = 100  # minimum ORF length in bp
-    circular: Optional[bool] = True
-
-class TranslateRequest(BaseModel):
-    seq: str
-    frame: Optional[int] = 1  # 1,2,3 fwd; -1,-2,-3 rev
-
-class RestrictionRequest(BaseModel):
-    seq: str
-    enzymes: Optional[List[str]] = None  # None = common commercial set
-    circular: Optional[bool] = True
-
-class TmCalcRequest(BaseModel):
-    seq: str
-
-class SeqToolRequest(BaseModel):
-    seq: str
-    operation: str  # 'rc' | 'complement' | 'reverse' | 'translate'
-
-class DigestRequest(BaseModel):
-    seq: str
-    enzymes: List[str]  # 1-3 enzyme names
-    circular: Optional[bool] = True
-
-class BlastRequest(BaseModel):
-    seq: str
-    program: Optional[str] = "blastn"  # blastn, blastp, blastx, tblastn, tblastx
-    database: Optional[str] = "nt"     # nt, nr, swissprot, etc.
-    max_hits: Optional[int] = 10
-
-class ScanFeaturesRequest(BaseModel):
-    seq: str
-    circular: Optional[bool] = True
-
-
-# Assembly designer models
-class FragmentInput(BaseModel):
-    name: str = "fragment"
-    seq: str
-    start: Optional[int] = None
-    end: Optional[int] = None
-
-class GibsonRequest(BaseModel):
-    fragments: List[FragmentInput]
-    circular: Optional[bool] = True
-    overlap_length: Optional[int] = 25
-    tm_target: Optional[float] = 62.0
-
-class BinInput(BaseModel):
-    name: str = "Bin"
-    fragments: List[FragmentInput]
-
-class GoldenGateRequest(BaseModel):
-    bins: Optional[List[BinInput]] = None          # new: positional bins with multiple fragments each
-    fragments: Optional[List[FragmentInput]] = None # legacy: flat fragment list (converted to 1-per-bin)
-    vector: Optional[FragmentInput] = None          # optional backbone vector
-    enzyme: Optional[str] = "BsaI"
-    circular: Optional[bool] = True
-    tm_target: Optional[float] = 62.0
-
-class DigestLigateRequest(BaseModel):
-    vector: FragmentInput
-    insert: FragmentInput
-    enzyme1: str
-    enzyme2: Optional[str] = None
-    vector_cut1_pos: Optional[int] = None
-    vector_cut2_pos: Optional[int] = None
-    design_primers: Optional[bool] = True
-    tm_target: Optional[float] = 62.0
-
-
-# ---------------------------------------------------------------------------
-# GenBank parser (uses BioPython)
-# ---------------------------------------------------------------------------
-FEATURE_COLORS = {
-    "CDS": "#4682B4",
-    "gene": "#5b7a5e",
-    "promoter": "#E8A838",
-    "terminator": "#C0392B",
-    "rep_origin": "#8E44AD",
-    "primer_bind": "#E67E22",
-    "misc_feature": "#7F8C8D",
-    "regulatory": "#E8A838",
-    "protein_bind": "#1ABC9C",
-    "RBS": "#D4AC0D",
-    "enhancer": "#F39C12",
-    "polyA_signal": "#C0392B",
-    "sig_peptide": "#3498DB",
-    "source": "#BDC3C7",
+function _loadScript(src) {
+  return new Promise(function(resolve, reject) {
+    var existing = document.querySelector('script[src="' + src + '"]');
+    if (existing) { resolve(); return; }
+    var s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = function() { reject(new Error('Failed to load: ' + src)); };
+    document.head.appendChild(s);
+  });
 }
 
-
-def parse_genbank(filepath: str) -> dict:
-    try:
-        from Bio import SeqIO
-    except ImportError:
-        raise HTTPException(500, "BioPython not installed")
-
-    if not os.path.isfile(filepath):
-        raise HTTPException(404, f"File not found: {filepath}")
-
-    records = list(SeqIO.parse(filepath, "genbank"))
-    if not records:
-        raise HTTPException(400, "No records found in GenBank file")
-
-    rec = records[0]
-    seq = str(rec.seq)
-
-    annotations = []
-    for feat in rec.features:
-        if feat.type == "source":
-            continue
-        name = (
-            feat.qualifiers.get("label", [None])[0]
-            or feat.qualifiers.get("gene", [None])[0]
-            or feat.qualifiers.get("product", [None])[0]
-            or feat.qualifiers.get("note", [None])[0]
-            or feat.type
-        )
-        color = feat.qualifiers.get("ApEinfo_fwdcolor", [None])[0] or FEATURE_COLORS.get(feat.type, "#95A5A6")
-        annotations.append({
-            "name": name,
-            "start": int(feat.location.start),
-            "end": int(feat.location.end),
-            "direction": 1 if feat.location.strand == 1 else -1,
-            "color": color,
-            "type": feat.type,
-        })
-
-    return {
-        "name": rec.name or rec.id or "Unknown",
-        "description": rec.description or "",
-        "seq": seq,
-        "annotations": annotations,
-        "length": len(seq),
-        "topology": rec.annotations.get("topology", "linear"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Shared primer utilities
-# ---------------------------------------------------------------------------
-def _reverse_complement(seq: str) -> str:
-    comp = {"A": "T", "T": "A", "G": "C", "C": "G",
-            "a": "t", "t": "a", "g": "c", "c": "g",
-            "N": "N", "n": "n"}
-    return "".join(comp.get(b, "N") for b in reversed(seq))
-
-
-def _gc_content(seq: str) -> float:
-    if not seq:
-        return 0.0
-    s = seq.upper()
-    gc = sum(1 for b in s if b in "GC")
-    return gc / len(s)
-
-
-def _calc_tm(seq: str) -> float:
-    """Nearest-neighbour Tm via BioPython, with simple fallback."""
-    seq_upper = seq.upper()
-    try:
-        from Bio.SeqUtils.MeltingTemp import Tm_NN, DNA_NN4
-        from Bio.Seq import Seq
-        tm = Tm_NN(Seq(seq_upper), nn_table=DNA_NN4)
-        return round(tm, 1)
-    except Exception:
-        pass
-    a = seq_upper.count("A")
-    t = seq_upper.count("T")
-    g = seq_upper.count("G")
-    c = seq_upper.count("C")
-    length = a + t + g + c
-    if length == 0:
-        return 0.0
-    if length <= 13:
-        return float((a + t) * 2 + (g + c) * 4)
-    return round(64.9 + 41 * (g + c - 16.4) / length, 1)
-
-# Nearest-Neighbor thermodynamics for DNA/DNA (SantaLucia 1998)
-# Values are (Delta H in kcal/mol, Delta S in cal/K/mol)
-NN_THERMO = {
-    "AA": (-7.9, -22.2), "TT": (-7.9, -22.2),
-    "AT": (-7.2, -20.4), "TA": (-7.2, -21.3),
-    "CA": (-8.5, -22.7), "TG": (-8.5, -22.7),
-    "GT": (-8.4, -22.4), "AC": (-8.4, -22.4),
-    "CT": (-7.8, -21.0), "AG": (-7.8, -21.0),
-    "GA": (-8.2, -22.2), "TC": (-8.2, -22.2),
-    "CG": (-10.6, -27.2), "GC": (-9.8, -24.4),
-    "GG": (-8.0, -19.9), "CC": (-8.0, -19.9),
+function _loadSeqVizDeps() {
+  if (_scriptsLoaded) return Promise.resolve();
+  if (_scriptsLoading) {
+    return new Promise(function(resolve) {
+      var iv = setInterval(function() { if (_scriptsLoaded) { clearInterval(iv); resolve(); } }, 100);
+    });
+  }
+  _scriptsLoading = true;
+  return _loadScript('https://unpkg.com/react@18/umd/react.production.min.js')
+    .then(function() { return _loadScript('https://unpkg.com/react-dom@18/umd/react-dom.production.min.js'); })
+    .then(function() { return _loadScript('https://unpkg.com/seqviz'); })
+    .then(function() { _scriptsLoaded = true; _cl.seqvizReady = true; })
+    .catch(function(err) {
+      console.error('SeqViz loading failed:', err);
+      toast('Could not load SeqViz viewer \u2014 check internet connection', true);
+    });
 }
 
-def _calc_delta_g(seq: str, temp_c: float = 60.0) -> float:
-    """Calculate the Gibbs Free Energy (ΔG) in kcal/mol for a given sequence."""
-    seq = seq.upper()
-    if len(seq) < 2:
-        return 0.0
-
-    dH, dS = 0.0, 0.0
-    for i in range(len(seq) - 1):
-        pair = seq[i:i+2]
-        if pair in NN_THERMO:
-            h, s = NN_THERMO[pair]
-            dH += h
-            dS += s
-
-    # Basic initiation parameters
-    if seq[0] in "GC":
-        dH += 0.1; dS -= 2.8
-    else:
-        dH += 2.3; dS += 4.1
-
-    if seq[-1] in "GC":
-        dH += 0.1; dS -= 2.8
-    else:
-        dH += 2.3; dS += 4.1
-
-    # ΔG = ΔH - TΔS (convert temperature to Kelvin and dS to kcal)
-    temp_k = temp_c + 273.15
-    dG = dH - (temp_k * dS / 1000.0)
-    return round(dG, 2)
-def _get_seq_region(template: str, start: int, length: int) -> str:
-    """Get a region from template, wrapping around for circular sequences."""
-    tpl_len = len(template)
-    out = []
-    for i in range(length):
-        out.append(template[(start + i) % tpl_len])
-    return "".join(out)
-
-
-def _check_primer_quality(seq: str, tm: float) -> list:
-    """Evaluate a primer against standard design rules. Returns list of
-    {level: 'pass'|'warn'|'error', rule: str, detail: str}."""
-    checks = []
-    s = seq.upper()
-    length = len(s)
-
-    # Length
-    if length < 18:
-        checks.append({"level": "error", "rule": "Length", "detail": f"{length}bp — minimum 18bp recommended"})
-    elif length > 30:
-        checks.append({"level": "warn", "rule": "Length", "detail": f"{length}bp — 18-25bp is typical"})
-    else:
-        checks.append({"level": "pass", "rule": "Length", "detail": f"{length}bp"})
-
-    # GC content
-    gc = _gc_content(s) * 100
-    if gc < 40 or gc > 60:
-        checks.append({"level": "warn", "rule": "GC Content", "detail": f"{gc:.0f}% — 40-60% recommended"})
-    else:
-        checks.append({"level": "pass", "rule": "GC Content", "detail": f"{gc:.0f}%"})
-
-    # GC clamp — last 2 bases at 3' end
-    if length >= 2:
-        last2 = s[-2:]
-        gc_clamp = sum(1 for b in last2 if b in "GC")
-        if gc_clamp == 0:
-            checks.append({"level": "warn", "rule": "GC Clamp", "detail": f"3' end is {last2} — no G/C in last 2 bases"})
-        elif gc_clamp == 2 and length >= 5 and sum(1 for b in s[-5:] if b in "GC") >= 4:
-            checks.append({"level": "warn", "rule": "GC Clamp", "detail": "Strong 3' GC run — may cause mispriming"})
-        else:
-            checks.append({"level": "pass", "rule": "GC Clamp", "detail": f"3' end: ...{last2}"})
-
-    # Homopolymer runs (4+ of same base)
-    max_run_base = ""
-    max_run_len = 0
-    for base in "ATGC":
-        run = 4
-        while base * run in s:
-            run += 1
-        run -= 1
-        if run >= 4 and run > max_run_len:
-            max_run_len = run
-            max_run_base = base
-    if max_run_len >= 4:
-        checks.append({"level": "warn", "rule": "Homopolymer", "detail": f"{max_run_len}× {max_run_base} run detected"})
-    else:
-        checks.append({"level": "pass", "rule": "Homopolymer", "detail": "No runs ≥4"})
-
-    # Tm
-    if tm < 55:
-        checks.append({"level": "error", "rule": "Tm", "detail": f"{tm}°C — below 55°C, too low"})
-    elif tm < 58 or tm > 68:
-        checks.append({"level": "warn", "rule": "Tm", "detail": f"{tm}°C — 58-65°C ideal"})
-    else:
-        checks.append({"level": "pass", "rule": "Tm", "detail": f"{tm}°C"})
-
-    # Self-complementarity
-    if length >= 6:
-        tail = s[-6:]
-        rc_tail = _reverse_complement(tail)
-        if rc_tail in s:
-            checks.append({"level": "warn", "rule": "Self-dimer", "detail": "3' end complement found within primer"})
-        else:
-            checks.append({"level": "pass", "rule": "Self-dimer", "detail": "No obvious 3' self-dimer"})
-
-    # NEW: 3' End Thermodynamic Stability (Energy Density)
-    if length >= 5:
-        last5 = s[-5:]
-        # Calculate ΔG at 37°C which is the standard baseline for 3' end stability analysis
-        last5_dg = _calc_delta_g(last5, temp_c=37.0)
-        if last5_dg > -4.0:
-            checks.append({"level": "warn", "rule": "3' Stability (ΔG)", "detail": f"Weak 3' end ({last5_dg} kcal/mol) — may reduce priming efficiency"})
-        elif last5_dg < -10.0:
-            checks.append({"level": "warn", "rule": "3' Stability (ΔG)", "detail": f"Over-stable 3' end ({last5_dg} kcal/mol) — may cause mispriming"})
-        else:
-            checks.append({"level": "pass", "rule": "3' Stability (ΔG)", "detail": f"{last5_dg} kcal/mol"})
-
-    return checks
-
-
-def _design_annealing_region(template: str, pos: int, direction: str, tm_target: float,
-                              min_len: int = 18, max_len: int = 40, hard_max_len: int = None) -> dict:
-    """Design an annealing region starting from pos in given direction, targeting tm_target.
-    direction: 'forward' (5'->3' on top strand) or 'reverse' (5'->3' on bottom strand, upstream)."""
-    if hard_max_len is not None:
-        max_len = hard_max_len
-    tpl_len = len(template)
-    best_seq = ""
-    best_tm = 0.0
-
-    for anneal_len in range(min_len, max_len + 1):
-        if direction == "forward":
-            candidate = _get_seq_region(template, pos, anneal_len)
-        else:
-            # Reverse: go upstream from pos, then RC
-            bases = []
-            for i in range(anneal_len):
-                bases.append(template[(pos - 1 - i) % tpl_len])
-            candidate = _reverse_complement("".join(bases))
-
-        tm = _calc_tm(candidate)
-        if tm > best_tm:
-            best_seq = candidate
-            best_tm = tm
-        if tm >= tm_target:
-            break
-
-    quality = _check_primer_quality(best_seq, best_tm)
-    return {
-        "seq": best_seq,
-        "tm": best_tm,
-        "delta_g": _calc_delta_g(best_seq, best_tm), # NEW
-        "length": len(best_seq),
-        "gc_percent": round(_gc_content(best_seq) * 100, 1),
-        "quality": quality,
-    }
-
-
-# ---------------------------------------------------------------------------
-# KLD Primer Design
-# ---------------------------------------------------------------------------
-def _score_split(insert_seq: str, pos: int) -> float:
-    if pos <= 0 or pos >= len(insert_seq):
-        return 0.0
-    left_start = max(0, pos - 2)
-    right_end = min(len(insert_seq), pos + 2)
-    window = insert_seq[left_start:right_end].upper()
-    if not window:
-        return 0.0
-    return sum(1 for b in window if b in "GC") / len(window)
-
-def design_kld_primers(template_seq: str, insert_seq: str = "",
-                       start_pos: int = 0, end_pos: int = None,
-                       optimize: bool = False, tm_target: float = 62.0,
-                       max_len: int = 60):
-    import time
-    t0 = time.time()
-    template_seq = template_seq.upper().replace(" ", "").replace("\n", "")
-    insert_seq = (insert_seq or "").upper().replace(" ", "").replace("\n", "")
-    if end_pos is None:
-        end_pos = start_pos
-
-    if not template_seq:
-        raise HTTPException(400, "Template sequence is empty")
-
-    tpl_len = len(template_seq)
-    ins_len = len(insert_seq)
-    split_points = list(range(ins_len + 1)) if ins_len > 0 else [0]
-
-    print(f"[KLD] start={start_pos} end={end_pos} insert={ins_len}bp optimize={optimize} "
-          f"range={end_pos-start_pos+1} splits={len(split_points)} max_len={max_len}", flush=True)
-
-    best_overall_score = -float('inf')
-    best_result = None
-
-    search_stats = {"junction_pairs": 0, "split_points": len(split_points),
-                    "candidates_generated": 0, "pairs_scored": 0}
-
-    # ── Helper: full-analysis scoring for a (start, end, split) combo
-    def _score_combo(s, e, sp):
-        nonlocal best_overall_score, best_result
-        fwd_tail = insert_seq[sp:]
-        rev_tail = _reverse_complement(insert_seq[:sp])
-        f_max_ann = max_len - len(fwd_tail)
-        r_max_ann = max_len - len(rev_tail)
-        if f_max_ann < 12 or r_max_ann < 12:
-            return
-
-        f_cands = _generate_primer_candidates(
-            template_seq, e, "forward", fwd_tail, tm_target,
-            min_len=12, max_len=f_max_ann, max_total=max_len, lightweight=False)
-        r_cands = _generate_primer_candidates(
-            template_seq, s, "reverse", rev_tail, tm_target,
-            min_len=12, max_len=r_max_ann, max_total=max_len, lightweight=False)
-        search_stats["candidates_generated"] += len(f_cands) + len(r_cands)
-        if not f_cands or not r_cands:
-            return
-
-        f, r = f_cands[0], r_cands[0]
-
-        # Check annealing overlap on circular template
-        amplicon_space = tpl_len - (e - s)
-        if amplicon_space < len(f['annealing']) + len(r['annealing']):
-            return
-
-        tm_err = abs(f['tm'] - tm_target) + abs(r['tm'] - tm_target)
-        tm_delta = abs(f['tm'] - r['tm'])
-        ss_penalty = 0
-        if f.get('hairpin') or r.get('hairpin'): ss_penalty += 25
-        if f.get('homodimer_dg', 0) < -12.0: ss_penalty += 15
-        score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
-        search_stats["pairs_scored"] += 1
-
-        if score > best_overall_score:
-            best_overall_score = score
-            best_result = {
-                "fwd_all": f_cands, "rev_all": r_cands,
-                "actual_start": s, "actual_end": e,
-                "split": sp,
-            }
-
-    # ══════════════════════════════════════════════════════════════
-    # PHASE 1: Baseline — full analysis at the exact (start, end)
-    # This always runs, so optimize can only improve on it.
-    # ══════════════════════════════════════════════════════════════
-    for sp in split_points:
-        _score_combo(start_pos, end_pos, sp)
-    search_stats["junction_pairs"] = 1
-
-    baseline_score = best_overall_score
-    print(f"[KLD] baseline done in {time.time()-t0:.2f}s  score={baseline_score:.1f}  "
-          f"candidates={search_stats['candidates_generated']}", flush=True)
-
-    # ══════════════════════════════════════════════════════════════
-    # PHASE 2: Optimize — lightweight scan of ALL (s, e) pairs,
-    # then full refinement of top candidates.
-    # ══════════════════════════════════════════════════════════════
-    if optimize and (end_pos - start_pos) > 0:
-        positions = list(range(start_pos, end_pos + 1))
-        n_pos = len(positions)
-        n_junction_pairs = n_pos * (n_pos + 1) // 2
-        search_stats["junction_pairs"] = n_junction_pairs
-
-        TOP_N = 50
-        TOP_K = 3  # Consider top-K annealing lengths per position (not just best)
-        shortlist = []  # [(score, start, end, split), ...]
-
-        print(f"[KLD] optimize: {n_pos} positions, {n_junction_pairs} pairs, "
-              f"{len(split_points)} splits, TOP_N={TOP_N}, TOP_K={TOP_K}", flush=True)
-
-        for si, sp in enumerate(split_points):
-            t_sp = time.time()
-            fwd_tail = insert_seq[sp:]
-            rev_tail = _reverse_complement(insert_seq[:sp])
-            f_max_ann = max_len - len(fwd_tail)
-            r_max_ann = max_len - len(rev_tail)
-            if f_max_ann < 12 or r_max_ann < 12:
-                continue
-
-            # Pre-compute forward candidates (LIGHTWEIGHT)
-            fwd_cache = {}
-            for pos in positions:
-                cands = _generate_primer_candidates(
-                    template_seq, pos, "forward", fwd_tail, tm_target,
-                    min_len=12, max_len=f_max_ann, max_total=max_len, lightweight=True)
-                search_stats["candidates_generated"] += len(cands)
-                if cands:
-                    fwd_cache[pos] = cands
-
-            # Pre-compute reverse candidates (LIGHTWEIGHT)
-            rev_cache = {}
-            for pos in positions:
-                cands = _generate_primer_candidates(
-                    template_seq, pos, "reverse", rev_tail, tm_target,
-                    min_len=12, max_len=r_max_ann, max_total=max_len, lightweight=True)
-                search_stats["candidates_generated"] += len(cands)
-                if cands:
-                    rev_cache[pos] = cands
-
-            # Score (s, e) pairs — test top-K annealing lengths, not just best
-            pairs_this_split = 0
-            for s in positions:
-                if s not in rev_cache:
-                    continue
-                r_top = rev_cache[s][:TOP_K]
-                for e in positions:
-                    if e < s:
-                        continue
-                    if e not in fwd_cache:
-                        continue
-                    f_top = fwd_cache[e][:TOP_K]
-
-                    for f_best in f_top:
-                        f_ann_len = len(f_best['annealing'])
-                        for r_best in r_top:
-                            r_ann_len = len(r_best['annealing'])
-
-                            # Skip overlapping annealing regions
-                            amplicon_space = tpl_len - (e - s)
-                            if amplicon_space < f_ann_len + r_ann_len:
-                                continue
-
-                            tm_err = abs(f_best['tm'] - tm_target) + abs(r_best['tm'] - tm_target)
-                            tm_delta = abs(f_best['tm'] - r_best['tm'])
-                            score = -(tm_err * 2) - (tm_delta * 4)
-                            search_stats["pairs_scored"] += 1
-                            pairs_this_split += 1
-
-                            if len(shortlist) < TOP_N or score > shortlist[-1][0]:
-                                shortlist.append((score, s, e, sp))
-                                shortlist.sort(key=lambda x: x[0], reverse=True)
-                                if len(shortlist) > TOP_N:
-                                    shortlist.pop()
-
-            t_score = time.time()
-            if (si + 1) % max(1, len(split_points) // 10) == 0 or si == len(split_points) - 1:
-                print(f"[KLD]   split {si+1}/{len(split_points)}: "
-                      f"{t_score-t_sp:.2f}s  pairs={pairs_this_split}  "
-                      f"elapsed={t_score-t0:.1f}s", flush=True)
-
-        print(f"[KLD] scan done in {time.time()-t0:.2f}s  "
-              f"pairs_scored={search_stats['pairs_scored']}  shortlist={len(shortlist)}", flush=True)
-
-        # ── Refine: full thermodynamic analysis on shortlisted candidates
-        # Deduplicate shortlist entries (same s,e,sp can appear from different K combos)
-        seen = set()
-        unique_shortlist = []
-        for entry in shortlist:
-            key = (entry[1], entry[2], entry[3])  # (s, e, sp)
-            if key not in seen:
-                seen.add(key)
-                unique_shortlist.append(entry)
-
-        if unique_shortlist:
-            t_full = time.time()
-            for rank, (tm_score, cand_s, cand_e, cand_sp) in enumerate(unique_shortlist):
-                _score_combo(cand_s, cand_e, cand_sp)
-
-            print(f"[KLD] refined {len(unique_shortlist)} candidates in {time.time()-t_full:.3f}s  "
-                  f"baseline_score={baseline_score:.1f} -> final_score={best_overall_score:.1f}", flush=True)
-            search_stats["shortlist_refined"] = len(unique_shortlist)
-
-    if not best_result:
-        raise HTTPException(400, "No viable primers found in this range.")
-
-    fwd_primer = _pick_best_with_alternatives(best_result["fwd_all"], "Forward", max_alternatives=None)
-    rev_primer = _pick_best_with_alternatives(best_result["rev_all"], "Reverse", max_alternatives=None)
-
-    # Construct result product
-    product = template_seq[:best_result["actual_start"]] + insert_seq + template_seq[best_result["actual_end"]:]
-
-    split = best_result["split"]
-
-    # Build warnings
-    warnings = []
-    if abs(fwd_primer['tm'] - rev_primer['tm']) > 3:
-        warnings.append("Tm mismatch > 3°C")
-    amplicon_space = tpl_len - (best_result["actual_end"] - best_result["actual_start"])
-    fwd_ann_len = len(fwd_primer.get('annealing', ''))
-    rev_ann_len = len(rev_primer.get('annealing', ''))
-    gap = amplicon_space - fwd_ann_len - rev_ann_len
-    if gap < 10:
-        warnings.append(f"Tight primer spacing — only {gap}bp gap between annealing regions")
-
-    print(f"[KLD] DONE in {time.time()-t0:.2f}s  start_used={best_result['actual_start']} "
-          f"end_used={best_result['actual_end']} split={split} score={best_overall_score:.1f}", flush=True)
-
-    return {
-        "forward": fwd_primer,
-        "reverse": rev_primer,
-        "start_used": best_result["actual_start"],
-        "end_used": best_result["actual_end"],
-        "insert_split": split,
-        "split_position": split,
-        "insert_length": len(insert_seq),
-        "split_gc_score": round(_score_split(insert_seq, split), 2) if insert_seq else 0.0,
-        "product_length": len(product),
-        "search_stats": search_stats,
-        "warnings": warnings
-    }
-
-
-# ---------------------------------------------------------------------------
-# Custom Primer Evaluation
-# ---------------------------------------------------------------------------
-def evaluate_custom_primer(template_seq, start, end, direction):
-    template_seq = template_seq.upper().replace(" ", "").replace("\n", "")
-    tpl_len = len(template_seq)
-
-    if start < 0 or end < 0 or start >= tpl_len or end > tpl_len:
-        raise HTTPException(400, f"Positions out of range (0-{tpl_len})")
-    if start >= end:
-        raise HTTPException(400, "Start must be less than end")
-    if direction not in ("forward", "reverse"):
-        raise HTTPException(400, "Direction must be 'forward' or 'reverse'")
-
-    region = template_seq[start:end]
-
-    if direction == "reverse":
-        primer_seq = _reverse_complement(region)
-    else:
-        primer_seq = region
-
-    tm = _calc_tm(primer_seq)
-    quality = _check_primer_quality(primer_seq, tm)
-
-    return {
-        "primer_seq": primer_seq,
-        "template_region": region,
-        "start": start,
-        "end": end,
-        "direction": direction,
-        "tm": tm,
-        "length": len(primer_seq),
-        "gc_percent": round(_gc_content(primer_seq) * 100, 1),
-        "delta_g": _calc_delta_g(primer_seq, temp_c=tm if tm > 0 else 60.0),
-        "homodimer_dg": _calc_homodimer_dg(primer_seq, temp_c=25.0),
-        "hairpin": _has_hairpin(primer_seq),
-        "self_dimer": _has_self_dimer(primer_seq),
-        "quality": quality,
-    }
-
-
-# ---------------------------------------------------------------------------
-# PCR Primer Design
-# ---------------------------------------------------------------------------
-def design_pcr_primers(template_seq, target_start, target_end, tm_target=62.0):
-    template_seq = template_seq.upper().replace(" ", "").replace("\n", "")
-    tpl_len = len(template_seq)
-
-    if target_start < 0 or target_end > tpl_len or target_start >= target_end:
-        raise HTTPException(400, f"Invalid target region ({target_start}-{target_end}), template is {tpl_len}bp")
-
-    # Design forward primer candidates at target_start (no tail for PCR)
-    fwd_candidates = _generate_primer_candidates(template_seq, target_start, "forward", "", tm_target)
-    fwd = _pick_best_with_alternatives(fwd_candidates, "Forward")
-
-    # Design reverse primer candidates at target_end
-    rev_candidates = _generate_primer_candidates(template_seq, target_end, "reverse", "", tm_target)
-    rev = _pick_best_with_alternatives(rev_candidates, "Reverse")
-
-    total_amplicon = target_end - target_start
-
-    # Tm difference between primers
-    tm_diff = abs(fwd["tm"] - rev["tm"])
-    warnings = []
-    if tm_diff > 5:
-        warnings.append(f"Tm difference between primers is {tm_diff:.1f}°C — ideally <5°C")
-    if fwd.get("hairpin"):
-        warnings.append("Forward primer may form hairpin")
-    if fwd.get("homodimer_dg", 0) < -9.0:
-        warnings.append(f"Forward primer has strong self-dimer (ΔG = {fwd['homodimer_dg']} kcal/mol)")
-    if rev.get("hairpin"):
-        warnings.append("Reverse primer may form hairpin")
-    if rev.get("homodimer_dg", 0) < -9.0:
-        warnings.append(f"Reverse primer has strong self-dimer (ΔG = {rev['homodimer_dg']} kcal/mol)")
-
-    # Add seq alias and position for frontend compatibility
-    fwd["seq"] = fwd["full_seq"]
-    fwd["position"] = target_start
-    rev["seq"] = rev["full_seq"]
-    rev["position"] = target_end
-
-    return {
-        "forward": fwd,
-        "reverse": rev,
-        "amplicon_length": total_amplicon,
-        "target_length": target_end - target_start,
-        "tm_diff": round(tm_diff, 1),
-        "warnings": warnings,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Sequencing Primer Design
-# ---------------------------------------------------------------------------
-def design_seq_primers(template_seq, region_start, region_end, read_length=900, tm_target=62.0):
-    template_seq = template_seq.upper().replace(" ", "").replace("\n", "")
-    tpl_len = len(template_seq)
-
-    if region_start < 0 or region_end > tpl_len or region_start >= region_end:
-        raise HTTPException(400, f"Invalid region ({region_start}-{region_end}), template is {tpl_len}bp")
-
-    region_length = region_end - region_start
-
-    # Usable read: first ~50bp often low quality, so effective read = read_length - 50
-    effective_read = read_length - 50
-    # Overlap between reads for confidence: ~100bp
-    step = effective_read - 100  # ~750bp between primer starts
-
-    if step < 200:
-        step = 200
-
-    primers = []
-    pos = region_start
-
-    # First primer placed ~50bp upstream of region start to cover the start
-    first_pos = max(0, region_start - 50)
-    pos = first_pos
-
-    idx = 0
-    while pos < region_end:
-        # Design primer candidates at this position (no tail for sequencing primers)
-        candidates = _generate_primer_candidates(template_seq, pos, "forward", "", tm_target)
-        best = _pick_best_with_alternatives(candidates, f"Seq_{idx + 1}")
-        read_start = pos
-        read_end = min(pos + read_length, tpl_len)
-
-        if best:
-            # Add seq alias and sequencing-specific fields for frontend compatibility
-            best["seq"] = best["full_seq"]
-            best["index"] = idx + 1
-            best["position"] = pos
-            best["direction"] = "forward"
-            best["read_covers"] = f"{read_start}-{read_end}"
-            best["effective_start"] = pos + 50
-            best["effective_end"] = min(pos + read_length, tpl_len)
-            primers.append(best)
-
-        pos += step
-        idx += 1
-
-        # Safety: don't design more than 20 primers
-        if idx >= 20:
-            break
-
-    # Check coverage
-    total_coverage = region_length
-    if len(primers) > 0:
-        last = primers[-1]
-        covered_end = last["effective_end"]
-        if covered_end < region_end:
-            gap = region_end - covered_end
-            # Note about incomplete coverage
-            pass
-
-    return {
-        "primers": primers,
-        "num_primers": len(primers),
-        "region_length": region_length,
-        "read_length": read_length,
-        "step_size": step,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Product Generation (KLD / PCR)
-# ---------------------------------------------------------------------------
-def _build_product(mode, template_seq, annotations, template_name="template",
-                   template_topology="circular",
-                   insertion_pos=None, insert_seq=None, insert_label="insert",
-                   target_start=None, target_end=None,
-                   start_pos=None, end_pos=None):
-    """Build a product sequence with remapped annotations.
-    Returns SeqViz-compatible dict with name, seq, annotations, length, topology."""
-    template_seq = template_seq.upper()
-    anns = annotations or []
-
-    if mode == "kld":
-        # Support both old single insertion_pos and new start/end range
-        kld_start = start_pos if start_pos is not None else (insertion_pos if insertion_pos is not None else None)
-        kld_end = end_pos if end_pos is not None else kld_start
-        if kld_start is None or insert_seq is None:
-            raise HTTPException(400, "KLD mode requires start_pos (or insertion_pos) and insert_seq")
-        insert_seq = insert_seq.upper().replace(" ", "").replace("\n", "")
-        ins_len = len(insert_seq)
-        deleted_len = kld_end - kld_start  # 0 for pure insertion
-        product_seq = template_seq[:kld_start] + insert_seq + template_seq[kld_end:]
-        if deleted_len > 0 and ins_len > 0:
-            product_name = f"{template_name}_KLD_replace_{kld_start}-{kld_end}_{insert_label}"
-        elif deleted_len > 0:
-            product_name = f"{template_name}_KLD_del_{kld_start}-{kld_end}"
-        else:
-            product_name = f"{template_name}_KLD_{insert_label}"
-        topology = template_topology  # stays circular
-
-        # Net shift = insert_length - deleted_length
-        net_shift = ins_len - deleted_len
-
-        # Remap annotations
-        new_anns = []
-        for a in anns:
-            s, e = a.get("start", 0), a.get("end", 0)
-            if e <= kld_start:
-                # Entirely before affected region — unchanged
-                new_anns.append(dict(a))
-            elif s >= kld_end:
-                # Entirely after affected region — shift by net change
-                na = dict(a)
-                na["start"] = s + net_shift
-                na["end"] = e + net_shift
-                new_anns.append(na)
-            else:
-                # Overlaps affected region — mark as disrupted
-                na = dict(a)
-                na["end"] = max(na["start"] + 1, e + net_shift)
-                na["name"] = a.get("name", "?") + " (disrupted)"
-                na["color"] = "#e74c3c"
-                new_anns.append(na)
-
-        # Add insert as a feature (only if there's actual insert sequence)
-        if ins_len > 0:
-            new_anns.append({
-                "name": insert_label or "insert",
-                "start": kld_start,
-                "end": kld_start + ins_len,
-                "direction": 1,
-                "color": "#27ae60",
-                "type": "misc_feature",
-            })
-
-    elif mode == "pcr":
-        if target_start is None or target_end is None:
-            raise HTTPException(400, "PCR mode requires target_start and target_end")
-        product_seq = template_seq[target_start:target_end]
-        product_name = f"{template_name}_PCR_{target_start}-{target_end}"
-        topology = "linear"  # PCR products are linear
-
-        # Remap annotations — keep only those within amplicon
-        new_anns = []
-        for a in anns:
-            s, e = a.get("start", 0), a.get("end", 0)
-            if s >= target_start and e <= target_end:
-                # Fully inside amplicon — shift
-                na = dict(a)
-                na["start"] = s - target_start
-                na["end"] = e - target_start
-                new_anns.append(na)
-            elif s < target_end and e > target_start:
-                # Partially overlapping — trim to amplicon bounds
-                na = dict(a)
-                na["start"] = max(0, s - target_start)
-                na["end"] = min(len(product_seq), e - target_start)
-                if na["end"] > na["start"]:
-                    na["name"] = a.get("name", "?") + " (trimmed)"
-                    new_anns.append(na)
-    else:
-        raise HTTPException(400, f"Unknown mode: {mode}")
-
-    return {
-        "name": product_name,
-        "description": f"Expected product from {mode.upper()} on {template_name}",
-        "seq": product_seq,
-        "annotations": new_anns,
-        "length": len(product_seq),
-        "topology": topology,
-    }
-
-
-def _write_genbank(product_data: dict) -> str:
-    """Write a product dict to GenBank-format string using BioPython."""
-    from Bio.Seq import Seq
-    from Bio.SeqRecord import SeqRecord
-    from Bio.SeqFeature import SeqFeature, FeatureLocation
-    from io import StringIO
-
-    record = SeqRecord(
-        Seq(product_data["seq"]),
-        id=product_data["name"][:16],  # GenBank ID max 16 chars
-        name=product_data["name"][:16],
-        description=product_data.get("description", ""),
-    )
-    record.annotations["molecule_type"] = "DNA"
-    record.annotations["topology"] = product_data.get("topology", "linear")
-
-    for a in product_data.get("annotations", []):
-        strand = 1 if a.get("direction", 1) == 1 else -1
-        feat = SeqFeature(
-            FeatureLocation(a["start"], a["end"], strand=strand),
-            type=a.get("type", "misc_feature"),
-            qualifiers={
-                "label": [a.get("name", "feature")],
-                "ApEinfo_fwdcolor": [a.get("color", "#95A5A6")],
-            },
-        )
-        record.features.append(feat)
-
-    output = StringIO()
-    from Bio import SeqIO as _SeqIO
-    _SeqIO.write(record, output, "genbank")
-    return output.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# ORF Finder
-# ---------------------------------------------------------------------------
-CODON_TABLE = {
-    'TTT': 'F', 'TTC': 'F', 'TTA': 'L', 'TTG': 'L', 'CTT': 'L', 'CTC': 'L',
-    'CTA': 'L', 'CTG': 'L', 'ATT': 'I', 'ATC': 'I', 'ATA': 'I', 'ATG': 'M',
-    'GTT': 'V', 'GTC': 'V', 'GTA': 'V', 'GTG': 'V', 'TCT': 'S', 'TCC': 'S',
-    'TCA': 'S', 'TCG': 'S', 'CCT': 'P', 'CCC': 'P', 'CCA': 'P', 'CCG': 'P',
-    'ACT': 'T', 'ACC': 'T', 'ACA': 'T', 'ACG': 'T', 'GCT': 'A', 'GCC': 'A',
-    'GCA': 'A', 'GCG': 'A', 'TAT': 'Y', 'TAC': 'Y', 'TAA': '*', 'TAG': '*',
-    'CAT': 'H', 'CAC': 'H', 'CAA': 'Q', 'CAG': 'Q', 'AAT': 'N', 'AAC': 'N',
-    'AAA': 'K', 'AAG': 'K', 'GAT': 'D', 'GAC': 'D', 'GAA': 'E', 'GAG': 'E',
-    'TGT': 'C', 'TGC': 'C', 'TGA': '*', 'TGG': 'W', 'CGT': 'R', 'CGC': 'R',
-    'CGA': 'R', 'CGG': 'R', 'AGT': 'S', 'AGC': 'S', 'AGA': 'R', 'AGG': 'R',
-    'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G',
+/* ── data loading ──────────────────────────────────────────── */
+function _clLoadSequences() {
+  return api('GET', '/api/cloning/sequences').then(function(d) { _cl.sequences = d.items || []; });
 }
-STOP_CODONS = {'TAA', 'TAG', 'TGA'}
 
+function _clLoadConfig() {
+  return api('GET', '/api/cloning/config').then(function(d) { _cl.ocUrl = d.opencloning_url || ''; });
+}
 
-def _translate_seq(seq: str) -> str:
-    """Translate a DNA sequence to protein (standard code)."""
-    seq = seq.upper()
-    protein = []
-    for i in range(0, len(seq) - 2, 3):
-        codon = seq[i:i + 3]
-        aa = CODON_TABLE.get(codon, 'X')
-        protein.append(aa)
-    return "".join(protein)
+function _clSelectSequence(type, id) {
+  _cl.selected = { type: type, id: id };
+  _cl.parsed = null;
+  _cl.loading = true;
+  // Reset all primer results and product preview
+  _cl.pd.custom.result = null;
+  _cl.pd.pcr.result = null;
+  _cl.pd.seq.result = null;
+  _cl.pd.kld.result = null;
+  _cl.pd.kld.selectedFwdIdx = 0;
+  _cl.pd.kld.selectedRevIdx = 0;
+  _cl.pd._viewingProduct = false;
+  _cl.pd._productPreview = null;
+  _cl.pd._productBaseBody = null;
+  _cl.featuresDirty = false;
+  _cl.editFeature = null;
+  _cl.sa.orfs.result = null;
+  _cl.sa.re.result = null;
+  _cl.sa.tools.result = null;
+  _cl.sa.digest.result = null;
+  _cl.sa.blast.result = null;
+  _cl.sa.blast.seq = '';
+  _cl.sa.scan.result = null;
+  _cl.search.query = '';
+  _cl.ad.gibson.result = null;
+  _cl.ad.goldengate.result = null;
+  _cl.ad.digestligate.result = null;
+  _cl.ad._libPicker = null;
+  _cl.search.results = null;
+  _cl.search.activeIdx = 0;
+  _cl.search.open = false;
+  _clRender();
 
+  api('GET', '/api/cloning/sequences/' + type + '/' + id + '/parse')
+    .then(function(data) {
+      _cl.parsed = data;
+      _cl.loading = false;
+      _clRender();
+      setTimeout(function() { _clRenderSeqViz(); }, 50);
+    })
+    .catch(function(err) {
+      _cl.loading = false;
+      toast('Failed to parse GenBank file: ' + (err.message || err), true);
+      _clRender();
+    });
+}
 
-def find_orfs(seq: str, min_length: int = 100, circular: bool = True) -> list:
-    """Find all ORFs (ATG to stop) in all 6 frames."""
-    seq = seq.upper()
-    slen = len(seq)
-    # For circular sequences, search with wrap-around
-    search_seq = seq + seq if circular else seq
-    search_len = len(search_seq)
+/* ── SeqViz renderer ───────────────────────────────────────── */
+function _clRenderSeqViz() {
+  if (!_cl.parsed || !_cl.seqvizReady) return;
+  if (typeof window.seqviz === 'undefined') return;
 
-    orfs = []
-    # Forward frames 1,2,3
-    for frame_offset in range(3):
-        i = frame_offset
-        in_orf = False
-        orf_start = 0
-        while i + 2 < search_len:
-            codon = search_seq[i:i + 3]
-            if not in_orf:
-                if codon == 'ATG':
-                    in_orf = True
-                    orf_start = i
-            else:
-                if codon in STOP_CODONS:
-                    orf_end = i + 3
-                    orf_len = orf_end - orf_start
-                    if orf_len >= min_length:
-                        # Normalise positions for circular
-                        real_start = orf_start % slen
-                        real_end = orf_end % slen if orf_end <= slen else orf_end % slen
-                        orf_seq = search_seq[orf_start:orf_end]
-                        protein = _translate_seq(orf_seq)
-                        orfs.append({
-                            "frame": frame_offset + 1,
-                            "direction": 1,
-                            "start": real_start,
-                            "end": real_end if real_end > 0 else slen,
-                            "length_bp": orf_len,
-                            "length_aa": len(protein) - 1,  # minus stop
-                            "protein": protein.rstrip('*'),
-                        })
-                    in_orf = False
-                    # Don't skip, next ATG might start right after
-            i += 3
-            # For circular, stop searching once we've gone past one full length
-            if circular and orf_start >= slen:
-                break
-            if circular and i >= slen * 2:
-                break
+  var el = document.getElementById('cl-seqviz-mount');
+  if (!el) return;
+  el.innerHTML = '';
 
-    # Reverse complement frames
-    rc_seq = _reverse_complement(seq)
-    search_rc = rc_seq + rc_seq if circular else rc_seq
-    search_rc_len = len(search_rc)
+  var annotations = (_cl.parsed.annotations || []).map(function(a) {
+    return { name: a.name, start: a.start, end: a.end, direction: a.direction || 1, color: a.color || '#95A5A6' };
+  });
 
-    for frame_offset in range(3):
-        i = frame_offset
-        in_orf = False
-        orf_start = 0
-        while i + 2 < search_rc_len:
-            codon = search_rc[i:i + 3]
-            if not in_orf:
-                if codon == 'ATG':
-                    in_orf = True
-                    orf_start = i
-            else:
-                if codon in STOP_CODONS:
-                    orf_end = i + 3
-                    orf_len = orf_end - orf_start
-                    if orf_len >= min_length:
-                        # Map back to top strand coordinates
-                        rc_start = orf_start % slen
-                        rc_end = orf_end % slen if orf_end <= slen else orf_end % slen
-                        # On top strand: start = slen - rc_end, end = slen - rc_start
-                        top_start = (slen - (orf_end % slen)) % slen
-                        top_end = (slen - (orf_start % slen)) % slen
-                        if top_end == 0:
-                            top_end = slen
-                        orf_seq = search_rc[orf_start:orf_end]
-                        protein = _translate_seq(orf_seq)
-                        orfs.append({
-                            "frame": -(frame_offset + 1),
-                            "direction": -1,
-                            "start": top_start,
-                            "end": top_end,
-                            "length_bp": orf_len,
-                            "length_aa": len(protein) - 1,
-                            "protein": protein.rstrip('*'),
-                        })
-                    in_orf = False
-            i += 3
-            if circular and orf_start >= slen:
-                break
-            if circular and i >= slen * 2:
-                break
+  var seqLen = (_cl.parsed.seq || '').length;
+  var pd = _cl.pd;
 
-    # Sort by length descending
-    orfs.sort(key=lambda o: o["length_bp"], reverse=True)
-    # Deduplicate (circular can produce duplicates)
-    seen = set()
-    unique = []
-    for o in orfs:
-        key = (o["start"], o["end"], o["direction"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(o)
-    return unique
-
-
-# ---------------------------------------------------------------------------
-# Restriction Enzyme Analysis
-# ---------------------------------------------------------------------------
-# Common commercial enzymes for quick analysis
-COMMON_ENZYMES = [
-    "EcoRI", "BamHI", "HindIII", "XhoI", "NdeI", "NcoI", "SalI", "XbaI",
-    "PstI", "SphI", "KpnI", "SacI", "SacII", "NotI", "EcoRV", "ClaI",
-    "BglII", "NheI", "MluI", "ApaI", "SpeI", "BsrGI", "AflII", "AscI",
-    "FseI", "PacI", "SwaI", "PmeI", "SfiI", "SmaI", "AgeI", "BspEI",
-    "MfeI", "AvrII", "BsiWI", "BlpI", "BstBI", "DraI", "StuI", "ScaI",
-]
-
-
-def find_restriction_sites(seq: str, enzyme_names: list = None, circular: bool = True) -> dict:
-    """Find restriction enzyme cut sites using BioPython."""
-    seq = seq.upper()
-    try:
-        from Bio.Seq import Seq
-        from Bio.Restriction import RestrictionBatch, Analysis, AllEnzymes
-    except ImportError:
-        raise HTTPException(500, "BioPython Restriction module not available")
-
-    if enzyme_names:
-        # Filter to valid enzyme names
-        batch = RestrictionBatch()
-        for name in enzyme_names:
-            try:
-                batch.add(name)
-            except (ValueError, KeyError):
-                pass  # skip unknown enzymes
-        if not batch:
-            raise HTTPException(400, "No valid enzyme names provided")
-    else:
-        # Use common set
-        batch = RestrictionBatch()
-        for name in COMMON_ENZYMES:
-            try:
-                batch.add(name)
-            except (ValueError, KeyError):
-                pass
-
-    bio_seq = Seq(seq)
-    analysis = Analysis(batch, bio_seq, linear=not circular)
-    results = analysis.full()
-
-    enzymes = []
-    for enzyme, positions in results.items():
-        if positions:  # Only include enzymes that cut
-            enzymes.append({
-                "name": str(enzyme),
-                "cut_positions": sorted(positions),
-                "num_cuts": len(positions),
-                "overhang": str(enzyme.ovhg) if hasattr(enzyme, 'ovhg') else "?",
-                "site": str(enzyme.site) if hasattr(enzyme, 'site') else "?",
-            })
-
-    # Sort by number of cuts (single cutters first, most useful)
-    enzymes.sort(key=lambda e: (e["num_cuts"], e["name"]))
-
-    # Summary stats
-    non_cutters = sum(1 for _, p in results.items() if not p)
-    single_cutters = [e for e in enzymes if e["num_cuts"] == 1]
-
-    return {
-        "enzymes": enzymes,
-        "total_cutters": len(enzymes),
-        "non_cutters": non_cutters,
-        "single_cutters": len(single_cutters),
-        "seq_length": len(seq),
+  // Add markers based on current primer design mode
+  if (pd.mode === 'kld') {
+    var kldStart = parseInt(pd.kld.startPos, 10);
+    var kldEnd = parseInt(pd.kld.endPos, 10);
+    if (isNaN(kldEnd)) kldEnd = kldStart;
+    if (!isNaN(kldStart) && kldStart >= 0 && kldStart <= seqLen) {
+      if (kldEnd > kldStart) {
+        // Range deletion/replacement — highlight the region being removed
+        annotations.push({ name: '\u2702 Delete region', start: kldStart, end: Math.min(kldEnd, seqLen), direction: 1, color: '#e74c3c' });
+      } else {
+        // Pure insertion point
+        annotations.push({ name: '\u2702 Insert here', start: Math.max(0, kldStart - 1), end: Math.min(seqLen, kldStart + 1), direction: 1, color: '#e74c3c' });
+      }
     }
+    if (pd.kld.result) {
+      var r = pd.kld.result;
+      var rStart = parseInt(r.start_used, 10);
+      var rEnd = parseInt(r.end_used, 10);
+      // Use selected primer annealing length for map markers
+      var selF = _pdKldGetSelected('fwd');
+      var selR = _pdKldGetSelected('rev');
+      var fwdAnnLen = selF ? selF.annealing.length : r.forward.annealing.length;
+      var revAnnLen = selR ? selR.annealing.length : r.reverse.annealing.length;
+      if (!isNaN(rEnd)) {
+        var fAnnEnd = (rEnd + fwdAnnLen) % seqLen;
+        annotations.push({ name: 'Fwd anneal', start: rEnd, end: fAnnEnd > rEnd ? fAnnEnd : fAnnEnd || seqLen, direction: 1, color: '#2980b9' });
+      }
+      if (!isNaN(rStart)) {
+        var rAnnStart = ((rStart - revAnnLen) % seqLen + seqLen) % seqLen;
+        annotations.push({ name: 'Rev anneal', start: rAnnStart, end: rStart, direction: -1, color: '#8e44ad' });
+      }
+    }
+  } else if (pd.mode === 'custom' && pd.custom.result) {
+    var cr = pd.custom.result;
+    annotations.push({ name: 'Primer', start: cr.start, end: cr.end, direction: cr.direction === 'forward' ? 1 : -1, color: '#2980b9' });
+  } else if (pd.mode === 'pcr' && pd.pcr.result) {
+    var pr = pd.pcr.result;
+    annotations.push({ name: 'Fwd primer', start: pr.forward.position, end: pr.forward.position + pr.forward.length, direction: 1, color: '#2980b9' });
+    var revEnd = pr.reverse.position;
+    var revStart = revEnd - pr.reverse.length;
+    if (revStart < 0) revStart += seqLen;
+    annotations.push({ name: 'Rev primer', start: revStart, end: revEnd, direction: -1, color: '#8e44ad' });
+    annotations.push({ name: 'Amplicon', start: pr.forward.position, end: pr.reverse.position, direction: 1, color: 'rgba(46,204,113,0.25)' });
+  } else if (pd.mode === 'seq' && pd.seq.result) {
+    pd.seq.result.primers.forEach(function(p, i) {
+      annotations.push({ name: 'Seq#' + (i + 1), start: p.position, end: Math.min(p.position + p.length, seqLen), direction: 1, color: '#e67e22' });
+    });
+  } else {
+    // Native SeqViz drag highlight shows the selection — no need for annotation workaround
+  }
 
+  // ── ORF annotations
+  var sa = _cl.sa;
+  if (sa.orfs.showOnMap && sa.orfs.result && sa.orfs.result.orfs) {
+    var orfColors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c'];
+    sa.orfs.result.orfs.forEach(function(o, idx) {
+      if (sa.orfs.hiddenOrfs[idx]) return; // skip hidden ORFs
+      annotations.push({
+        name: 'ORF ' + o.length_aa + 'aa (' + (o.direction === 1 ? '+' : '-') + o.frame + ')',
+        start: o.start,
+        end: o.end,
+        direction: o.direction,
+        color: orfColors[idx % orfColors.length],
+      });
+    });
+  }
 
-# ---------------------------------------------------------------------------
-# Digest Simulator
-# ---------------------------------------------------------------------------
-def simulate_digest(seq: str, enzyme_names: list, circular: bool = True) -> dict:
-    """Simulate a restriction digest and return fragment sizes."""
-    seq = seq.upper()
-    slen = len(seq)
+  // ── RE site annotations
+  if (sa.re.showOnMap && sa.re.result && sa.re.result.enzymes) {
+    sa.re.result.enzymes.forEach(function(enz) {
+      enz.cut_positions.forEach(function(pos) {
+        annotations.push({
+          name: enz.name,
+          start: Math.max(0, pos - 2),
+          end: Math.min(seqLen, pos + 2),
+          direction: 1,
+          color: enz.num_cuts === 1 ? '#e74c3c' : '#f39c12',
+        });
+      });
+    });
+  }
 
-    try:
-        from Bio.Seq import Seq
-        from Bio.Restriction import RestrictionBatch, Analysis
-    except ImportError:
-        raise HTTPException(500, "BioPython Restriction module not available")
+  // ── Known features scan annotations
+  if (sa.scan.showOnMap && sa.scan.result && sa.scan.result.features) {
+    sa.scan.result.features.forEach(function(f) {
+      annotations.push({
+        name: f.name,
+        start: f.start,
+        end: f.end,
+        direction: f.direction,
+        color: f.color,
+      });
+    });
+  }
 
-    if not enzyme_names or len(enzyme_names) < 1:
-        raise HTTPException(400, "Provide at least one enzyme")
-    if len(enzyme_names) > 3:
-        raise HTTPException(400, "Maximum 3 enzymes for digest simulation")
+  // ── Search result annotations
+  if (_cl.search.results && _cl.search.results.length > 0) {
+    _cl.search.results.forEach(function(hit, idx) {
+      var isActive = idx === _cl.search.activeIdx;
+      annotations.push({
+        name: (hit.strand === 'fwd' ? '\u2192' : '\u2190') + ' Match ' + (idx + 1),
+        start: hit.start,
+        end: hit.end,
+        direction: hit.strand === 'fwd' ? 1 : -1,
+        color: isActive ? '#e74c3c' : '#f39c12',
+      });
+    });
+  }
 
-    batch = RestrictionBatch()
-    valid_enzymes = []
-    for name in enzyme_names:
-        try:
-            batch.add(name.strip())
-            valid_enzymes.append(name.strip())
-        except (ValueError, KeyError):
-            pass
-    if not batch:
-        raise HTTPException(400, "No valid enzyme names provided")
+  try {
+    var viewerProps = {
+      name: _cl.parsed.name || 'Sequence',
+      seq: _cl.parsed.seq,
+      annotations: annotations,
+      style: { height: '100%', width: '100%' },
+      viewer: (_cl.showCircular && _cl.showLinear) ? 'both' :
+              _cl.showCircular ? 'circular' : 'linear',
+      showComplement: true,
+      showIndex: true,
+      zoom: { linear: 50 },
+      onSelection: _clOnSeqVizSelection,
+    };
 
-    bio_seq = Seq(seq)
-    analysis = Analysis(batch, bio_seq, linear=not circular)
-    results = analysis.full()
-
-    # Collect all cut positions from all enzymes
-    all_cuts = []
-    enzyme_info = []
-    for enzyme, positions in results.items():
-        ename = str(enzyme)
-        enzyme_info.append({
-            "name": ename,
-            "cuts": len(positions),
-            "positions": sorted(positions),
-            "site": str(enzyme.site) if hasattr(enzyme, 'site') else "?",
-        })
-        for p in positions:
-            all_cuts.append({"pos": p, "enzyme": ename})
-
-    # Sort cuts by position
-    all_cuts.sort(key=lambda c: c["pos"])
-    cut_positions = [c["pos"] for c in all_cuts]
-
-    if not cut_positions:
-        # No cuts — one fragment = whole sequence
-        return {
-            "enzymes": enzyme_info,
-            "fragments": [{"size": slen, "start": 0, "end": slen}],
-            "num_fragments": 1,
-            "num_cuts": 0,
-            "total_cuts": cut_positions,
-            "circular": circular,
+    if (window.seqviz.Viewer && typeof window.seqviz.Viewer === 'function') {
+      try { window.seqviz.Viewer(el, viewerProps).render(); return; } catch (e) { /* fall through */ }
+    }
+    if (window.React && window.ReactDOM) {
+      var SeqVizComp = window.seqviz.SeqViz || window.seqviz.default || window.seqviz;
+      if (SeqVizComp) {
+        if (window.ReactDOM.createRoot) {
+          window.ReactDOM.createRoot(el).render(window.React.createElement(SeqVizComp, viewerProps));
+        } else {
+          window.ReactDOM.render(window.React.createElement(SeqVizComp, viewerProps), el);
         }
-
-    # Calculate fragments
-    fragments = []
-    if circular:
-        # Circular: fragments between consecutive cuts, wrapping around
-        for i in range(len(cut_positions)):
-            start = cut_positions[i]
-            end = cut_positions[(i + 1) % len(cut_positions)]
-            if end > start:
-                size = end - start
-            else:
-                size = (slen - start) + end  # wrap around
-            fragments.append({"size": size, "start": start, "end": end})
-    else:
-        # Linear: fragments include ends
-        # First fragment: 0 to first cut
-        fragments.append({"size": cut_positions[0], "start": 0, "end": cut_positions[0]})
-        # Middle fragments
-        for i in range(len(cut_positions) - 1):
-            size = cut_positions[i + 1] - cut_positions[i]
-            fragments.append({"size": size, "start": cut_positions[i], "end": cut_positions[i + 1]})
-        # Last fragment: last cut to end
-        fragments.append({"size": slen - cut_positions[-1], "start": cut_positions[-1], "end": slen})
-
-    # Remove zero-size fragments
-    fragments = [f for f in fragments if f["size"] > 0]
-
-    # Sort by size descending (for gel display)
-    fragments.sort(key=lambda f: f["size"], reverse=True)
-
-    return {
-        "enzymes": enzyme_info,
-        "fragments": fragments,
-        "num_fragments": len(fragments),
-        "num_cuts": len(cut_positions),
-        "total_cuts": cut_positions,
-        "circular": circular,
+      }
     }
-
-
-# ---------------------------------------------------------------------------
-# BLAST Search (NCBI)
-# ---------------------------------------------------------------------------
-def run_blast(seq: str, program: str = "blastn", database: str = "nt",
-              max_hits: int = 10) -> dict:
-    """Run a BLAST search against NCBI and return parsed results."""
-    seq = seq.upper().replace(" ", "").replace("\n", "")
-    if len(seq) < 10:
-        raise HTTPException(400, "Sequence too short for BLAST (minimum 10bp)")
-    if len(seq) > 10000:
-        raise HTTPException(400, "Sequence too long for web BLAST (maximum 10000bp)")
-
-    try:
-        from Bio.Blast import NCBIWWW, NCBIXML
-    except ImportError:
-        raise HTTPException(500, "BioPython BLAST module not available")
-
-    valid_programs = ["blastn", "blastp", "blastx", "tblastn", "tblastx"]
-    if program not in valid_programs:
-        raise HTTPException(400, f"Invalid program. Use: {', '.join(valid_programs)}")
-
-    try:
-        result_handle = NCBIWWW.qblast(
-            program, database, seq,
-            hitlist_size=max_hits,
-            expect=10.0,
-        )
-        blast_records = NCBIXML.parse(result_handle)
-        record = next(blast_records)
-    except Exception as e:
-        raise HTTPException(502, f"BLAST query failed: {str(e)}")
-
-    hits = []
-    for alignment in record.alignments[:max_hits]:
-        for hsp in alignment.hsps[:1]:  # Top HSP per hit
-            identity_pct = round(hsp.identities / hsp.align_length * 100, 1) if hsp.align_length > 0 else 0
-            hits.append({
-                "title": alignment.title[:200],
-                "accession": alignment.accession,
-                "length": alignment.length,
-                "score": hsp.score,
-                "bits": round(hsp.bits, 1),
-                "evalue": f"{hsp.expect:.2e}",
-                "identity": f"{hsp.identities}/{hsp.align_length}",
-                "identity_pct": identity_pct,
-                "gaps": hsp.gaps,
-                "query_start": hsp.query_start,
-                "query_end": hsp.query_end,
-                "subject_start": hsp.sbjct_start,
-                "subject_end": hsp.sbjct_end,
-                "query_seq": str(hsp.query)[:500],
-                "match_seq": str(hsp.match)[:500],
-                "subject_seq": str(hsp.sbjct)[:500],
-                "strand": "Plus/Plus" if hsp.strand == (None, None) else f"{hsp.strand[0] or 'Plus'}/{hsp.strand[1] or 'Plus'}",
-            })
-
-    return {
-        "program": program,
-        "database": database,
-        "query_length": len(seq),
-        "hits": hits,
-        "num_hits": len(hits),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Known Features / Motif Scanner
-# ---------------------------------------------------------------------------
-KNOWN_FEATURES = [
-    # Purification tags
-    {"name": "6xHis tag", "seq": "CATCACCATCACCATCAC", "type": "CDS", "category": "Purification tag", "color": "#E67E22"},
-    {"name": "6xHis tag (alt)", "seq": "CACCACCACCACCACCAC", "type": "CDS", "category": "Purification tag", "color": "#E67E22"},
-    {"name": "8xHis tag", "seq": "CATCACCATCACCATCACCATCACCATCAC", "type": "CDS", "category": "Purification tag", "color": "#E67E22"},
-    {"name": "FLAG tag", "seq": "GACTACAAGGACGATGACGATAAGTAA", "type": "CDS", "category": "Purification tag", "color": "#E74C3C"},
-    {"name": "HA tag", "seq": "TACCCTTACGACGTGCCTGACTACGCC", "type": "CDS", "category": "Purification tag", "color": "#9B59B6"},
-    {"name": "Myc tag", "seq": "GAACAAAAACTCATCTCAGAAGAGGATCTG", "type": "CDS", "category": "Purification tag", "color": "#3498DB"},
-    {"name": "V5 tag", "seq": "GGTAAGCCTATCCCTAACCCTCTCCTCGGTCTCGATTCTACG", "type": "CDS", "category": "Purification tag", "color": "#1ABC9C"},
-    {"name": "Strep-tag II", "seq": "TGGAGCCACCCGCAGTTCGAAAAG", "type": "CDS", "category": "Purification tag", "color": "#F39C12"},
-    # Protease sites
-    {"name": "TEV site", "seq": "GAAAACCTGTATTTTCAGGGC", "type": "CDS", "category": "Protease site", "color": "#C0392B"},
-    {"name": "Thrombin site", "seq": "CTGGTTCCGCGTGGATCC", "type": "CDS", "category": "Protease site", "color": "#C0392B"},
-    {"name": "Factor Xa site", "seq": "ATCGAGGGAAGA", "type": "CDS", "category": "Protease site", "color": "#C0392B"},
-    {"name": "PreScission site", "seq": "CTGGAAGTTCTGTTCCAGGGGCCC", "type": "CDS", "category": "Protease site", "color": "#C0392B"},
-    # Promoters
-    {"name": "T7 promoter", "seq": "TAATACGACTCACTATAGGG", "type": "promoter", "category": "Promoter", "color": "#E8A838"},
-    {"name": "T7 promoter (consensus)", "seq": "TAATACGACTCACTATA", "type": "promoter", "category": "Promoter", "color": "#E8A838"},
-    {"name": "SP6 promoter", "seq": "ATTTAGGTGACACTATAG", "type": "promoter", "category": "Promoter", "color": "#E8A838"},
-    {"name": "T3 promoter", "seq": "AATTAACCCTCACTAAAGGG", "type": "promoter", "category": "Promoter", "color": "#E8A838"},
-    {"name": "lac promoter", "seq": "TTTACACTTTATGCTTCCGGCTCGTATGTTG", "type": "promoter", "category": "Promoter", "color": "#E8A838"},
-    {"name": "tac promoter", "seq": "TTGACAATTAATCATCGGCTCGTATAATG", "type": "promoter", "category": "Promoter", "color": "#E8A838"},
-    {"name": "CMV promoter (core)", "seq": "GTTGACATTGATTATTGACTAG", "type": "promoter", "category": "Promoter", "color": "#D4AC0D"},
-    # Terminators
-    {"name": "T7 terminator", "seq": "GCTAGTTATTGCTCAGCGG", "type": "terminator", "category": "Terminator", "color": "#C0392B"},
-    {"name": "rrnB T1 terminator", "seq": "CAAATAAAACGAAAGGCTCAGTCGAAAGAC", "type": "terminator", "category": "Terminator", "color": "#C0392B"},
-    # RBS / translation signals
-    {"name": "Shine-Dalgarno (E. coli)", "seq": "AAGGAG", "type": "RBS", "category": "RBS", "color": "#D4AC0D"},
-    {"name": "Kozak (mammalian)", "seq": "GCCACCATGG", "type": "regulatory", "category": "RBS", "color": "#D4AC0D"},
-    {"name": "Kozak (strong)", "seq": "GCCGCCACCATGG", "type": "regulatory", "category": "RBS", "color": "#D4AC0D"},
-    # Operators / regulatory
-    {"name": "lac operator", "seq": "AATTGTGAGCGGATAACAATT", "type": "regulatory", "category": "Regulatory", "color": "#8E44AD"},
-    {"name": "tet operator", "seq": "TCCCTATCAGTGATAGAGA", "type": "regulatory", "category": "Regulatory", "color": "#8E44AD"},
-    # Origins
-    {"name": "pBR322 ori (partial)", "seq": "TTCTCATGTTTGACAGCTTATCATCG", "type": "rep_origin", "category": "Origin", "color": "#8E44AD"},
-    {"name": "f1 ori (partial)", "seq": "ACGCGCCCTGTAGCGGCGCATTAAGCGCGG", "type": "rep_origin", "category": "Origin", "color": "#8E44AD"},
-    # Resistance markers (short signature regions)
-    {"name": "AmpR (bla signal)", "seq": "ATGAGTATTCAACATTTCCGTGTCGCCCTTAT", "type": "CDS", "category": "Resistance", "color": "#4682B4"},
-    {"name": "KanR (aph start)", "seq": "ATGATTGAACAAGATGGATTGCACGCAGG", "type": "CDS", "category": "Resistance", "color": "#4682B4"},
-    {"name": "CmR (cat start)", "seq": "ATGGAGAAAAAAATCACTGGATATACC", "type": "CDS", "category": "Resistance", "color": "#4682B4"},
-    # Recombination / cloning
-    {"name": "loxP", "seq": "ATAACTTCGTATAGCATACATTATACGAAGTTAT", "type": "misc_feature", "category": "Recombination", "color": "#1ABC9C"},
-    {"name": "FRT", "seq": "GAAGTTCCTATTCTCTAGAAAGTATAGGAACTTC", "type": "misc_feature", "category": "Recombination", "color": "#1ABC9C"},
-    {"name": "attB1", "seq": "ACAAGTTTGTACAAAAAAGCAGGCT", "type": "misc_feature", "category": "Recombination", "color": "#1ABC9C"},
-    {"name": "attB2", "seq": "ACCACTTTGTACAAGAAAGCTGGGT", "type": "misc_feature", "category": "Recombination", "color": "#1ABC9C"},
-]
-
-
-def scan_known_features(seq: str, circular: bool = True) -> list:
-    """Scan sequence for known molecular biology features on both strands."""
-    seq = seq.upper()
-    slen = len(seq)
-    search_seq = seq + seq[:50] if circular else seq  # small wrap for circular
-    rc_search = _reverse_complement(search_seq)
-
-    found = []
-    for feat in KNOWN_FEATURES:
-        motif = feat["seq"].upper()
-        mlen = len(motif)
-
-        # Forward strand
-        pos = 0
-        while True:
-            idx = search_seq.find(motif, pos)
-            if idx == -1 or idx >= slen:
-                break
-            found.append({
-                "name": feat["name"],
-                "start": idx,
-                "end": idx + mlen,
-                "direction": 1,
-                "strand": "fwd",
-                "type": feat["type"],
-                "category": feat["category"],
-                "color": feat["color"],
-                "motif_seq": motif,
-            })
-            pos = idx + 1
-
-        # Reverse complement strand
-        pos = 0
-        while True:
-            idx = rc_search.find(motif, pos)
-            if idx == -1 or idx >= slen:
-                break
-            # Map back to top strand coordinates
-            top_start = slen - (idx + mlen)
-            top_end = slen - idx
-            if top_start < 0:
-                top_start += slen
-            found.append({
-                "name": feat["name"],
-                "start": top_start,
-                "end": top_end,
-                "direction": -1,
-                "strand": "rc",
-                "type": feat["type"],
-                "category": feat["category"],
-                "color": feat["color"],
-                "motif_seq": motif,
-            })
-            pos = idx + 1
-
-    # Sort by position
-    found.sort(key=lambda f: f["start"])
-
-    # Group by category for summary
-    categories = {}
-    for f in found:
-        cat = f["category"]
-        if cat not in categories:
-            categories[cat] = 0
-        categories[cat] += 1
-
-    return {"features": found, "count": len(found), "categories": categories}
-
-
-# ---------------------------------------------------------------------------
-# Assembly Designer — Gibson, Golden Gate, Digest-Ligate
-# ---------------------------------------------------------------------------
-
-# Type IIS enzyme definitions for Golden Gate
-TYPE_IIS_ENZYMES = {
-    "BsaI":  {"site": "GGTCTC", "cut_offset": 7, "overhang_len": 4, "rc_site": "GAGACC"},
-    "BbsI":  {"site": "GAAGAC", "cut_offset": 8, "overhang_len": 4, "rc_site": "GTCTTC"},
-    "BpiI":  {"site": "GAAGAC", "cut_offset": 8, "overhang_len": 4, "rc_site": "GTCTTC"},
-    "SapI":  {"site": "GCTCTTC", "cut_offset": 8, "overhang_len": 3, "rc_site": "GAAGAGC"},
-    "BsmBI": {"site": "CGTCTC", "cut_offset": 7, "overhang_len": 4, "rc_site": "GAGACG"},
+  } catch (err) {
+    console.error('SeqViz render error:', err);
+    el.innerHTML = '<div style="padding:2rem;color:#8a7f72;">Viewer failed to render. Try refreshing.</div>';
+  }
 }
 
-# Validated high-fidelity overhang sets (NEB)
-GOLDEN_OVERHANGS = ["AATG", "AGGT", "GCTT", "TACA", "TTCG", "CAGT", "GATC", "ACGA", "TGAC", "CTGA"]
+/* ── SeqViz selection → auto-fill primer design fields ──── */
+function _clOnSeqVizSelection(sel) {
+  var start, end;
+  if (sel && typeof sel.start === 'number') {
+    start = sel.start;
+    end = sel.end;
+  } else if (sel && sel.selection && typeof sel.selection.start === 'number') {
+    start = sel.selection.start;
+    end = sel.selection.end;
+  } else {
+    return;
+  }
 
+  if (start === end && start === 0) return;
 
-def _check_internal_sites(seq: str, site: str, rc_site: str) -> list:
-    """Check for internal enzyme recognition sites in a fragment."""
-    seq_upper = seq.upper()
-    positions = []
-    for pattern in [site, rc_site]:
-        pos = 0
-        while True:
-            idx = seq_upper.find(pattern, pos)
-            if idx == -1:
-                break
-            positions.append(idx)
-            pos = idx + 1
-    return positions
+  var isCircular = _cl.parsed && (_cl.parsed.topology || '').toLowerCase() === 'circular';
+  var crossesOrigin = false;
 
+  // For linear sequences or when SeqViz gives us inverted coords, swap
+  if (start > end) {
+    if (isCircular) {
+      // Cross-origin selection on circular — keep as-is
+      crossesOrigin = true;
+    } else {
+      var tmp = start; start = end; end = tmp;
+    }
+  }
 
-def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 25,
-                  tm_target: float = 62.0) -> dict:
-    """Design a Gibson assembly — primers with overlapping tails for each junction."""
-    if len(fragments) < 2:
-        raise HTTPException(400, "Gibson assembly requires at least 2 fragments")
-    if overlap_length < 15 or overlap_length > 60:
-        raise HTTPException(400, "Overlap length must be 15-60 bp")
+  var selLen = _clSelLen(start, end);
+  var isSingleClick = (start === end) || selLen <= 1;
+  var selSeq = (_cl.parsed && !isSingleClick) ? _clGetSelSeq(start, end) : '';
+  var filled = false;
 
-    seqs = []
-    for f in fragments:
-        s = f["seq"].upper().replace(" ", "").replace("\n", "")
-        if len(s) < 20:
-            raise HTTPException(400, f"Fragment '{f['name']}' is too short (min 20bp)")
-        seqs.append(s)
+  // Store last selection for feature editor auto-fill
+  if (!isSingleClick) {
+    _cl.lastSelection = { start: start, end: end, crossesOrigin: crossesOrigin };
+    // Live-update feature editor panel if open
+    if (_cl.editFeature !== null) {
+      _clSetInputVal('cl-feat-start', start);
+      _clSetInputVal('cl-feat-end', end);
+    }
+  }
 
-    warnings = []
-    junctions = []
-    all_primers = []
-    half_overlap = overlap_length // 2
+  // Format selection text for toasts
+  var selText = crossesOrigin
+    ? start + '\u2192origin\u2192' + end + ' (' + selLen + ' bp, wraps origin)'
+    : start + '\u2013' + end + ' (' + selLen + ' bp)';
 
-    # Determine junctions
-    n = len(seqs)
-    junction_count = n if circular else n - 1
+  // ── Route to primer design panel if expanded
+  if (_cl.pd.expanded) {
+    var mode = _cl.pd.mode;
+    if (mode === 'kld') {
+      if (isSingleClick) {
+        // Single click: set both start and end to same position (pure insertion)
+        _cl.pd.kld.startPos = String(start);
+        _cl.pd.kld.endPos = String(start);
+        _clSetInputVal('cl-pd-kld-startPos', start);
+        _clSetInputVal('cl-pd-kld-endPos', start);
+        toast('Insertion point set to ' + start, false);
+      } else {
+        // Drag selection: set start/end range (deletion/replacement)
+        _cl.pd.kld.startPos = String(start);
+        _cl.pd.kld.endPos = String(end);
+        _clSetInputVal('cl-pd-kld-startPos', start);
+        _clSetInputVal('cl-pd-kld-endPos', end);
+        toast('KLD range: ' + selText, false);
+      }
+      filled = true;
+    } else if (mode === 'custom' && !isSingleClick) {
+      _cl.pd.custom.start = String(start);
+      _cl.pd.custom.end = String(end);
+      _clSetInputVal('cl-pd-custom-start', start);
+      _clSetInputVal('cl-pd-custom-end', end);
+      toast('Primer region: ' + selText, false);
+      filled = true;
+    } else if (mode === 'pcr' && !isSingleClick) {
+      _cl.pd.pcr.targetStart = String(start);
+      _cl.pd.pcr.targetEnd = String(end);
+      _clSetInputVal('cl-pd-pcr-targetStart', start);
+      _clSetInputVal('cl-pd-pcr-targetEnd', end);
+      toast('PCR target: ' + selText, false);
+      filled = true;
+    } else if (mode === 'seq' && !isSingleClick) {
+      _cl.pd.seq.regionStart = String(start);
+      _cl.pd.seq.regionEnd = String(end);
+      _clSetInputVal('cl-pd-seq-regionStart', start);
+      _clSetInputVal('cl-pd-seq-regionEnd', end);
+      toast('Sequencing region: ' + selText, false);
+      filled = true;
+    }
+  }
 
-    for j in range(junction_count):
-        up_idx = j
-        down_idx = (j + 1) % n
-        up_seq = seqs[up_idx]
-        down_seq = seqs[down_idx]
-        up_name = fragments[up_idx]["name"]
-        down_name = fragments[down_idx]["name"]
+  // ── Route to analysis panel if expanded
+  if (_cl.sa.expanded && _cl.parsed && !isSingleClick) {
+    if (_cl.sa.mode === 'tools') {
+      _cl.sa.tools.input = selSeq;
+      _clSetInputVal('cl-sa-tools-input', selSeq);
+      if (!filled) toast('Selection: ' + selLen + ' bp \u2192 Sequence Tools', false);
+      filled = true;
+    } else if (_cl.sa.mode === 'blast') {
+      _cl.sa.blast.seq = selSeq;
+      _clSetInputVal('cl-sa-blast-input', selSeq);
+      if (!filled) toast('Selection: ' + selLen + ' bp \u2192 BLAST', false);
+      filled = true;
+    } else if (_cl.sa.mode === 'restriction') {
+      if (!filled) toast('Selected ' + selText, false);
+    } else if (_cl.sa.mode === 'orfs') {
+      if (!filled) toast('Selected ' + selText, false);
+    }
+  }
 
-        # Overlap = last half_overlap of upstream + first half_overlap of downstream
-        up_tail = up_seq[-half_overlap:] if len(up_seq) >= half_overlap else up_seq
-        down_tail = down_seq[:half_overlap] if len(down_seq) >= half_overlap else down_seq
-        overlap_seq = up_tail + down_tail
+  // ── Route to assembly panel if expanded
+  if (_cl.ad.expanded && _cl.parsed && !isSingleClick && !filled) {
+    toast('Selected ' + selText + ' \u2014 click \u201c+ From loaded\u201d to add as fragment', false);
+    filled = true;
+  }
 
-        overlap_tm = _calc_tm(overlap_seq)
-        if overlap_tm < 45:
-            warnings.append(f"Junction {up_name}→{down_name} overlap Tm ({overlap_tm}°C) is low — may reduce assembly efficiency")
-        elif overlap_tm > 72:
-            warnings.append(f"Junction {up_name}→{down_name} overlap Tm ({overlap_tm}°C) is high")
+  // ── Fallback: if neither panel is expanded, just show a toast with the selection
+  if (!filled && !isSingleClick) {
+    toast('Selected ' + selText + ' \u2014 open a panel to use it', false);
+  }
+  // Note: we intentionally do NOT re-render SeqViz here — that would destroy
+  // the native drag highlight. Fields are updated via direct DOM manipulation.
+}
 
-        # Forward primer for downstream fragment: tail = end of upstream, annealing = start of downstream
-        fwd_tail = up_tail
-        fwd_candidates = _generate_primer_candidates(
-            template=down_seq, pos=0, direction="forward", tail=fwd_tail, 
-            tm_target=tm_target, min_len=12, max_len=60, max_total=60
-        )
-        fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{down_name}_Fwd", max_alternatives=None)
+// Directly set an input's value in the DOM without full re-render
+function _clSetInputVal(id, val) {
+  var el = document.getElementById(id);
+  if (el) el.value = val;
+}
 
-        # Reverse primer for upstream fragment: tail = RC of start of downstream, annealing = RC of end of upstream
-        rev_tail = _reverse_complement(down_tail)
-        rev_candidates = _generate_primer_candidates(
-            template=up_seq, pos=len(up_seq), direction="reverse", tail=rev_tail, 
-            tm_target=tm_target, min_len=12, max_len=60, max_total=60
-        )
-        rev_primer = _pick_best_with_alternatives(rev_candidates, f"{up_name}_Rev", max_alternatives=None)
+/* ── helpers ────────────────────────────────────────────────── */
+function _clGcPct(seq) {
+  if (!seq) return 0;
+  var s = seq.toUpperCase().replace(/[^ATGC]/g, '');
+  if (!s.length) return 0;
+  var gc = 0;
+  for (var i = 0; i < s.length; i++) { if (s[i] === 'G' || s[i] === 'C') gc++; }
+  return Math.round(gc / s.length * 100);
+}
+function _clCleanSeq(seq) { return (seq || '').toUpperCase().replace(/[^ATGCN]/g, ''); }
 
-        for p, pname in [(fwd_primer, f"{down_name}_Fwd"), (rev_primer, f"{up_name}_Rev")]:
-            if p and p.get("hairpin"):
-                warnings.append(f"{pname} may form hairpin")
-            if p and p.get("homodimer_dg", 0) < -9.0:
-                warnings.append(f"{pname} has strong self-dimer (ΔG = {p['homodimer_dg']} kcal/mol)")
+/** Get selected sequence, handling cross-origin wrapping for circular. */
+function _clGetSelSeq(start, end) {
+  if (!_cl.parsed || !_cl.parsed.seq) return '';
+  var seq = _cl.parsed.seq;
+  if (start <= end) {
+    return seq.substring(start, end);
+  }
+  // Cross-origin: start > end → from start to end-of-seq + from 0 to end
+  return seq.substring(start) + seq.substring(0, end);
+}
 
-        junctions.append({
-            "name": f"{up_name}→{down_name}",
-            "overlap_seq": overlap_seq,
-            "overlap_tm": overlap_tm,
-            "fwd_primer": fwd_primer,
-            "rev_primer": rev_primer,
-        })
-        all_primers.append(fwd_primer)
-        all_primers.append(rev_primer)
+/** Length of selection, handling cross-origin. */
+function _clSelLen(start, end) {
+  if (!_cl.parsed) return Math.abs(end - start);
+  if (start <= end) return end - start;
+  return (_cl.parsed.seq.length - start) + end;
+}
 
-    # Build product sequence (concatenate all fragments)
-    product_seq = "".join(seqs)
-    product_annotations = []
-    offset = 0
-    for i, f in enumerate(fragments):
-        flen = len(seqs[i])
-        product_annotations.append({
-            "name": f["name"], "start": offset, "end": offset + flen,
-            "direction": 1, "color": ["#4682B4", "#2ecc71", "#e67e22", "#9b59b6", "#e74c3c", "#1abc9c"][i % 6],
-            "type": "misc_feature",
-        })
-        offset += flen
+/* ── main render ───────────────────────────────────────────── */
+var _clEl = null;
+function _clRender() {
+  if (!_clEl) return;
+  window._featStash = []; // Reset feature stash each render
+  var h = '';
 
-    return {
-        "junctions": junctions,
-        "primers": all_primers,
-        "product_length": len(product_seq),
-        "product_seq": product_seq,
-        "product_annotations": product_annotations,
-        "num_fragments": len(fragments),
-        "warnings": warnings,
+  // Header
+  h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1.2rem;flex-wrap:wrap;gap:.6rem;">';
+  h += '<div>';
+  h += '<h2 style="margin:0;font-size:1.25rem;color:#4a4139;">Cloning Workbench</h2>';
+  h += '<p style="margin:.2rem 0 0;font-size:.82rem;color:#8a7f72;">Browse sequences, view maps, design primers</p>';
+  h += '</div>';
+  h += '<div style="display:flex;gap:.5rem;align-items:center;">';
+  h += '<div style="display:flex;border:1px solid #d5cec0;border-radius:4px;overflow:hidden;">';
+  h += '<button onclick="_clSetTab(\x27viewer\x27)" style="padding:.35rem .8rem;font-size:.78rem;border:none;cursor:pointer;' +
+       (_cl.tab === 'viewer' ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#4a4139;') + '">Sequence Viewer</button>';
+  h += '<button onclick="_clSetTab(\x27opencloning\x27)" style="padding:.35rem .8rem;font-size:.78rem;border:none;cursor:pointer;' +
+       (_cl.tab === 'opencloning' ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#4a4139;') + '">OpenCloning</button>';
+  h += '</div></div></div>';
+
+  if (_cl.tab === 'viewer') { h += _clRenderViewerTab(); }
+  else { h += _clRenderOCTab(); }
+
+  _clEl.innerHTML = h;
+  if (_cl.tab === 'viewer' && _cl.parsed) { setTimeout(function() { _clRenderSeqViz(); }, 30); }
+}
+
+/* ── Viewer tab ────────────────────────────────────────────── */
+function _clRenderViewerTab() {
+  var sb = _cl.sidebarOpen;
+  var h = '<div style="display:grid;grid-template-columns:' + (sb ? '280px ' : '') + '1fr;gap:1rem;min-height:750px;">';
+
+  // Left panel (collapsible)
+  if (sb) {
+    h += '<div style="border:1px solid #d5cec0;border-radius:6px;background:#fff;overflow:hidden;display:flex;flex-direction:column;">';
+    // Header with collapse button
+    h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.45rem .6rem;border-bottom:1px solid #e8e2d8;background:#faf8f4;">';
+    h += '<span style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Sequences</span>';
+    h += '<button onclick="_clToggleSidebar()" style="padding:.15rem .35rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#8a7f72;cursor:pointer;" title="Hide sidebar">\u00ab</button>';
+    h += '</div>';
+    h += '<div style="padding:.4rem .6rem;border-bottom:1px solid #e8e2d8;">';
+    h += '<input type="text" placeholder="Filter\u2026" value="' + esc(_cl.filter) + '" oninput="_clFilterChange(this.value)" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.78rem;color:#4a4139;" />';
+    h += '</div>';
+
+    var plasmids = _cl.sequences.filter(function(s) { return s.type === 'plasmid' && s.has_file; });
+    var kitparts = _cl.sequences.filter(function(s) { return s.type === 'kitpart' && s.has_file; });
+    var primers = _cl.sequences.filter(function(s) { return s.type === 'primer' && s.has_file; });
+    if (_cl.filter) {
+      var f = _cl.filter.toLowerCase();
+      plasmids = plasmids.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1; });
+      kitparts = kitparts.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.kit_name && s.kit_name.toLowerCase().indexOf(f) !== -1); });
+      primers = primers.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1; });
     }
 
+    h += '<div style="flex:1;overflow-y:auto;padding:.4rem 0;">';
+    if (plasmids.length > 0) {
+      h += '<div style="padding:.3rem .7rem;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;font-weight:600;border-bottom:1px solid #e8e2d8;">Plasmids</div>';
+      plasmids.forEach(function(s) {
+        var isA = _cl.selected && _cl.selected.type === s.type && _cl.selected.id === s.id;
+        h += '<div onclick="_clSelectSequence(\x27' + s.type + '\x27,' + s.id + ')" style="padding:.5rem .7rem;cursor:pointer;border-bottom:1px solid #f0ebe3;' +
+             (isA ? 'background:#eef4ee;border-left:3px solid #5b7a5e;' : 'border-left:3px solid transparent;') + 'transition:background .15s;" ' +
+             'onmouseover="this.style.background=\x27' + (isA ? '#eef4ee' : '#f5f1eb') + '\x27" onmouseout="this.style.background=\x27' + (isA ? '#eef4ee' : 'transparent') + '\x27">';
+        h += '<div style="font-size:.85rem;font-weight:500;color:#4a4139;">' + esc(s.name) + '</div>';
+        if (s.use) h += '<div style="font-size:.72rem;color:#8a7f72;margin-top:.15rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(s.use) + '</div>';
+        h += '</div>';
+      });
+    }
+    if (kitparts.length > 0) {
+      h += '<div style="padding:.3rem .7rem;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8E44AD;font-weight:600;border-bottom:1px solid #e8e2d8;margin-top:.2rem;">\ud83e\uddf0 Kit Parts</div>';
+      kitparts.forEach(function(s) {
+        var isA = _cl.selected && _cl.selected.type === s.type && _cl.selected.id === s.id;
+        h += '<div onclick="_clSelectSequence(\x27' + s.type + '\x27,' + s.id + ')" style="padding:.5rem .7rem;cursor:pointer;border-bottom:1px solid #f0ebe3;' +
+             (isA ? 'background:#eef4ee;border-left:3px solid #5b7a5e;' : 'border-left:3px solid transparent;') + 'transition:background .15s;" ' +
+             'onmouseover="this.style.background=\x27' + (isA ? '#eef4ee' : '#f5f1eb') + '\x27" onmouseout="this.style.background=\x27' + (isA ? '#eef4ee' : 'transparent') + '\x27">';
+        h += '<div style="font-size:.85rem;font-weight:500;color:#4a4139;">' + esc(s.name) + '</div>';
+        var meta = [];
+        if (s.kit_name) meta.push(s.kit_name);
+        if (s.part_type) meta.push(s.part_type);
+        if (meta.length > 0) h += '<div style="font-size:.72rem;color:#8E44AD;margin-top:.15rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(meta.join(' \u00b7 ')) + '</div>';
+        h += '</div>';
+      });
+    }
+    if (primers.length > 0) {
+      h += '<div style="padding:.3rem .7rem;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;font-weight:600;border-bottom:1px solid #e8e2d8;margin-top:.2rem;">Primers</div>';
+      primers.forEach(function(s) {
+        var isA = _cl.selected && _cl.selected.type === s.type && _cl.selected.id === s.id;
+        h += '<div onclick="_clSelectSequence(\x27' + s.type + '\x27,' + s.id + ')" style="padding:.5rem .7rem;cursor:pointer;border-bottom:1px solid #f0ebe3;' +
+             (isA ? 'background:#eef4ee;border-left:3px solid #5b7a5e;' : 'border-left:3px solid transparent;') + 'transition:background .15s;" ' +
+             'onmouseover="this.style.background=\x27' + (isA ? '#eef4ee' : '#f5f1eb') + '\x27" onmouseout="this.style.background=\x27' + (isA ? '#eef4ee' : 'transparent') + '\x27">';
+        h += '<div style="font-size:.85rem;font-weight:500;color:#4a4139;">' + esc(s.name) + '</div>';
+        if (s.sequence) h += '<div style="font-size:.7rem;color:#8a7f72;margin-top:.15rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px;">' + esc(s.sequence.substring(0, 40)) + (s.sequence.length > 40 ? '\u2026' : '') + '</div>';
+        h += '</div>';
+      });
+    }
+    if (plasmids.length === 0 && kitparts.length === 0 && primers.length === 0) {
+      h += '<div style="padding:1.5rem;text-align:center;color:#8a7f72;font-size:.82rem;">';
+      h += _cl.filter ? 'No sequences match your filter.' : 'No sequences with GenBank files found.<br><br><span style="font-size:.75rem;">Import with .gb files in DNA Manager first.</span>';
+      h += '</div>';
+    }
+    h += '</div></div>';
+  }
 
-def _ensure_gc_clamp(seq, max_len=60):
-    """Append a G to the 3' end if it doesn't already end with G or C."""
-    if seq[-1] in "GC":
-        return seq
-    if len(seq) < max_len:
-        return seq + "G"
-    return seq
+  // Right column
+  h += '<div style="display:flex;flex-direction:column;gap:1rem;">';
 
-
-def _has_hairpin(seq, min_stem=4, min_loop=3):
-    """Check whether seq can form a hairpin (stem-loop)."""
-    n = len(seq)
-    for stem_len in range(min_stem, min(8, n // 2)):
-        for i in range(n - 2 * stem_len - min_loop + 1):
-            stem = seq[i:i + stem_len]
-            loop_start = i + stem_len + min_loop
-            complement = seq[loop_start:loop_start + stem_len]
-            if stem == _reverse_complement(complement):
-                return True
-    return False
-
-
-def _has_self_dimer(seq, min_match=4):
-    """Check whether the primer can form a self-dimer (3' overlap with its own RC)."""
-    rc = _reverse_complement(seq)
-    n = len(seq)
-    for i in range(n - min_match + 1):
-        kmer = seq[i:i + min_match]
-        if kmer in rc:
-            return True
-    return False
-
-def _calc_homodimer_dg(seq: str, temp_c: float = 25.0) -> float:
-    """Calculate the most stable self-dimer ΔG by sliding the primer against its own RC.
-    Uses SantaLucia 1998 nearest-neighbor parameters. Each contiguous stretch of
-    matched base pairs is scored independently with initiation penalties.
-    Returns the most negative (most stable) ΔG found across all alignments."""
-    seq = seq.upper()
-    rc = _reverse_complement(seq)
-    n = len(seq)
-    if n < 4:
-        return 0.0
-
-    best_dg = 0.0  # 0 = no interaction; more negative = worse dimer
-    temp_k = temp_c + 273.15
-
-    # Initiation parameters (SantaLucia 1998)
-    # Each independent duplex stretch gets an initiation cost
-    INIT_DH = 0.2   # kcal/mol  (average of GC and AT init)
-    INIT_DS = -5.7   # cal/K/mol (average of GC and AT init)
-
-    # Slide rc across seq in all possible alignments (at least 4bp overlap)
-    for offset in range(-(n - 4), n - 3):
-        if offset < 0:
-            s_start = 0
-            r_start = -offset
-        else:
-            s_start = offset
-            r_start = 0
-        overlap_len = min(n - s_start, n - r_start)
-        if overlap_len < 4:
-            continue
-
-        # Find contiguous stretches of matched dinucleotides
-        # A "stretch" breaks whenever a position doesn't match
-        stretch_dh = 0.0
-        stretch_ds = 0.0
-        stretch_len = 0
-        alignment_best_dg = 0.0
-
-        for i in range(overlap_len - 1):
-            sb = seq[s_start + i]
-            rb = rc[r_start + i]
-            sb2 = seq[s_start + i + 1]
-            rb2 = rc[r_start + i + 1]
-
-            if sb == rb and sb2 == rb2:
-                pair = sb + sb2
-                if pair in NN_THERMO:
-                    h, s = NN_THERMO[pair]
-                    stretch_dh += h
-                    stretch_ds += s
-                stretch_len += 1
-            else:
-                # Mismatch — score the completed stretch (if any)
-                if stretch_len >= 2:
-                    total_dh = stretch_dh + INIT_DH
-                    total_ds = stretch_ds + INIT_DS
-                    dg = total_dh - (temp_k * total_ds / 1000.0)
-                    if dg < alignment_best_dg:
-                        alignment_best_dg = dg
-                stretch_dh = 0.0
-                stretch_ds = 0.0
-                stretch_len = 0
-
-        # Score any remaining stretch at end of overlap
-        if stretch_len >= 2:
-            total_dh = stretch_dh + INIT_DH
-            total_ds = stretch_ds + INIT_DS
-            dg = total_dh - (temp_k * total_ds / 1000.0)
-            if dg < alignment_best_dg:
-                alignment_best_dg = dg
-
-        if alignment_best_dg < best_dg:
-            best_dg = alignment_best_dg
-
-    return round(best_dg, 2)
-
-
-def _generate_primer_candidates(template: str, pos: int, direction: str, tail: str,
-                                 tm_target: float, min_len: int = 18, max_len: int = 40,
-                                 max_total: int = 60, lightweight: bool = False) -> list:
-    """Generate multiple primer candidates with different annealing lengths.
-    Returns a list of candidate dicts sorted by score (best first), each containing
-    full primer properties including dimer/hairpin/ΔG analysis.
+  // Viewer card
+  h += '<div style="border:1px solid #d5cec0;border-radius:6px;background:#fff;display:flex;flex-direction:column;overflow:hidden;">';
+  if (_cl.loading) {
+    h += '<div style="min-height:500px;display:flex;align-items:center;justify-content:center;color:#8a7f72;">';
+    h += '<div style="text-align:center;"><div style="font-size:1.6rem;margin-bottom:.5rem;">\u23f3</div><div style="font-size:.85rem;">Parsing GenBank file\u2026</div></div></div>';
+  } else if (_cl.parsed) {
+    // Toolbar
+    h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.55rem .8rem;border-bottom:1px solid #e8e2d8;flex-wrap:wrap;gap:.4rem;">';
+    h += '<div style="display:flex;align-items:center;gap:.4rem;">';
     
-    lightweight=True skips expensive homodimer/hairpin/quality analysis — used for
-    fast scanning in the optimize loop.  Only Tm and GC are computed."""
-    tpl_len = len(template)
-    candidates = []
-
-    # Constrain annealing length so total primer doesn't exceed max_total
-    tail_len = len(tail)
-    effective_max = min(max_len, max_total - tail_len)
-    if effective_max < min_len:
-        effective_max = min_len  # at least try one
-
-    for anneal_len in range(min_len, effective_max + 1):
-        if direction == "forward":
-            anneal_seq = _get_seq_region(template, pos, anneal_len)
-        else:
-            bases = []
-            for i in range(anneal_len):
-                bases.append(template[(pos - 1 - i) % tpl_len])
-            anneal_seq = _reverse_complement("".join(bases))
-
-        full_seq = tail + anneal_seq
-        tm = _calc_tm(anneal_seq)
-        gc = round(_gc_content(full_seq) * 100, 1)
-
-        # Score: lower is better
-        tm_penalty = abs(tm - tm_target) * 2.0
-        gc_penalty = max(0, abs(gc - 50) - 10) * 0.5
-
-        if lightweight:
-            # Fast path: skip expensive O(L²) analysis
-            score = tm_penalty + gc_penalty
-            candidates.append({
-                "full_seq": full_seq,
-                "tail": tail,
-                "annealing": anneal_seq,
-                "tm": tm,
-                "length": len(full_seq),
-                "gc_percent": gc,
-                "score": round(score, 2),
-            })
-        else:
-            # Full path: complete thermodynamic analysis
-            dg = _calc_delta_g(anneal_seq, temp_c=tm if tm > 0 else 60.0)
-            homodimer_dg = _calc_homodimer_dg(full_seq, temp_c=25.0)
-            hairpin = _has_hairpin(full_seq)
-            self_dimer = _has_self_dimer(full_seq)
-            quality = _check_primer_quality(anneal_seq, tm)
-
-            dimer_penalty = max(0, -homodimer_dg - 9.0) * 3.0
-            hairpin_penalty = 5.0 if hairpin else 0.0
-            score = tm_penalty + dimer_penalty + hairpin_penalty + gc_penalty
-
-            candidates.append({
-                "full_seq": full_seq,
-                "tail": tail,
-                "annealing": anneal_seq,
-                "tm": tm,
-                "length": len(full_seq),
-                "gc_percent": gc,
-                "delta_g": dg,
-                "homodimer_dg": homodimer_dg,
-                "hairpin": hairpin,
-                "self_dimer": self_dimer,
-                "quality": quality,
-                "score": round(score, 2),
-            })
-
-    # Sort by score (best first)
-    candidates.sort(key=lambda c: c["score"])
-    return candidates
-
-
-def _pick_best_with_alternatives(candidates: list, name: str, max_alternatives: int = None) -> dict:
-    """From a sorted list of candidates, pick the best and attach ALL other candidates
-    as alternatives (filtered by Tm >= 55) so the user can compare trade-offs.
-    Returns the best candidate dict with a 'name' and 'alternatives' key added."""
-    if not candidates:
-        return None
-        
-    # Always keep the absolute best candidate to prevent returning None 
-    # if the sequence is highly AT-rich and nothing hits 55°C.
-    best = dict(candidates[0])
-    best["name"] = name
-    alts = []
+    if (!sb) {
+      h += '<button onclick="_clToggleSidebar()" style="padding:.2rem .4rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#faf8f4;color:#8a7f72;cursor:pointer;" title="Show sequence list">\u00bb</button>';
+    }
     
-    for c in candidates[1:]:
-        # Filter out alternatives with a Tm below 55°C
-        if c.get("tm", 0) < 55.0:
-            continue
-            
-        # Allow max_alternatives to be None to return an unlimited list
-        if max_alternatives is not None and len(alts) >= max_alternatives:
-            break
-            
-        alt = dict(c)
-        alt["name"] = name
-        alts.append(alt)
-        
-    best["alternatives"] = alts
-    return best
+    h += '<span style="font-weight:600;color:#4a4139;font-size:.9rem;">' + esc(_cl.parsed.name) + '</span>';
+    h += '<span style="font-size:.75rem;color:#8a7f72;">' + _cl.parsed.length.toLocaleString() + ' bp</span>';
+    h += '<span style="font-size:.72rem;color:#8a7f72;padding:.15rem .4rem;background:#f0ebe3;border-radius:3px;">' + esc(_cl.parsed.topology) + '</span>';
+    h += '</div>';
 
+    h += '<div style="display:flex;gap:.3rem;align-items:center;">';
+    
+    // View Toggles
+    h += '<div style="display:flex;border:1px solid #d5cec0;border-radius:4px;overflow:hidden;margin-right:.4rem;">';
+    h += '<button onclick="_clToggleView(\x27circular\x27)" style="padding:.25rem .5rem;font-size:.72rem;border:none;cursor:pointer;' +
+          (_cl.showCircular ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#8a7f72;text-decoration:line-through;') + '">\u2b55 Circular</button>';
+    h += '<button onclick="_clToggleView(\x27linear\x27)" style="padding:.25rem .5rem;font-size:.72rem;border:none;cursor:pointer;' +
+          (_cl.showLinear ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#8a7f72;text-decoration:line-through;') + '">\u2501 Linear</button>';
+    h += '</div>';
 
-def design_golden_gate(bins: list = None, fragments: list = None, vector: dict = None,
-                       enzyme: str = "BsaI", circular: bool = True,
-                       tm_target: float = 62.0) -> dict:
-    """Design a Golden Gate assembly with type IIS enzyme.
+    // Action Buttons
+    if (!_cl.pd._viewingProduct) {
+      // .gb Download
+      h += '<a href="/api/' + esc(_cl.selected.type) + 's/' + _cl.selected.id + '/gb" download style="padding:.25rem .5rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;text-decoration:none;">\u2b07 .gb</a>';
 
-    Supports positional bins — each bin holds 1+ fragment options.
-    Overhangs are assigned per junction (between bins), so every fragment
-    in a given bin gets the same flanking overhangs, enabling combinatorial
-    assembly in a single reaction.
+      // Reindex (Show for Circular or Unknown, Grayed out for Linear)
+      var isCirc = (_cl.parsed.topology || '').toLowerCase().includes('circular');
+      var isLin = (_cl.parsed.topology || '').toLowerCase().includes('linear');
+      
+      if (isCirc || !isLin) {
+          h += '<button onclick="_clReindex()" style="padding:.25rem .5rem;font-size:.72rem;color:#e67e22;border:1px solid #e67e22;border-radius:4px;background:#fff;cursor:pointer;margin:0 .2rem;" title="Set new origin">🔄 Reindex</button>';
+      }
 
-    If `bins` is None but `fragments` is provided, each fragment becomes a
-    single-option bin (backward compatibility).
-    """
-    # ── Normalise input to bins
-    if bins is None and fragments is not None:
-        bins = [{"name": f.get("name", f"Part {i+1}"), "fragments": [f]} for i, f in enumerate(fragments)]
-    if not bins or len(bins) < 1:
-        raise HTTPException(400, "Golden Gate assembly requires at least 1 bin with fragments")
-    for b in bins:
-        if not b.get("fragments"):
-            raise HTTPException(400, f"Bin '{b.get('name', '?')}' has no fragments")
-
-    if enzyme not in TYPE_IIS_ENZYMES:
-        raise HTTPException(400, f"Unknown enzyme: {enzyme}. Supported: {', '.join(TYPE_IIS_ENZYMES.keys())}")
-
-    enz = TYPE_IIS_ENZYMES[enzyme]
-    site = enz["site"]
-    rc_site = enz["rc_site"]
-    spacer = "A"
-
-    warnings = []
-    internal_sites = []
-
-    # ── Validate every fragment in every bin & check internal sites
-    for b in bins:
-        for f in b["fragments"]:
-            s = f["seq"].upper().replace(" ", "").replace("\n", "")
-            f["_seq"] = s  # store cleaned version
-            if len(s) < 15:
-                raise HTTPException(400, f"Fragment '{f['name']}' in bin '{b['name']}' is too short (min 15bp)")
-            positions = _check_internal_sites(s, site, rc_site)
-            if positions:
-                internal_sites.append({"fragment": f["name"], "bin": b["name"], "positions": positions})
-                warnings.append(f"'{f['name']}' (bin {b['name']}) has {len(positions)} internal {enzyme} site(s)")
-
-    # Vector check
-    vec_seq = None
-    if vector and vector.get("seq"):
-        vec_seq = vector["seq"].upper().replace(" ", "").replace("\n", "")
-        positions = _check_internal_sites(vec_seq, site, rc_site)
-        # Vector is *expected* to have exactly 2 sites (flanking the insert cassette)
-        # but extra sites are a problem
-        if len(positions) > 2:
-            warnings.append(f"Vector '{vector.get('name', 'vector')}' has {len(positions)} {enzyme} sites — expected ≤2")
-
-    # ── Assign overhangs to junctions
-    # Junctions: [vec→bin0], bin0→bin1, bin1→bin2, ..., [binN→vec]
-    # With vector & circular: N_bins + 1 overhangs (one per junction including wrap)
-    # Without vector & circular: N_bins overhangs
-    # Without vector & linear: N_bins - 1 overhangs (+ start/end don't need matching)
-    n_bins = len(bins)
-    has_vec = vec_seq is not None
-
-    if circular or has_vec:
-        n_junctions = n_bins + (1 if has_vec else 0)
-    else:
-        n_junctions = n_bins - 1
-
-    n_overhangs = n_junctions + (1 if circular or has_vec else 0)
-    if n_overhangs > len(GOLDEN_OVERHANGS):
-        raise HTTPException(400, f"Too many positions — max {len(GOLDEN_OVERHANGS)} overhangs available, need {n_overhangs}")
-    overhangs = GOLDEN_OVERHANGS[:n_overhangs]
-
-    # ── Design primers for every fragment in every bin
-    # Each bin i has:
-    #   left_overhang  = overhangs[i]      (or overhangs[i+1] with vector offset)
-    #   right_overhang = overhangs[i+1]    (wrapping for circular)
-    bin_results = []
-    all_primers = []
-
-    oh_offset = 1 if has_vec else 0  # shift bin overhangs if vector takes position 0
-
-    for bi, b in enumerate(bins):
-        left_oh = overhangs[(bi + oh_offset) % len(overhangs)]
-        right_oh = overhangs[(bi + oh_offset + 1) % len(overhangs)]
-
-        frag_results = []
-        for f in b["fragments"]:
-            s = f["_seq"]
-            # Forward primer: spacer + site + left_overhang + annealing
-            fwd_tail = spacer + site + left_oh
-            fwd_candidates = _generate_primer_candidates(s, 0, "forward", fwd_tail, tm_target)
-            fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{f['name']}_Fwd_{enzyme}")
-
-            # Reverse primer: spacer + RC(site) + RC(right_overhang) + annealing
-            rev_tail = spacer + rc_site + _reverse_complement(right_oh)
-            rev_candidates = _generate_primer_candidates(s, len(s), "reverse", rev_tail, tm_target)
-            rev_primer = _pick_best_with_alternatives(rev_candidates, f"{f['name']}_Rev_{enzyme}")
-
-            # Add hairpin/dimer warnings
-            for p, pname in [(fwd_primer, f"{f['name']}_Fwd"), (rev_primer, f"{f['name']}_Rev")]:
-                if p and p.get("hairpin"):
-                    warnings.append(f"{pname} may form hairpin")
-                if p and p.get("homodimer_dg", 0) < -9.0:
-                    warnings.append(f"{pname} has strong self-dimer (ΔG = {p['homodimer_dg']} kcal/mol)")
-
-            frag_results.append({
-                "name": f["name"],
-                "length": len(s),
-                "fwd_primer": fwd_primer,
-                "rev_primer": rev_primer,
-            })
-            all_primers.append(fwd_primer)
-            all_primers.append(rev_primer)
-
-        bin_results.append({
-            "name": b["name"],
-            "left_overhang": left_oh,
-            "right_overhang": right_oh,
-            "num_options": len(b["fragments"]),
-            "fragments": frag_results,
-        })
-
-    # ── Vector primers (if provided)
-    vec_primers = None
-    if has_vec:
-        # Vector fwd: after last bin → vector start
-        vec_fwd_tail = spacer + site + overhangs[0]
-        vec_fwd_candidates = _generate_primer_candidates(vec_seq, 0, "forward", vec_fwd_tail, tm_target)
-        vec_fwd = _pick_best_with_alternatives(vec_fwd_candidates, f"{vector.get('name', 'Vector')}_Fwd_{enzyme}")
-
-        # Vector rev: before first bin → vector end
-        vec_rev_oh_idx = oh_offset  # = 1
-        vec_rev_tail = spacer + rc_site + _reverse_complement(overhangs[vec_rev_oh_idx])
-        vec_rev_candidates = _generate_primer_candidates(vec_seq, len(vec_seq), "reverse", vec_rev_tail, tm_target)
-        vec_rev = _pick_best_with_alternatives(vec_rev_candidates, f"{vector.get('name', 'Vector')}_Rev_{enzyme}")
-
-        vec_primers = {"fwd": vec_fwd, "rev": vec_rev}
-        all_primers.append(vec_primers["fwd"])
-        all_primers.append(vec_primers["rev"])
-
-    # ── Combinatorial stats
-    combo_count = 1
-    for b in bins:
-        combo_count *= len(b["fragments"])
-
-    if combo_count > 1:
-        warnings.insert(0, f"Combinatorial assembly: {combo_count} possible construct{'s' if combo_count > 1 else ''}")
-
-    # ── Build default product (first fragment from each bin)
-    default_seqs = []
-    for b in bins:
-        default_seqs.append(b["fragments"][0]["_seq"])
-    if has_vec:
-        product_seq = vec_seq + "".join(default_seqs)
-    else:
-        product_seq = "".join(default_seqs)
-
-    # ── Overhang map for display
-    overhang_map = []
-    for i in range(len(overhangs)):
-        if has_vec and i == 0:
-            label = f"Vector → {bins[0]['name']}" if len(bins) > 0 else "Vector start"
-        elif has_vec:
-            left_name = bins[i - 1]["name"] if i - 1 < len(bins) else "Vector"
-            right_name = bins[i]["name"] if i < len(bins) else "Vector"
-            label = f"{left_name} → {right_name}"
-        else:
-            left_name = bins[i]["name"] if i < len(bins) else bins[-1]["name"]
-            right_name = bins[(i + 1) % len(bins)]["name"] if (i + 1) < len(bins) else bins[0]["name"]
-            label = f"{left_name} → {right_name}"
-        overhang_map.append({"overhang": overhangs[i], "label": label})
-
-    return {
-        "enzyme": {"name": enzyme, "site": site, "cut_offset": enz["cut_offset"]},
-        "bins": bin_results,
-        "overhang_map": overhang_map,
-        "vector_primers": vec_primers,
-        "vector_name": vector.get("name", "Vector") if vector else None,
-        "primers": all_primers,
-        "product_length": len(product_seq),
-        "product_seq": product_seq,
-        "combo_count": combo_count,
-        "num_bins": n_bins,
-        "warnings": warnings,
-        "internal_sites": internal_sites,
+      // Send to OC
+      h += '<button onclick="_clSendToOC()" style="padding:.25rem .5rem;font-size:.72rem;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;">\ud83d\udce4 Send to OC</button>';
     }
 
+    // Search Toggle
+    h += '<button onclick="_clSearchToggle()" style="padding:.25rem .5rem;font-size:.72rem;border:1px solid ' + (_cl.search.open ? '#5b7a5e' : '#d5cec0') + ';border-radius:4px;background:' + (_cl.search.open ? '#5b7a5e' : '#faf8f4') + ';color:' + (_cl.search.open ? '#fff' : '#8a7f72') + ';cursor:pointer;">\ud83d\udd0d</button>';
+    h += '</div></div>';
+    // ── Sequence search bar
+    if (_cl.search.open) {
+      h += '<div style="display:flex;align-items:center;gap:.5rem;padding:.4rem .8rem;border-bottom:1px solid #e8e2d8;background:#faf8f4;">';
+      h += '<span style="font-size:.75rem;color:#8a7f72;">\ud83d\udd0d</span>';
+      h += '<input id="cl-search-input" type="text" value="' + esc(_cl.search.query) + '" oninput="_clSearchRun(this.value)" onkeydown="if(event.key===\x27Enter\x27)_clSearchNext();if(event.key===\x27Escape\x27)_clSearchToggle();" placeholder="Search sequence (forward + reverse complement)\u2026" autofocus style="flex:1;padding:.3rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#fff;font-size:.8rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" />';
+      if (_cl.search.results && _cl.search.results.length > 0) {
+        h += '<span style="font-size:.72rem;color:#4a4139;font-weight:500;white-space:nowrap;">' + (_cl.search.activeIdx + 1) + '/' + _cl.search.results.length + '</span>';
+        h += '<button onclick="_clSearchPrev()" style="padding:.15rem .4rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#4a4139;cursor:pointer;">\u25b2</button>';
+        h += '<button onclick="_clSearchNext()" style="padding:.15rem .4rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#4a4139;cursor:pointer;">\u25bc</button>';
+      } else if (_cl.search.query.length >= 3 && _cl.search.results) {
+        h += '<span style="font-size:.72rem;color:#c0392b;">No matches</span>';
+      }
+      if (_cl.search.results && _cl.search.results.length > 0) {
+        var hit = _cl.search.results[_cl.search.activeIdx];
+        h += '<span style="font-size:.7rem;color:' + (hit.strand === 'fwd' ? '#2980b9' : '#8e44ad') + ';font-weight:500;white-space:nowrap;">' + (hit.strand === 'fwd' ? '\u2192 Forward' : '\u2190 Rev Comp') + ' at ' + hit.start + '</span>';
+      }
+      h += '<button onclick="_clSearchToggle()" style="padding:.15rem .35rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#8a7f72;cursor:pointer;">\u2715</button>';
+      h += '</div>';
+    }
+    
 
-def design_digest_ligate(vector: dict, insert: dict, enzyme1: str, enzyme2: str = None,
-                         design_primers: bool = True, tm_target: float = 62.0,
-                         vector_cut1_pos: int = None, vector_cut2_pos: int = None) -> dict:
-    """Design a digest-ligate cloning strategy."""
-    from Bio.Seq import Seq as BioSeq
-    from Bio.Restriction import RestrictionBatch, Analysis
+    // ── Product preview banner
+    if (_cl.pd._viewingProduct) {
+      h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.5rem .8rem;background:linear-gradient(90deg,#eef4ee,#e8f0f8);border-bottom:1px solid #b8d4b8;flex-wrap:wrap;gap:.4rem;">';
+      h += '<div style="display:flex;align-items:center;gap:.5rem;">';
+      h += '<span style="font-size:.9rem;">\ud83e\uddea</span>';
+      h += '<span style="font-size:.8rem;font-weight:600;color:#4a4139;">Product Preview</span>';
+      h += '<span style="font-size:.72rem;color:#5b7a5e;">Expected result with remapped features. Review before saving.</span>';
+      h += '</div>';
+      h += '<div style="display:flex;gap:.4rem;">';
+      h += '<button onclick="_pdExitProductPreview()" style="padding:.3rem .7rem;font-size:.75rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:4px;background:#fff;cursor:pointer;">\u2190 Back to Template</button>';
+      h += '<button onclick="_pdSaveProduct()" style="padding:.3rem .7rem;font-size:.75rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;">\ud83d\udcbe Save as Plasmid</button>';
+      h += '</div>';
+      h += '</div>';
+    }
+    // ── Features / Annotations editor (collapsible)
+    var anns = _cl.parsed.annotations || [];
+    h += '<div style="border-bottom:1px solid #e8e2d8;">';
+    h += '<div onclick="_clToggleFeatures()" style="display:flex;align-items:center;justify-content:space-between;padding:.35rem .8rem;cursor:pointer;background:#faf8f4;user-select:none;" onmouseover="this.style.background=\x27#f0ebe3\x27" onmouseout="this.style.background=\x27#faf8f4\x27">';
+    h += '<div style="display:flex;align-items:center;gap:.5rem;">';
+    h += '<span style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Features (' + anns.length + ')</span>';
+    if (_cl.featuresDirty) {
+      h += '<span style="font-size:.62rem;color:#c0392b;font-weight:600;">\u2022 unsaved</span>';
+    }
+    h += '</div>';
+    h += '<span style="font-size:.7rem;color:#8a7f72;transition:transform .2s;display:inline-block;transform:rotate(' + (_cl.featuresOpen ? '180' : '0') + 'deg);">\u25bc</span>';
+    h += '</div>';
+    if (_cl.featuresOpen) {
+      h += '<div style="max-height:280px;overflow-y:auto;">';
+      h += '<table style="width:100%;border-collapse:collapse;font-size:.76rem;"><thead><tr style="background:#faf8f4;">';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;width:22px;"></th>';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Name</th>';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Type</th>';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Location</th>';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Dir</th>';
+      h += '<th style="text-align:center;padding:.25rem .3rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;width:50px;"></th>';
+      h += '</tr></thead><tbody>';
+      anns.forEach(function(a, i) {
+        h += '<tr style="border-bottom:1px solid #f0ebe3;" onmouseover="this.style.background=\x27#f5f1eb\x27" onmouseout="this.style.background=\x27transparent\x27">';
+        h += '<td style="padding:.2rem .3rem;text-align:center;"><input type="color" value="' + esc(a.color || '#95A5A6') + '" onchange="_clFeatColor(' + i + ',this.value)" style="width:18px;height:18px;border:1px solid #d5cec0;border-radius:3px;padding:0;cursor:pointer;background:none;" title="Change color" /></td>';
+        h += '<td style="padding:.2rem .5rem;color:#4a4139;">' + esc(a.name) + '</td>';
+        h += '<td style="padding:.2rem .5rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;">' + esc(a.type) + '</td>';
+        h += '<td style="padding:.2rem .5rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;">' + a.start + '..' + a.end + '</td>';
+        h += '<td style="padding:.2rem .5rem;color:#8a7f72;cursor:pointer;" onclick="_clFeatDir(' + i + ')" title="Toggle direction">' + (a.direction === 1 ? '\u2192' : '\u2190') + '</td>';
+        h += '<td style="padding:.2rem .3rem;text-align:center;">';
+        h += '<button onclick="_clFeatEdit(' + i + ')" style="padding:0 .3rem;font-size:.68rem;color:#4a4139;border:none;background:none;cursor:pointer;" title="Edit">\u270f\ufe0f</button>';
+        h += '<button onclick="_clFeatRemove(' + i + ')" style="padding:0 .3rem;font-size:.68rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Remove">\u2715</button>';
+        h += '</td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table></div>';
+      // Action bar
+      h += '<div style="display:flex;gap:.4rem;padding:.4rem .6rem;background:#faf8f4;border-top:1px solid #e8e2d8;">';
+      h += '<button onclick="_clFeatAdd()" style="padding:.25rem .6rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:#fff;cursor:pointer;">+ Add Feature</button>';
+      if (_cl.featuresDirty && !_cl.pd._viewingProduct) {
+        h += '<button onclick="_clFeatSave()" style="padding:.25rem .6rem;font-size:.72rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;">\ud83d\udcbe Save to .gb</button>';
+        h += '<button onclick="_clFeatRevert()" style="padding:.25rem .5rem;font-size:.72rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:4px;background:#fff;cursor:pointer;">Revert</button>';
+      }
+      h += '</div>';
+    }
+    h += '</div>';
 
-    vec_seq = vector["seq"].upper().replace(" ", "").replace("\n", "")
-    ins_seq = insert["seq"].upper().replace(" ", "").replace("\n", "")
-    vec_name = vector.get("name", "vector")
-    ins_name = insert.get("name", "insert")
+    // SeqViz mount
+    h += '<div id="cl-seqviz-mount" style="flex:1;min-height:500px;background:#fff;"></div>';
+  } else {
+    // Show sidebar button in empty state too
+    h += '<div style="min-height:500px;display:flex;align-items:center;justify-content:center;color:#8a7f72;position:relative;">';
+    if (!sb) {
+      h += '<button onclick="_clToggleSidebar()" style="position:absolute;top:.6rem;left:.6rem;padding:.2rem .4rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#faf8f4;color:#8a7f72;cursor:pointer;" title="Show sequence list">\u00bb</button>';
+    }
+    h += '<div style="text-align:center;max-width:280px;">';
+    h += '<div style="font-size:2.5rem;margin-bottom:.7rem;opacity:.5;">\ud83e\uddec</div>';
+    h += '<div style="font-size:.95rem;font-weight:500;color:#4a4139;margin-bottom:.3rem;">Select a sequence</div>';
+    h += '<div style="font-size:.8rem;">Choose a plasmid or primer from the ' + (sb ? 'left panel' : 'sidebar (\u00bb)') + ' to view its sequence map and features.</div>';
+    h += '</div></div>';
+  }
+  h += '</div>'; // viewer card
 
-    if not vec_seq or not ins_seq:
-        raise HTTPException(400, "Both vector and insert sequences are required")
+  // Primer design panel (hidden during product preview)
+  if (_cl.parsed && !_cl.pd._viewingProduct) { h += _clRenderPDPanel(); }
 
-    enzymes_to_use = [enzyme1]
-    if enzyme2:
-        enzymes_to_use.append(enzyme2)
+  // Sequence analysis panel (hidden during product preview)
+  if (_cl.parsed && !_cl.pd._viewingProduct) { h += _clRenderSAPanel(); }
 
-    # Validate enzymes and get properties
-    batch = RestrictionBatch()
-    enz_objects = {}
-    for ename in enzymes_to_use:
-        try:
-            batch.add(ename.strip())
-        except (ValueError, KeyError):
-            raise HTTPException(400, f"Unknown enzyme: {ename}")
+  // Assembly designer panel (hidden during product preview)
+  if (_cl.parsed && !_cl.pd._viewingProduct) { h += _clRenderAssemblyPanel(); }
 
-    # Analyse vector
-    bio_vec = BioSeq(vec_seq)
-    vec_analysis = Analysis(batch, bio_vec, linear=False)
-    vec_results = vec_analysis.full()
+  h += '</div>'; // right column
+  h += '</div>'; // grid
 
-    # Analyse insert
-    bio_ins = BioSeq(ins_seq)
-    ins_analysis = Analysis(batch, bio_ins, linear=True)
-    ins_results = ins_analysis.full()
+  // ── Floating feature editor panel (outside grid, always on top)
+  if (_cl.editFeature !== null) {
+    h += _clRenderFeaturePanel();
+  }
 
-    warnings = []
-    enzyme_info = {}
-    sticky_ends = {}
+  return h;
+}
 
-    for enzyme_obj, positions in vec_results.items():
-        ename = str(enzyme_obj)
-        ovhg = int(enzyme_obj.ovhg) if hasattr(enzyme_obj, 'ovhg') else 0
-        site_str = str(enzyme_obj.site) if hasattr(enzyme_obj, 'site') else "?"
-        enzyme_info[ename] = {
-            "name": ename, "site": site_str, "overhang": ovhg,
-            "vector_cuts": sorted(positions), "num_vector_cuts": len(positions),
+/* ═══════════════════════════════════════════════════════════
+   PRIMER DESIGN PANEL
+   ═══════════════════════════════════════════════════════════ */
+function _clRenderPDPanel() {
+  var pd = _cl.pd;
+  var h = '';
+
+  h += '<div style="border:1px solid #d5cec0;border-radius:6px;background:#fff;overflow:hidden;">';
+
+  // Collapsible header
+  h += '<div onclick="_pdToggle()" style="display:flex;align-items:center;justify-content:space-between;padding:.6rem .9rem;cursor:pointer;background:#faf8f4;border-bottom:' + (pd.expanded ? '1px solid #e8e2d8' : 'none') + ';user-select:none;" ' +
+       'onmouseover="this.style.background=\x27#f0ebe3\x27" onmouseout="this.style.background=\x27#faf8f4\x27">';
+  h += '<div style="display:flex;align-items:center;gap:.5rem;">';
+  h += '<span style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#5b7a5e;">Primer Design</span>';
+  h += '</div>';
+  h += '<span style="font-size:.8rem;color:#8a7f72;transition:transform .2s;display:inline-block;transform:rotate(' + (pd.expanded ? '180' : '0') + 'deg);">\u25bc</span>';
+  h += '</div>';
+
+  if (!pd.expanded) { h += '</div>'; return h; }
+
+  // Mode tabs
+  h += '<div style="display:flex;border-bottom:1px solid #e8e2d8;background:#faf8f4;">';
+  var modes = [
+    { key: 'custom', label: 'Custom', icon: '\u270f\ufe0f' },
+    { key: 'pcr', label: 'PCR', icon: '\ud83d\udd2c' },
+    { key: 'seq', label: 'Sequencing', icon: '\ud83d\udcca' },
+    { key: 'kld', label: 'KLD Insertion', icon: '\u2702\ufe0f' },
+  ];
+  modes.forEach(function(m) {
+    var active = pd.mode === m.key;
+    h += '<button onclick="_pdSetMode(\x27' + m.key + '\x27)" style="flex:1;padding:.5rem .3rem;font-size:.75rem;font-weight:' + (active ? '600' : '400') + ';border:none;border-bottom:2px solid ' + (active ? '#5b7a5e' : 'transparent') + ';cursor:pointer;background:' + (active ? '#fff' : 'transparent') + ';color:' + (active ? '#4a4139' : '#8a7f72') + ';transition:all .15s;">' + m.icon + ' ' + m.label + '</button>';
+  });
+  h += '</div>';
+
+  // Mode body
+  h += '<div style="padding:.9rem;">';
+  if (pd.mode === 'custom') { h += _clRenderCustomMode(); }
+  else if (pd.mode === 'pcr') { h += _clRenderPCRMode(); }
+  else if (pd.mode === 'seq') { h += _clRenderSeqMode(); }
+  else if (pd.mode === 'kld') { h += _clRenderKLDMode(); }
+  h += '</div>';
+
+  h += '</div>';
+  return h;
+}
+
+/* ── CUSTOM PRIMER MODE ────────────────────────────────────── */
+function _clRenderCustomMode() {
+  var c = _cl.pd.custom;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Select a region on the template to create a primer. <strong style="color:#5b7a5e;">Click or drag on the map above</strong> to set positions. Quality checks flag issues with Tm, GC, self-dimers, and more.</p>';
+
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr auto;gap:.6rem;margin-bottom:.7rem;align-items:end;">';
+  // Start
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Start (0-based)</label>';
+  h += '<input id="cl-pd-custom-start" type="number" min="0" max="' + (_cl.parsed ? _cl.parsed.length - 1 : 99999) + '" value="' + esc(String(c.start)) + '" oninput="_pdCustomSet(\x27start\x27,this.value)" placeholder="e.g. 100" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
+  // End
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">End</label>';
+  h += '<input id="cl-pd-custom-end" type="number" min="0" max="' + (_cl.parsed ? _cl.parsed.length : 99999) + '" value="' + esc(String(c.end)) + '" oninput="_pdCustomSet(\x27end\x27,this.value)" placeholder="e.g. 122" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
+  // Direction
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Direction</label>';
+  h += '<div style="display:flex;border:1px solid #d5cec0;border-radius:4px;overflow:hidden;">';
+  h += '<button onclick="_pdCustomSet(\x27direction\x27,\x27forward\x27)" style="padding:.4rem .6rem;font-size:.78rem;border:none;cursor:pointer;' + (c.direction === 'forward' ? 'background:#2980b9;color:#fff;' : 'background:#faf8f4;color:#4a4139;') + '">Fwd \u2192</button>';
+  h += '<button onclick="_pdCustomSet(\x27direction\x27,\x27reverse\x27)" style="padding:.4rem .6rem;font-size:.78rem;border:none;cursor:pointer;' + (c.direction === 'reverse' ? 'background:#8e44ad;color:#fff;' : 'background:#faf8f4;color:#4a4139;') + '">\u2190 Rev</button>';
+  h += '</div></div>';
+  h += '</div>';
+
+  // Region preview
+  var s = parseInt(c.start, 10), e = parseInt(c.end, 10);
+  if (_cl.parsed && !isNaN(s) && !isNaN(e) && s >= 0 && e > s && e <= _cl.parsed.length) {
+    var region = _cl.parsed.seq.substring(s, e);
+    var dispLen = Math.min(region.length, 50);
+    h += '<div style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.75rem;color:#8a7f72;margin-bottom:.5rem;background:#f0ebe3;padding:.3rem .5rem;border-radius:3px;word-break:break-all;">';
+    h += '<span style="font-size:.65rem;color:#8a7f72;">Region (' + region.length + 'bp): </span>' + esc(region.substring(0, dispLen)) + (region.length > dispLen ? '\u2026' : '');
+    h += '</div>';
+  }
+
+  h += '<button onclick="_pdCustomDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (c.designing ? 'opacity:.6;pointer-events:none;' : '') + '">' + (c.designing ? '\u23f3 Evaluating\u2026' : '\ud83e\uddea Evaluate Primer') + '</button>';
+
+  if (c.result) { h += _clRenderCustomResult(c.result); }
+  return h;
+}
+
+function _clRenderCustomResult(r) {
+  var h = '<div style="margin-top:.8rem;">';
+  h += _clRenderSinglePrimer(r.direction === 'forward' ? 'Forward' : 'Reverse', {
+    seq: r.primer_seq, tm: r.tm, length: r.length, gc_percent: r.gc_percent, quality: r.quality
+  }, r.direction === 'forward' ? '#2980b9' : '#8e44ad', 'custom', {
+    name: 'Primer ' + r.start + '-' + r.end, start: r.start, end: r.end,
+    direction: r.direction === 'forward' ? 1 : -1, color: '#E67E22', type: 'primer_bind'
+  });
+  h += _clRenderSaveBtn([{ seq: r.primer_seq, label: (r.direction === 'forward' ? 'FWD' : 'REV') + ' custom primer at ' + r.start + '-' + r.end }]);
+  h += '</div>';
+  return h;
+}
+
+/* ── PCR PRIMER MODE ───────────────────────────────────────── */
+function _clRenderPCRMode() {
+  var p = _cl.pd.pcr;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Define the region you want to amplify. <strong style="color:#5b7a5e;">Drag on the map</strong> to select the target. Forward and reverse primers will be designed flanking it.</p>';
+
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Target Start</label>';
+  h += '<input id="cl-pd-pcr-targetStart" type="number" min="0" value="' + esc(String(p.targetStart)) + '" oninput="_pdPcrSet(\x27targetStart\x27,this.value)" placeholder="e.g. 500" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Target End</label>';
+  h += '<input id="cl-pd-pcr-targetEnd" type="number" min="0" value="' + esc(String(p.targetEnd)) + '" oninput="_pdPcrSet(\x27targetEnd\x27,this.value)" placeholder="e.g. 1500" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Tm Target (\u00b0C)</label>';
+  h += '<input type="number" min="50" max="75" value="' + p.tmTarget + '" oninput="_pdPcrSet(\x27tmTarget\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  h += '</div>';
+
+  // Amplicon preview
+  var ts = parseInt(p.targetStart, 10), te = parseInt(p.targetEnd, 10);
+  if (!isNaN(ts) && !isNaN(te) && te > ts) {
+    h += '<div style="font-size:.75rem;color:#8a7f72;margin-bottom:.5rem;">Amplicon: ~' + (te - ts).toLocaleString() + ' bp</div>';
+  }
+
+  h += '<button onclick="_pdPcrDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (p.designing ? 'opacity:.6;pointer-events:none;' : '') + '">' + (p.designing ? '\u23f3 Designing\u2026' : '\ud83e\uddea Design PCR Primers') + '</button>';
+
+  if (p.result) { h += _clRenderPCRResult(p.result); }
+  return h;
+}
+
+function _clRenderPCRResult(r) {
+  var h = '<div style="margin-top:.8rem;">';
+  if (r.warnings && r.warnings.length > 0) {
+    h += '<div style="background:#fdf2e9;border:1px solid #e8a838;border-radius:5px;padding:.5rem .7rem;margin-bottom:.6rem;">';
+    r.warnings.forEach(function(w) { h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(w) + '</div>'; });
+    h += '</div>';
+  }
+  h += _clRenderSinglePrimer('Forward', r.forward, '#2980b9', 'pcr-fwd', {
+    name: 'PCR Fwd', start: r.forward.position, end: r.forward.position + r.forward.length,
+    direction: 1, color: '#2980b9', type: 'primer_bind'
+  });
+  h += _clRenderSinglePrimer('Reverse', r.reverse, '#8e44ad', 'pcr-rev', {
+    name: 'PCR Rev', start: r.reverse.position - r.reverse.length, end: r.reverse.position,
+    direction: -1, color: '#8e44ad', type: 'primer_bind'
+  });
+
+  // Summary
+  h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;padding:.5rem .7rem;background:#faf8f4;border:1px solid #e8e2d8;border-radius:5px;margin-top:.5rem;">';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Amplicon: <strong style="color:#4a4139;">' + r.amplicon_length.toLocaleString() + ' bp</strong></span>';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">\u0394Tm: <strong style="color:#4a4139;">' + r.tm_diff + '\u00b0C</strong></span>';
+  h += '<button onclick="_pdCopyBoth(\x27pcr\x27)" style="margin-left:auto;padding:.3rem .6rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:transparent;cursor:pointer;">\ud83d\udccb Copy Both</button>';
+  h += '<button onclick="_pdGenerateProduct(\x27pcr\x27)" style="padding:.3rem .6rem;font-size:.72rem;background:#4682B4;color:#fff;border:none;border-radius:4px;cursor:pointer;" title="Generate linear PCR product as new .gb file">\ud83e\uddec Generate Product</button>';
+  h += '</div>';
+  h += _clRenderSaveBtn([
+    { seq: r.forward.seq, label: 'FWD PCR primer at ' + r.forward.position },
+    { seq: r.reverse.seq, label: 'REV PCR primer at ' + r.reverse.position },
+  ]);
+  h += '</div>';
+  return h;
+}
+
+/* ── SEQUENCING PRIMER MODE ────────────────────────────────── */
+function _clRenderSeqMode() {
+  var s = _cl.pd.seq;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Define the region to sequence. <strong style="color:#5b7a5e;">Drag on the map</strong> to select it. Primers will be spaced for ~900bp Sanger reads with overlap for full coverage.</p>';
+
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Region Start</label>';
+  h += '<input id="cl-pd-seq-regionStart" type="number" min="0" value="' + esc(String(s.regionStart)) + '" oninput="_pdSeqSet(\x27regionStart\x27,this.value)" placeholder="0" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Region End</label>';
+  h += '<input id="cl-pd-seq-regionEnd" type="number" min="0" value="' + esc(String(s.regionEnd)) + '" oninput="_pdSeqSet(\x27regionEnd\x27,this.value)" placeholder="e.g. 3000" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Read Length</label>';
+  h += '<input type="number" min="300" max="1200" value="' + s.readLen + '" oninput="_pdSeqSet(\x27readLen\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Tm Target</label>';
+  h += '<input type="number" min="50" max="75" value="' + s.tmTarget + '" oninput="_pdSeqSet(\x27tmTarget\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  h += '</div>';
+
+  var rs = parseInt(s.regionStart, 10), re = parseInt(s.regionEnd, 10);
+  if (!isNaN(rs) && !isNaN(re) && re > rs) {
+    var estPrimers = Math.ceil((re - rs) / (s.readLen - 150));
+    h += '<div style="font-size:.75rem;color:#8a7f72;margin-bottom:.5rem;">Region: ' + (re - rs).toLocaleString() + ' bp \u2014 estimated ' + estPrimers + ' primer' + (estPrimers > 1 ? 's' : '') + ' needed</div>';
+  }
+
+  h += '<button onclick="_pdSeqDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (s.designing ? 'opacity:.6;pointer-events:none;' : '') + '">' + (s.designing ? '\u23f3 Designing\u2026' : '\ud83e\uddea Design Sequencing Primers') + '</button>';
+
+  if (s.result) { h += _clRenderSeqResult(s.result); }
+  return h;
+}
+
+function _clRenderSeqResult(r) {
+  var h = '<div style="margin-top:.8rem;">';
+  h += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.6rem;">' + r.num_primers + ' primer' + (r.num_primers > 1 ? 's' : '') + ' designed \u2014 step size ' + r.step_size + 'bp, read length ' + r.read_length + 'bp</div>';
+
+  r.primers.forEach(function(p) {
+    h += _clRenderSinglePrimer('Seq #' + p.index + ' (pos ' + p.position + ')', {
+      seq: p.seq, tm: p.tm, length: p.length, gc_percent: p.gc_percent, quality: p.quality
+    }, '#e67e22', 'seq-' + p.index, {
+      name: 'Seq primer #' + p.index, start: p.position, end: Math.min(p.position + p.length, (_cl.parsed ? _cl.parsed.length : 99999)),
+      direction: 1, color: '#e67e22', type: 'primer_bind'
+    });
+  });
+
+  // Copy all
+  h += '<div style="display:flex;gap:.5rem;margin-top:.5rem;">';
+  h += '<button onclick="_pdCopyBoth(\x27seq\x27)" style="padding:.3rem .7rem;font-size:.75rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:transparent;cursor:pointer;">\ud83d\udccb Copy All Primers</button>';
+  h += '</div>';
+
+  var saveItems = r.primers.map(function(p) { return { seq: p.seq, label: 'Seq primer #' + p.index + ' at pos ' + p.position }; });
+  h += _clRenderSaveBtn(saveItems);
+  h += '</div>';
+  return h;
+}
+
+/* ── KLD INSERTION MODE ────────────────────────────────────── */
+function _clRenderKLDMode() {
+  var k = _cl.pd.kld;
+  var h = '';
+h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Ligation-DpnI) \u2014 design primers for insertion, deletion, or replacement via inverse PCR. <strong style="color:#5b7a5e;">Set range</strong> to chop out DNA.</p>';
+
+  // Row 1: Start and End Positions
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Start Position</label>';
+  h += '  <input id="cl-pd-kld-startPos" type="number" min="0" value="' + esc(String(_cl.pd.kld.startPos || '')) + '" oninput="_pdKldSet(\x27startPos\x27,this.value)" placeholder="e.g. 100" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:monospace;" /></div>';
+  
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">End Position</label>';
+  h += '  <input id="cl-pd-kld-endPos" type="number" min="0" value="' + esc(String(_cl.pd.kld.endPos || '')) + '" oninput="_pdKldSet(\x27endPos\x27,this.value)" placeholder="Same as start for insertion" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:monospace;" /></div>';
+  h += '</div>';
+
+  // Row 2: Optimization toggle
+  h += '<div style="margin-bottom:.7rem;">';
+  h += '  <label style="display:flex; align-items:center; gap:8px; font-size:.78rem; color:#4a4139; cursor:pointer;">';
+  h += '    <input type="checkbox" ' + (_cl.pd.kld.optimize ? 'checked' : '') + ' onchange="_pdKldSet(\x27optimize\x27,this.checked)" style="margin:0;">';
+  h += '    Optimize junction (find best primers within range)';
+  h += '  </label>';
+  h += '</div>';
+
+  // Row 3: Tm and Max Length
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Tm Target (\u00b0C)</label>';
+  h += '  <input type="number" min="50" max="75" value="' + k.tmTarget + '" oninput="_pdKldSet(\x27tmTarget\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Max Length (bp)</label>';
+  h += '  <input type="number" min="30" max="100" value="' + k.maxLen + '" oninput="_pdKldSet(\x27maxLen\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  h += '</div>';
+
+  h += '<label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Insert Sequence</label>';
+  h += '<textarea id="cl-kld-insert-ta" oninput="_pdKldSet(\x27insertSeq\x27,this.value)" placeholder="Paste DNA to insert\u2026" style="width:100%;box-sizing:border-box;padding:.45rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.78rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:55px;resize:vertical;line-height:1.5;">' + esc(k.insertSeq) + '</textarea>';
+
+  var clean = _clCleanSeq(k.insertSeq);
+  if (clean.length > 0) {
+    h += '<div style="font-size:.72rem;color:#8a7f72;margin-top:.2rem;display:flex;gap:.8rem;">';
+    h += '<span>Length: <strong style="color:#4a4139;">' + clean.length + ' bp</strong></span>';
+    h += '<span>GC: <strong style="color:#4a4139;">' + _clGcPct(clean) + '%</strong></span>';
+    h += '</div>';
+  }
+
+  // Complexity estimate
+  var kldS = parseInt(k.startPos, 10) || 0;
+  var kldE = parseInt(k.endPos || k.startPos, 10) || 0;
+  var kldRange = Math.max(1, Math.abs(kldE - kldS) + 1);
+  var kldInsLen = _clCleanSeq(k.insertSeq || '').length;
+  var kldSplits = kldInsLen > 0 ? kldInsLen + 1 : 1;
+  if (k.optimize && kldRange > 1) {
+    var kldPairs = kldRange * (kldRange + 1) / 2;
+    h += '<div style="font-size:.72rem;color:#8a7f72;margin-top:.5rem;padding:.4rem .6rem;background:#eef4ee;border-radius:4px;border:1px solid #d5cec0;">';
+    h += '\ud83d\udd0d Baseline + <strong style="color:#4a4139;">' + kldPairs.toLocaleString() + '</strong> junction pairs \u00d7 <strong style="color:#4a4139;">' + kldSplits + '</strong> splits \u00d7 top-3 annealing \u2192 refine top 50';
+    h += '</div>';
+  }
+
+  h += '<div style="margin-top:.6rem;">';
+  h += '<button onclick="_pdKldDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (k.designing ? 'opacity:.6;pointer-events:none;' : '') + '">' + (k.designing ? '\u23f3 Designing\u2026' : '\u2702\ufe0f Design KLD Primers') + '</button>';
+  h += '</div>';
+
+  // Progress bar during design
+  if (k.designing) {
+    h += '<div id="cl-kld-progress-wrap" style="margin-top:.5rem;">';
+    h += '<div style="height:6px;background:#e8e2d8;border-radius:3px;overflow:hidden;">';
+    h += '<div id="cl-kld-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#5b7a5e,#2980b9);border-radius:3px;transition:width 0.3s ease;"></div>';
+    h += '</div>';
+    h += '<div id="cl-kld-progress-text" style="font-size:.68rem;color:#8a7f72;margin-top:.2rem;">Running baseline analysis\u2026</div>';
+    h += '</div>';
+  }
+
+  if (k.result) { h += _clRenderKLDResult(k.result); }
+  return h;
+}
+
+function _clRenderKLDResult(r) {
+  var h = '<div style="margin-top:.8rem;">';
+  if (r.warnings && r.warnings.length > 0) {
+    h += '<div style="background:#fdf2e9;border:1px solid #e8a838;border-radius:5px;padding:.5rem .7rem;margin-bottom:.6rem;">';
+    r.warnings.forEach(function(w) { h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(w) + '</div>'; });
+    h += '</div>';
+  }
+
+  // Use start_used/end_used from the API response (the actual positions the algorithm chose)
+  var kldStart = parseInt(r.start_used, 10) || parseInt(_cl.pd.kld.startPos, 10) || 0;
+  var kldEnd = parseInt(r.end_used, 10) || parseInt(_cl.pd.kld.endPos, 10) || 0;
+  var kldSeqLen = _cl.parsed ? _cl.parsed.length : 99999;
+
+  // Get selected primers (may differ from best if user clicked an alternative)
+  var selFwd = _pdKldGetSelected('fwd');
+  var selRev = _pdKldGetSelected('rev');
+  
+  h += _clRenderTailedPrimer('Forward', r.forward, '#2980b9', 'kld-fwd', {
+    name: 'KLD Fwd anneal', 
+    start: kldEnd, 
+    end: Math.min(kldEnd + (selFwd ? selFwd.annealing.length : r.forward.annealing.length), kldSeqLen),
+    direction: 1, color: '#2980b9', type: 'primer_bind'
+  }, { direction: 'fwd', selectedIdx: _cl.pd.kld.selectedFwdIdx });
+  
+  // Reverse
+  var revAnnLen = selRev ? selRev.annealing.length : r.reverse.annealing.length;
+  var revAnnStart = ((kldStart - revAnnLen) % kldSeqLen + kldSeqLen) % kldSeqLen;
+  h += _clRenderTailedPrimer('Reverse', r.reverse, '#8e44ad', 'kld-rev', {
+    name: 'KLD Rev anneal', 
+    start: revAnnStart, 
+    end: kldStart,
+    direction: -1, color: '#8e44ad', type: 'primer_bind'
+  }, { direction: 'rev', selectedIdx: _cl.pd.kld.selectedRevIdx });
+
+  h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;padding:.5rem .7rem;background:#faf8f4;border:1px solid #e8e2d8;border-radius:5px;margin-top:.5rem;">';
+  if (r.insert_length > 0) {
+    h += '<span style="font-size:.78rem;color:#8a7f72;">Split: <strong style="color:#4a4139;">pos ' + (r.split_position || r.insert_split || 0) + '/' + (r.insert_length || 0) + '</strong></span>';
+    h += '<span style="font-size:.78rem;color:#8a7f72;">GC score: <strong style="color:#4a4139;">' + (r.split_gc_score != null ? r.split_gc_score.toFixed(2) : '—') + '</strong></span>';
+  }
+  if (kldEnd > kldStart) {
+    h += '<span style="font-size:.78rem;color:#8a7f72;">Deleted: <strong style="color:#e74c3c;">' + (kldEnd - kldStart) + ' bp</strong></span>';
+  }
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Product: <strong style="color:#4a4139;">' + r.product_length.toLocaleString() + ' bp</strong></span>';
+  h += '<button onclick="_pdCopyBoth(\x27kld\x27)" style="margin-left:auto;padding:.3rem .6rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:transparent;cursor:pointer;">\ud83d\udccb Copy Both</button>';
+  h += '<button onclick="_pdGenerateProduct(\x27kld\x27)" style="padding:.3rem .6rem;font-size:.72rem;background:#8E44AD;color:#fff;border:none;border-radius:4px;cursor:pointer;" title="Generate circularised KLD product as new .gb plasmid">\ud83d\udd04 Generate Circular Product</button>';
+  h += '</div>';
+
+  // Search stats
+  if (r.search_stats) {
+    var ss = r.search_stats;
+    h += '<div style="font-size:.66rem;color:#8a7f72;margin-top:.3rem;padding:.25rem .5rem;display:flex;gap:.8rem;flex-wrap:wrap;">';
+    h += '\ud83d\udd0d <span>Searched <strong>' + ss.junction_pairs.toLocaleString() + '</strong> junction pairs</span>';
+    h += '<span>\u00d7 <strong>' + ss.split_points + '</strong> splits</span>';
+    h += '<span>= <strong>' + ss.pairs_scored.toLocaleString() + '</strong> combos scored</span>';
+    h += '<span>(<strong>' + ss.candidates_generated.toLocaleString() + '</strong> candidates)</span>';
+    if (ss.shortlist_refined) h += '<span>\u2192 top <strong>' + ss.shortlist_refined + '</strong> refined with full \u0394G</span>';
+    h += '</div>';
+  }
+
+  var posLabel = kldEnd > kldStart ? kldStart + '-' + kldEnd : String(kldStart);
+  h += _clRenderSaveBtn([
+    { seq: selFwd ? selFwd.full_seq : r.forward.full_seq, label: 'FWD KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at ' + posLabel },
+    { seq: selRev ? selRev.full_seq : r.reverse.full_seq, label: 'REV KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at ' + posLabel },
+  ]);
+  h += '</div>';
+  return h;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SHARED PRIMER RENDERING
+   ═══════════════════════════════════════════════════════════ */
+
+// Standard primer card (no tail)
+function _clRenderSinglePrimer(label, p, accentColor, copyKey, featureData) {
+  var h = '';
+  h += '<div style="border:1px solid #e8e2d8;border-radius:5px;overflow:hidden;margin-bottom:.5rem;border-left:3px solid ' + accentColor + ';">';
+  // Header
+  h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.4rem .65rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;">';
+  h += '<div><span style="font-weight:600;font-size:.8rem;color:#4a4139;">' + esc(label) + '</span>';
+  h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + p.length + 'bp \u00b7 Tm ' + p.tm + '\u00b0C \u00b7 GC ' + p.gc_percent + '%</span></div>';
+  h += '<div style="display:flex;gap:.3rem;">';
+  if (featureData) {
+    var stashIdx = window._featStash.length;
+    window._featStash.push(featureData);
+    h += '<button onclick="_clAddAsFeature(' + stashIdx + ')" style="padding:.2rem .45rem;font-size:.68rem;color:#4682B4;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;" title="Add as annotation">\u2795 Feature</button>';
+  }
+  h += '<button onclick="_pdCopy(\x27' + esc(copyKey) + '\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy</button>';
+  h += '</div></div>';
+  // Sequence
+  h += '<div style="padding:.4rem .65rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.78rem;color:#4a4139;word-break:break-all;line-height:1.6;">' + esc(p.seq) + '</div>';
+  // Quality checks
+  if (p.quality && p.quality.length > 0) {
+    h += '<div style="padding:.35rem .65rem;border-top:1px solid #f0ebe3;display:flex;flex-wrap:wrap;gap:.3rem .8rem;">';
+    p.quality.forEach(function(q) {
+      var icon = q.level === 'pass' ? '\u2705' : q.level === 'warn' ? '\u26a0\ufe0f' : '\u274c';
+      var color = q.level === 'pass' ? '#5b7a5e' : q.level === 'warn' ? '#b8860b' : '#c0392b';
+      h += '<span style="font-size:.68rem;color:' + color + ';">' + icon + ' <strong>' + esc(q.rule) + '</strong> ' + esc(q.detail) + '</span>';
+    });
+    h += '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+// Tailed primer card (for KLD — shows tail + annealing split)
+// selectInfo: optional { direction: 'fwd'|'rev', selectedIdx: N } for clickable row selection
+function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData, selectInfo) {
+  // If selectInfo is provided and a non-best primer is selected, show that primer's data in the header
+  var displayPrimer = p;
+  if (selectInfo && selectInfo.selectedIdx > 0 && p.alternatives) {
+    var allOpts = [p].concat(p.alternatives);
+    if (allOpts[selectInfo.selectedIdx]) displayPrimer = allOpts[selectInfo.selectedIdx];
+  }
+
+  var h = '';
+  h += '<div style="border:1px solid #e8e2d8;border-radius:5px;overflow:hidden;margin-bottom:.5rem;border-left:3px solid ' + accentColor + ';">';
+  h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.4rem .65rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;">';
+  h += '<div><span style="font-weight:600;font-size:.8rem;color:#4a4139;">' + esc(label) + '</span>';
+  h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + displayPrimer.length + 'bp \u00b7 Tm ' + displayPrimer.tm + '\u00b0C \u00b7 GC ' + displayPrimer.gc_percent + '%</span>';
+  // Show dimer/hairpin badges if data is present
+  if (typeof displayPrimer.homodimer_dg === 'number') {
+    var dimerColor = displayPrimer.homodimer_dg < -12 ? '#c0392b' : displayPrimer.homodimer_dg < -9 ? '#e67e22' : '#5b7a5e';
+    h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (displayPrimer.homodimer_dg < -12 ? '#fde8e8' : displayPrimer.homodimer_dg < -9 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + displayPrimer.homodimer_dg + '</span>';
+  }
+  if (displayPrimer.hairpin) {
+    h += '<span style="font-size:.66rem;margin-left:.3rem;padding:.1rem .35rem;border-radius:3px;background:#fde8e8;color:#c0392b;">hairpin</span>';
+  }
+  h += '</div>';
+  h += '<div style="display:flex;gap:.3rem;">';
+  if (featureData) {
+    var stashIdx = window._featStash.length;
+    window._featStash.push(featureData);
+    h += '<button onclick="_clAddAsFeature(' + stashIdx + ')" style="padding:.2rem .45rem;font-size:.68rem;color:#4682B4;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;" title="Add as annotation">\u2795 Feature</button>';
+  }
+  h += '<button onclick="_pdCopy(\x27' + esc(copyKey) + '\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy</button>';
+  h += '</div></div>';
+  h += '<div style="padding:.45rem .65rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.78rem;line-height:1.7;">';
+  h += '<div style="display:flex;align-items:baseline;gap:.4rem;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">5\u2032 tail:</span><span style="color:' + accentColor + ';word-break:break-all;">' + esc(displayPrimer.tail) + '</span><span style="font-size:.62rem;color:#8a7f72;">(' + displayPrimer.tail.length + 'bp)</span></div>';
+  h += '<div style="display:flex;align-items:baseline;gap:.4rem;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">anneal:</span><span style="color:#4a4139;font-weight:500;word-break:break-all;">' + esc(displayPrimer.annealing) + '</span><span style="font-size:.62rem;color:#8a7f72;">(' + displayPrimer.annealing.length + 'bp)</span></div>';
+  h += '<div style="display:flex;align-items:baseline;gap:.4rem;margin-top:.25rem;padding-top:.25rem;border-top:1px solid #f0ebe3;"><span style="font-size:.62rem;color:#8a7f72;min-width:55px;text-align:right;">full:</span><span style="word-break:break-all;"><span style="color:' + accentColor + ';">' + esc(displayPrimer.tail) + '</span><span style="color:#4a4139;font-weight:600;">' + esc(displayPrimer.annealing) + '</span></span></div>';
+  h += '</div>';
+
+  // Alternatives section
+  if (p.alternatives && p.alternatives.length > 0) {
+    var altKey = copyKey + '-alts';
+    var isCollapsed = !!window._altExpanded[altKey];  // inverted: starts expanded, click to collapse
+    var selIdx = selectInfo ? selectInfo.selectedIdx : 0;
+    h += '<div style="border-top:1px solid #e8e2d8;">';
+    h += '<button onclick="_adToggleAlts(\x27' + esc(altKey) + '\x27)" style="display:flex;align-items:center;gap:.3rem;width:100%;padding:.35rem .65rem;font-size:.72rem;color:#5b7a5e;border:none;background:#eef4ee;cursor:pointer;text-align:left;font-weight:500;">';
+    h += '<span style="font-size:.6rem;">' + (isCollapsed ? '\u25B6' : '\u25BC') + '</span>';
+    h += (p.alternatives.length + 1) + ' primer options' + (selectInfo ? ' \u2014 click to show on map' : ' \u2014 compare Tm vs dimer trade-offs');
+    h += '</button>';
+    if (!isCollapsed) {
+      h += '<div style="padding:.4rem .65rem .5rem;background:#faf8f4;">';
+      h += '<table style="width:100%;border-collapse:collapse;font-size:.72rem;">';
+      h += '<thead><tr style="border-bottom:2px solid #d5cec0;">';
+      h += '<th style="text-align:left;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Annealing</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Len</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Tm</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">GC%</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Dimer \u0394G</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Hairpin</th>';
+      h += '<th style="text-align:center;padding:.3rem .3rem;color:#4a4139;font-weight:600;">Score</th>';
+      h += '<th style="text-align:right;padding:.3rem .3rem;"></th>';
+      h += '</tr></thead><tbody>';
+      // Recommended (current) primer as first row
+      var allOptions = [p].concat(p.alternatives);
+      allOptions.forEach(function(opt, oi) {
+        var isRec = (oi === 0);
+        var isSel = (oi === selIdx);
+        var dimerC = opt.homodimer_dg < -12 ? '#c0392b' : opt.homodimer_dg < -9 ? '#e67e22' : '#5b7a5e';
+        var rowBg = isSel ? 'background:#dbeafe;' : isRec ? 'background:#eef4ee;' : '';
+        var rowCursor = selectInfo ? 'cursor:pointer;' : '';
+        var rowClick = selectInfo ? ' onclick="_pdKldSelectPrimer(\x27' + selectInfo.direction + '\x27,' + oi + ')"' : '';
+        h += '<tr style="border-bottom:1px solid #f0ebe3;' + rowBg + rowCursor + '"' + rowClick + '>';
+        h += '<td style="padding:.3rem .3rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;word-break:break-all;max-width:180px;overflow:hidden;text-overflow:ellipsis;" title="' + esc(opt.annealing) + '">';
+        if (isSel) h += '<span style="font-size:.6rem;background:#2563eb;color:#fff;padding:.1rem .25rem;border-radius:2px;margin-right:.3rem;">\u25C9</span>';
+        else if (isRec) h += '<span style="font-size:.6rem;background:#5b7a5e;color:#fff;padding:.1rem .25rem;border-radius:2px;margin-right:.3rem;">\u2605</span>';
+        h += esc(opt.annealing.length > 22 ? opt.annealing.slice(0, 22) + '\u2026' : opt.annealing) + '</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;">' + opt.length + '</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;font-weight:' + (isSel ? '600' : '400') + ';">' + opt.tm + '\u00b0C</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;">' + opt.gc_percent + '%</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;color:' + dimerC + ';font-weight:500;">' + (typeof opt.homodimer_dg === 'number' ? opt.homodimer_dg : '-') + '</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;">' + (opt.hairpin ? '\u26a0\ufe0f' : '\u2705') + '</td>';
+        h += '<td style="text-align:center;padding:.3rem .3rem;color:#8a7f72;">' + (typeof opt.score === 'number' ? opt.score : '-') + '</td>';
+        h += '<td style="text-align:right;padding:.3rem .3rem;"><button onclick="event.stopPropagation();navigator.clipboard.writeText(\x27' + esc(opt.full_seq) + '\x27).then(function(){toast(\x27Primer copied\x27)})" style="padding:.15rem .4rem;font-size:.66rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy</button></td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table>';
+      h += '<div style="font-size:.64rem;color:#8a7f72;margin-top:.3rem;">' + (selectInfo ? '\u25C9 = selected on map \u00b7 ' : '') + '\u2605 = recommended (lowest score is best) \u00b7 Dimer \u0394G: green > -9, amber -9 to -12, red < -12 kcal/mol</div>';
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+
+  h += '</div>';
+  return h;
+}
+
+// Save button
+function _clRenderSaveBtn(items) {
+  var h = '<div style="margin-top:.6rem;display:flex;justify-content:flex-end;">';
+  h += '<button onclick="_pdSavePrimers()" style="padding:.4rem .8rem;font-size:.78rem;font-weight:500;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;' + (_cl.pd.saving ? 'opacity:.6;pointer-events:none;' : '') + '">' + (_cl.pd.saving ? 'Saving\u2026' : '\ud83d\udcbe Save to DNA Manager') + '</button>';
+  h += '</div>';
+  // Stash save items for the handler
+  window._pdSaveItems = items;
+  return h;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ACTION HANDLERS
+   ═══════════════════════════════════════════════════════════ */
+
+function _pdToggle() { _cl.pd.expanded = !_cl.pd.expanded; _clRender(); }
+function _pdSetMode(m) {
+  _cl.pd.mode = m;
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+// ── Custom
+function _pdCustomSet(field, val) {
+  if (field === 'direction') { _cl.pd.custom.direction = val; _clRender(); setTimeout(function() { _clRenderSeqViz(); }, 50); return; }
+  _cl.pd.custom[field] = val;
+  clearTimeout(window._pdCustomTimer);
+  window._pdCustomTimer = setTimeout(function() { _clRenderSeqViz(); }, 300);
+}
+
+function _pdCustomDesign() {
+  var c = _cl.pd.custom;
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var s = parseInt(c.start, 10), e = parseInt(c.end, 10);
+  if (isNaN(s) || isNaN(e) || s < 0 || e <= s) { toast('Enter valid start and end positions', true); return; }
+  c.designing = true; c.result = null; _clRender();
+  api('POST', '/api/cloning/evaluate-primer', {
+    template_seq: _cl.parsed.seq, start: s, end: e, direction: c.direction
+  }).then(function(data) {
+    c.designing = false; c.result = data; _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }).catch(function(err) { c.designing = false; toast('Error: ' + (err.message || err), true); _clRender(); });
+}
+
+// ── PCR
+function _pdPcrSet(field, val) {
+  _cl.pd.pcr[field] = field === 'tmTarget' ? parseInt(val, 10) || 62 : val;
+  clearTimeout(window._pdPcrTimer);
+  window._pdPcrTimer = setTimeout(function() { _clRenderSeqViz(); }, 300);
+}
+
+function _pdPcrDesign() {
+  var p = _cl.pd.pcr;
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var ts = parseInt(p.targetStart, 10), te = parseInt(p.targetEnd, 10);
+  if (isNaN(ts) || isNaN(te) || ts < 0 || te <= ts) { toast('Enter valid target start and end', true); return; }
+  p.designing = true; p.result = null; _clRender();
+  api('POST', '/api/cloning/design-pcr-primers', {
+    template_seq: _cl.parsed.seq, target_start: ts, target_end: te, tm_target: p.tmTarget
+  }).then(function(data) {
+    p.designing = false; p.result = data; _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }).catch(function(err) { p.designing = false; toast('Error: ' + (err.message || err), true); _clRender(); });
+}
+
+// ── Sequencing
+function _pdSeqSet(field, val) {
+  if (field === 'readLen' || field === 'tmTarget') { _cl.pd.seq[field] = parseInt(val, 10) || (field === 'readLen' ? 900 : 62); }
+  else { _cl.pd.seq[field] = val; }
+}
+
+function _pdSeqDesign() {
+  var s = _cl.pd.seq;
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var rs = parseInt(s.regionStart, 10), re = parseInt(s.regionEnd, 10);
+  if (isNaN(rs) || isNaN(re) || rs < 0 || re <= rs) { toast('Enter valid region start and end', true); return; }
+  s.designing = true; s.result = null; _clRender();
+  api('POST', '/api/cloning/design-seq-primers', {
+    template_seq: _cl.parsed.seq, region_start: rs, region_end: re, read_length: s.readLen, tm_target: s.tmTarget
+  }).then(function(data) {
+    s.designing = false; s.result = data; _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }).catch(function(err) { s.designing = false; toast('Error: ' + (err.message || err), true); _clRender(); });
+}
+
+  function _pdKldSet(field, val) {
+  // 1. Update the value in state
+  _cl.pd.kld[field] = val;
+
+  // 2. Auto-sync: If user sets Start but hasn't touched End, keep them the same (insertion mode)
+  if (field === 'startPos' && (!_cl.pd.kld.endPos || _cl.pd.kld.endPos === '')) {
+    _cl.pd.kld.endPos = val;
+  }
+
+  // 3. Map Refresh: If start or end positions change, update the SeqViz map highlights
+  if (field === 'startPos' || field === 'endPos' || field === 'optimize') {
+    clearTimeout(window._pdKldTimer);
+    window._pdKldTimer = setTimeout(function() { 
+      _clRenderSeqViz(); 
+    }, 300);
+  }
+
+  // 4. Input Refresh: If the insert sequence changes, re-render the UI 
+  // (we keep focus on the textarea so typing isn't interrupted)
+  if (field === 'insertSeq') {
+    clearTimeout(window._pdKldInsTimer);
+    window._pdKldInsTimer = setTimeout(function() { 
+      _clRender(); 
+      var ta = document.getElementById('cl-kld-insert-ta'); 
+      if (ta) {
+        ta.focus();
+        ta.selectionStart = ta.selectionEnd = ta.value.length; // Move cursor to end
+      }
+    }, 400);
+  }
+}
+  function _pdKldDesign() {
+  var k = _cl.pd.kld;
+  if (!_cl.parsed) { toast('Load a plasmid first', true); return; }
+
+  // 1. Get and Validate Start/End positions
+  var s = parseInt(k.startPos, 10);
+  var e = parseInt(k.endPos || k.startPos, 10); // Fallback to start if end is empty
+  
+  if (isNaN(s) || s < 0 || s >= _cl.parsed.length) { 
+    toast('Enter a valid Start Position', true); return; 
+  }
+  if (isNaN(e) || e < 0 || e >= _cl.parsed.length) { 
+    toast('Enter a valid End Position', true); return; 
+  }
+
+  // 2. Clean the insert (Allow empty for pure deletions)
+  var insert = _clCleanSeq(k.insertSeq || "");
+  
+  // 3. UI State
+  k.designing = true; 
+  k.result = null;
+  k.selectedFwdIdx = 0;
+  k.selectedRevIdx = 0;
+  _clRender();
+
+  // 4. Animate progress bar
+  var range = Math.abs(e - s) + 1;
+  var splits = insert.length > 0 ? insert.length + 1 : 1;
+  var isOpt = !!k.optimize;
+  // Estimate: baseline (splits×2 full calls) + optimize scan (range×splits×2 lightweight)
+  // Lightweight calls are ~10x faster than full, so weigh accordingly
+  var baselineCalls = splits * 2;
+  var scanCalls = isOpt ? range * splits * 2 : 0;
+  var refineCalls = isOpt ? 100 : 0; // ~50 shortlist × 2 full calls
+  var estMs = Math.max(2000, Math.ceil((baselineCalls / 400 + scanCalls / 4000 + refineCalls / 400) * 1000));
+  var progressStart = Date.now();
+  var progressMessages = [
+    'Running baseline analysis\u2026',
+    'Scanning junction positions\u2026',
+    'Testing insert split points\u2026',
+    'Scoring primer pairs\u2026',
+    'Refining top candidates\u2026',
+    'Final thermodynamic analysis\u2026'
+  ];
+  window._kldProgressIv = setInterval(function() {
+    var elapsed = Date.now() - progressStart;
+    // Asymptotic curve: approaches 95% but never reaches it
+    // Fast at first, slows as it gets closer — never looks stuck
+    var pct = 95 * (1 - Math.exp(-elapsed / (estMs * 0.7)));
+    var bar = document.getElementById('cl-kld-progress-bar');
+    var txt = document.getElementById('cl-kld-progress-text');
+    if (bar) bar.style.width = pct.toFixed(1) + '%';
+    if (txt) {
+      var msgIdx = Math.min(Math.floor(pct / 18), progressMessages.length - 1);
+      var elapsedSec = Math.floor(elapsed / 1000);
+      if (elapsed < estMs) {
+        var secLeft = Math.max(1, Math.ceil((estMs - elapsed) / 1000));
+        txt.textContent = progressMessages[msgIdx] + ' (~' + secLeft + 's remaining)';
+      } else {
+        // Past the estimate — show elapsed instead of misleading countdown
+        txt.textContent = progressMessages[msgIdx] + ' (' + elapsedSec + 's elapsed, still working\u2026)';
+      }
+    }
+  }, 200);
+
+  // 5. API Call
+  api('POST', '/api/cloning/design-kld-primers', {
+    template_seq: _cl.parsed.sequence || _cl.parsed.seq,
+    insert_seq: insert,
+    start_pos: s,
+    end_pos: e,
+    optimize: isOpt,
+    annealing_tm_target: parseInt(k.tmTarget, 10) || 62,
+    max_primer_length: parseInt(k.maxLen, 10) || 60
+  }).then(function(data) {
+    clearInterval(window._kldProgressIv);
+    k.designing = false; 
+    k.result = data; 
+    _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }).catch(function(err) { 
+    clearInterval(window._kldProgressIv);
+    k.designing = false; 
+    toast('Error: ' + (err.message || err), true); 
+    _clRender(); 
+  });
+}
+
+// ── KLD primer selection (click alternative to show on map)
+function _pdKldSelectPrimer(direction, idx) {
+  if (direction === 'fwd') {
+    _cl.pd.kld.selectedFwdIdx = idx;
+  } else {
+    _cl.pd.kld.selectedRevIdx = idx;
+  }
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+// Helper: get the currently selected KLD primer for a direction
+function _pdKldGetSelected(direction) {
+  var r = _cl.pd.kld.result;
+  if (!r) return null;
+  var primer = direction === 'fwd' ? r.forward : r.reverse;
+  var idx = direction === 'fwd' ? _cl.pd.kld.selectedFwdIdx : _cl.pd.kld.selectedRevIdx;
+  if (idx === 0) return primer; // best/recommended
+  var allOptions = [primer].concat(primer.alternatives || []);
+  return allOptions[idx] || primer;
+}
+
+// ── Copy
+function _pdCopy(key) {
+  var seq = '';
+  if (key === 'custom' && _cl.pd.custom.result) seq = _cl.pd.custom.result.primer_seq;
+  else if (key === 'pcr-fwd' && _cl.pd.pcr.result) seq = _cl.pd.pcr.result.forward.seq;
+  else if (key === 'pcr-rev' && _cl.pd.pcr.result) seq = _cl.pd.pcr.result.reverse.seq;
+  else if (key === 'kld-fwd' && _cl.pd.kld.result) { var sp = _pdKldGetSelected('fwd'); seq = sp ? sp.full_seq : ''; }
+  else if (key === 'kld-rev' && _cl.pd.kld.result) { var sp2 = _pdKldGetSelected('rev'); seq = sp2 ? sp2.full_seq : ''; }
+  else if (key.indexOf('seq-') === 0 && _cl.pd.seq.result) {
+    var idx = parseInt(key.replace('seq-', ''), 10) - 1;
+    if (_cl.pd.seq.result.primers[idx]) seq = _cl.pd.seq.result.primers[idx].seq;
+  }
+  else if (key.indexOf('ad-') === 0) {
+    _adCopyPrimer(key);
+    return;
+  }
+  if (seq) { navigator.clipboard.writeText(seq).then(function() { toast('Primer copied'); }); }
+}
+
+function _pdCopyBoth(mode) {
+  var text = '';
+  if (mode === 'pcr' && _cl.pd.pcr.result) {
+    var r = _cl.pd.pcr.result;
+    text = 'Forward: ' + r.forward.seq + '\nReverse: ' + r.reverse.seq;
+  } else if (mode === 'kld' && _cl.pd.kld.result) {
+    var sf = _pdKldGetSelected('fwd');
+    var sr = _pdKldGetSelected('rev');
+    text = 'Forward: ' + (sf ? sf.full_seq : '') + '\nReverse: ' + (sr ? sr.full_seq : '');
+  } else if (mode === 'seq' && _cl.pd.seq.result) {
+    text = _cl.pd.seq.result.primers.map(function(p) { return 'Seq#' + p.index + ' (pos ' + p.position + '): ' + p.seq; }).join('\n');
+  }
+  if (text) { navigator.clipboard.writeText(text).then(function() { toast('Primers copied'); }); }
+}
+
+// ── Save
+function _pdSavePrimers() {
+  var items = window._pdSaveItems;
+  if (!items || !items.length) { toast('Nothing to save', true); return; }
+  _cl.pd.saving = true; _clRender();
+  var primerData = items.map(function(it) { return { seq: it.seq, use_desc: it.label }; });
+  api('POST', '/api/cloning/save-primers', {
+    primers: primerData,
+    plasmid_name: _cl.parsed ? _cl.parsed.name : 'unknown',
+  }).then(function(data) {
+    _cl.pd.saving = false;
+    var names = data.saved.map(function(s) { return s.name; }).join(', ');
+    toast('Saved: ' + names);
+    _clRender();
+    _clLoadSequences().then(function() { _clRender(); });
+  }).catch(function(err) {
+    _cl.pd.saving = false;
+    toast('Save failed: ' + (err.message || err), true);
+    _clRender();
+  });
+}
+
+
+/* ── OpenCloning tab ───────────────────────────────────────── */
+function _clRenderOCTab() {
+  var h = '';
+  if (!_cl.ocUrl) {
+    h += '<div style="text-align:center;padding:3rem 1rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:6px;background:#fff;">';
+    h += '<div style="font-size:2rem;margin-bottom:.5rem;opacity:.5;">\u26a0\ufe0f</div>';
+    h += '<div style="font-size:.9rem;margin-bottom:.3rem;">OpenCloning URL not configured</div>';
+    h += '<div style="font-size:.8rem;">Set <code>OPENCLONING_URL</code> in docker-compose.yml</div></div>';
+    return h;
+  }
+  var osb = _cl.ocSidebarOpen;
+  h += '<div style="display:flex;gap:0;height:750px;">';
+
+  if (osb) {
+    h += '<div style="width:240px;min-width:240px;border:1px solid #d5cec0;border-right:none;border-radius:6px 0 0 6px;background:#fff;display:flex;flex-direction:column;overflow:hidden;">';
+    h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.4rem .6rem;border-bottom:1px solid #e8e2d8;background:#faf8f4;">';
+    h += '<span style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Your Sequences</span>';
+    h += '<button onclick="_clToggleOcSidebar()" style="padding:.15rem .35rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#8a7f72;cursor:pointer;" title="Hide sidebar">\u00ab</button>';
+    h += '</div>';
+    h += '<div style="padding:.4rem .6rem;border-bottom:1px solid #e8e2d8;">';
+    h += '<input type="text" placeholder="Search\u2026" value="' + esc(_cl.ocFilter || '') + '" oninput="_clOcFilterChange(this.value)" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#fff;font-size:.78rem;color:#4a4139;" />';
+    h += '</div>';
+    h += '<div style="flex:1;overflow-y:auto;">';
+
+    var plasmids = _cl.sequences.filter(function(s) { return s.type === 'plasmid' && s.has_file; });
+    var primers = _cl.sequences.filter(function(s) { return s.type === 'primer' && s.has_file; });
+    if (_cl.ocFilter) {
+      var f = _cl.ocFilter.toLowerCase();
+      plasmids = plasmids.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.use && s.use.toLowerCase().indexOf(f) !== -1); });
+      primers = primers.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.sequence && s.sequence.toLowerCase().indexOf(f) !== -1); });
+    }
+    if (plasmids.length > 0) {
+      h += '<div style="padding:.3rem .6rem;font-size:.65rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;font-weight:600;border-bottom:1px solid #e8e2d8;background:#faf8f4;">Plasmids</div>';
+      plasmids.forEach(function(s) {
+        h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.4rem .6rem;border-bottom:1px solid #f0ebe3;transition:background .1s;" onmouseover="this.style.background=\x27#f5f1eb\x27" onmouseout="this.style.background=\x27transparent\x27">';
+        h += '<div style="flex:1;min-width:0;"><div style="font-size:.8rem;font-weight:500;color:#4a4139;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(s.name) + '</div>';
+        if (s.use) h += '<div style="font-size:.65rem;color:#8a7f72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(s.use) + '</div>';
+        h += '</div>';
+        h += '<a href="/api/plasmids/' + s.id + '/gb" download style="flex-shrink:0;margin-left:.4rem;padding:.2rem .4rem;font-size:.68rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;text-decoration:none;white-space:nowrap;">\u2b07 .gb</a>';
+        h += '</div>';
+      });
+    }
+    if (primers.length > 0) {
+      h += '<div style="padding:.3rem .6rem;font-size:.65rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;font-weight:600;border-bottom:1px solid #e8e2d8;background:#faf8f4;' + (plasmids.length > 0 ? 'margin-top:.2rem;' : '') + '">Primers</div>';
+      primers.forEach(function(s) {
+        h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.4rem .6rem;border-bottom:1px solid #f0ebe3;transition:background .1s;" onmouseover="this.style.background=\x27#f5f1eb\x27" onmouseout="this.style.background=\x27transparent\x27">';
+        h += '<div style="flex:1;min-width:0;"><div style="font-size:.8rem;font-weight:500;color:#4a4139;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(s.name) + '</div>';
+        if (s.sequence) h += '<div style="font-size:.62rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(s.sequence.substring(0, 30)) + '</div>';
+        h += '</div>';
+        h += '<a href="/api/primers/' + s.id + '/gb" download style="flex-shrink:0;margin-left:.4rem;padding:.2rem .4rem;font-size:.68rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;text-decoration:none;white-space:nowrap;">\u2b07 .gb</a>';
+        h += '</div>';
+      });
+    }
+    if (plasmids.length === 0 && primers.length === 0) {
+      h += '<div style="padding:1.5rem .6rem;text-align:center;color:#8a7f72;font-size:.78rem;">' + (_cl.ocFilter ? 'No matches.' : 'No .gb files found.') + '</div>';
+    }
+    h += '</div></div>';
+  }
+
+  h += '<div style="flex:1;border:1px solid #d5cec0;border-radius:' + (osb ? '0 6px 6px 0' : '6px') + ';overflow:hidden;position:relative;">';
+  if (!osb) {
+    h += '<button onclick="_clToggleOcSidebar()" style="position:absolute;top:.5rem;left:.5rem;z-index:10;padding:.2rem .4rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#faf8f4;color:#8a7f72;cursor:pointer;" title="Show sequence list">\u00bb</button>';
+  }
+  h += '<iframe src="' + esc(_cl.ocUrl) + '" style="width:100%;height:100%;border:none;display:block;" title="OpenCloning"></iframe>';
+  h += '</div></div>';
+  return h;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SEQUENCE ANALYSIS PANEL
+   ═══════════════════════════════════════════════════════════ */
+function _clRenderSAPanel() {
+  var sa = _cl.sa;
+  var h = '';
+  h += '<div style="border:1px solid #d5cec0;border-radius:6px;background:#fff;overflow:hidden;">';
+
+  // Collapsible header
+  h += '<div onclick="_saToggle()" style="display:flex;align-items:center;justify-content:space-between;padding:.6rem .9rem;cursor:pointer;background:#faf8f4;border-bottom:' + (sa.expanded ? '1px solid #e8e2d8' : 'none') + ';user-select:none;" onmouseover="this.style.background=\x27#f0ebe3\x27" onmouseout="this.style.background=\x27#faf8f4\x27">';
+  h += '<span style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#5b7a5e;">Sequence Analysis</span>';
+  h += '<span style="font-size:.8rem;color:#8a7f72;transition:transform .2s;display:inline-block;transform:rotate(' + (sa.expanded ? '180' : '0') + 'deg);">\u25bc</span>';
+  h += '</div>';
+  if (!sa.expanded) { h += '</div>'; return h; }
+
+  // Mode tabs
+  h += '<div style="display:flex;border-bottom:1px solid #e8e2d8;background:#faf8f4;">';
+  var modes = [
+    { key: 'orfs', label: 'ORFs', icon: '\ud83e\uddec' },
+    { key: 'restriction', label: 'RE Sites', icon: '\u2702\ufe0f' },
+    { key: 'digest', label: 'Digest', icon: '\ud83e\uddea' },
+    { key: 'scan', label: 'Scan', icon: '\ud83d\udd2c' },
+    { key: 'blast', label: 'BLAST', icon: '\ud83c\udf10' },
+    { key: 'tools', label: 'Tools', icon: '\ud83d\udd27' },
+  ];
+  modes.forEach(function(m) {
+    var active = sa.mode === m.key;
+    h += '<button onclick="_saSetMode(\x27' + m.key + '\x27)" style="flex:1;padding:.5rem .2rem;font-size:.72rem;font-weight:' + (active ? '600' : '400') + ';border:none;border-bottom:2px solid ' + (active ? '#5b7a5e' : 'transparent') + ';cursor:pointer;background:' + (active ? '#fff' : 'transparent') + ';color:' + (active ? '#4a4139' : '#8a7f72') + ';transition:all .15s;">' + m.icon + ' ' + m.label + '</button>';
+  });
+  h += '</div>';
+
+  h += '<div style="padding:.9rem;">';
+  if (sa.mode === 'orfs') { h += _clRenderOrfTab(); }
+  else if (sa.mode === 'restriction') { h += _clRenderRETab(); }
+  else if (sa.mode === 'digest') { h += _clRenderDigestTab(); }
+  else if (sa.mode === 'scan') { h += _clRenderScanTab(); }
+  else if (sa.mode === 'blast') { h += _clRenderBlastTab(); }
+  else if (sa.mode === 'tools') { h += _clRenderToolsTab(); }
+  h += '</div>';
+  h += '</div>';
+  return h;
+}
+
+/* ── ORF FINDER TAB ────────────────────────────────────────── */
+function _clRenderOrfTab() {
+  var o = _cl.sa.orfs;
+  var h = '';
+  h += '<div style="display:flex;gap:.8rem;align-items:end;margin-bottom:.7rem;flex-wrap:wrap;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Min ORF length (bp)</label>';
+  h += '<input type="number" min="30" max="10000" step="10" value="' + o.minLen + '" oninput="_saOrfSetMin(this.value)" style="width:100px;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  h += '<button onclick="_saOrfRun()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (o.loading ? 'opacity:.6;pointer-events:none;' : '') + '">' + (o.loading ? '\u23f3 Scanning\u2026' : '\ud83d\udd0d Find ORFs') + '</button>';
+  if (o.result) {
+    h += '<label style="display:flex;align-items:center;gap:.3rem;font-size:.75rem;color:#8a7f72;cursor:pointer;"><input type="checkbox" ' + (o.showOnMap ? 'checked' : '') + ' onchange="_saOrfToggleMap()" /> Map overlay</label>';
+  }
+  h += '</div>';
+
+  if (o.result) {
+    var orfs = o.result.orfs || [];
+    h += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.5rem;">' + orfs.length + ' ORF' + (orfs.length !== 1 ? 's' : '') + ' found (\u2265' + o.minLen + ' bp)</div>';
+
+    if (orfs.length > 0) {
+      h += '<div id="cl-orf-list" style="max-height:350px;overflow-y:auto;border:1px solid #e8e2d8;border-radius:5px;">';
+      var orfColors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c'];
+      orfs.forEach(function(orf, idx) {
+        var expanded = o.expandedOrf === idx;
+        var hidden = !!o.hiddenOrfs[idx];
+        var color = orfColors[idx % orfColors.length];
+        h += '<div style="border-bottom:1px solid #f0ebe3;' + (hidden ? 'opacity:.45;' : '') + '">';
+        // Header row
+        h += '<div style="display:flex;align-items:center;gap:.4rem;padding:.4rem .6rem;">';
+        // Eye toggle
+        h += '<button onclick="_saOrfToggleOne(' + idx + ')" style="padding:0;border:none;background:none;cursor:pointer;font-size:.78rem;flex-shrink:0;" title="' + (hidden ? 'Show' : 'Hide') + ' on map">' + (hidden ? '\ud83d\ude48' : '\ud83d\udc41\ufe0f') + '</button>';
+        // Color dot
+        h += '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + color + ';flex-shrink:0;"></span>';
+        // Clickable info area to expand
+        h += '<div onclick="_saOrfExpand(' + idx + ')" style="display:flex;align-items:center;gap:.5rem;flex:1;cursor:pointer;">';
+        h += '<span style="font-size:.8rem;font-weight:500;color:#4a4139;min-width:70px;">' + orf.length_aa + ' aa</span>';
+        h += '<span style="font-size:.72rem;color:#8a7f72;">' + orf.length_bp + ' bp</span>';
+        h += '<span style="font-size:.72rem;color:#8a7f72;">Frame ' + (orf.direction === 1 ? '+' : '') + orf.frame + '</span>';
+        h += '<span style="font-size:.72rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;">' + orf.start + '..' + orf.end + '</span>';
+        h += '<span style="font-size:.68rem;color:#8a7f72;margin-left:auto;">' + (expanded ? '\u25b2' : '\u25bc') + '</span>';
+        h += '</div>';
+        h += '</div>';
+        // Expanded: protein + actions
+        if (expanded) {
+          h += '<div style="padding:.4rem .6rem .6rem 2rem;background:#faf8f4;">';
+          h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Protein sequence (' + orf.length_aa + ' aa)</div>';
+          h += '<div style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.72rem;color:#4a4139;word-break:break-all;line-height:1.6;max-height:120px;overflow-y:auto;background:#fff;padding:.4rem;border:1px solid #e8e2d8;border-radius:3px;">';
+          var prot = orf.protein || '';
+          for (var pi = 0; pi < prot.length; pi++) {
+            if (pi > 0 && pi % 10 === 0) h += ' ';
+            h += prot[pi];
+          }
+          h += '</div>';
+          h += '<div style="display:flex;gap:.4rem;margin-top:.4rem;flex-wrap:wrap;">';
+          h += '<button onclick="_saOrfCopyProt(' + idx + ')" style="padding:.2rem .5rem;font-size:.7rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy protein</button>';
+          h += '<button onclick="_saOrfCopyDna(' + idx + ')" style="padding:.2rem .5rem;font-size:.7rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy DNA</button>';
+          h += '<button onclick="_saOrfAddFeature(' + idx + ')" style="padding:.2rem .5rem;font-size:.7rem;color:#4682B4;border:1px solid #4682B4;border-radius:3px;background:#fff;cursor:pointer;">\u2795 Add as Feature</button>';
+          h += '</div></div>';
         }
-        # Determine sticky end type
-        if ovhg > 0:
-            sticky_ends[ename] = {"type": "5_prime", "length": ovhg}
-        elif ovhg < 0:
-            sticky_ends[ename] = {"type": "3_prime", "length": abs(ovhg)}
-        else:
-            sticky_ends[ename] = {"type": "blunt", "length": 0}
+        h += '</div>';
+      });
+      h += '</div>';
+    }
+  }
+  return h;
+}
 
-        if len(positions) == 0:
-            warnings.append(f"{ename} does not cut the vector")
-        elif len(positions) > 2:
-            warnings.append(f"{ename} cuts the vector {len(positions)} times — may fragment the backbone")
+/* ── RESTRICTION ENZYME TAB ────────────────────────────────── */
+function _clRenderRETab() {
+  var re = _cl.sa.re;
+  var h = '';
+  h += '<div style="margin-bottom:.6rem;">';
+  h += '<label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Enzymes (comma-separated, or blank for common set)</label>';
+  h += '<input type="text" value="' + esc(re.enzymes) + '" oninput="_saReSetEnz(this.value)" placeholder="EcoRI, BamHI, HindIII\u2026 (blank = 40 common)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.8rem;color:#4a4139;" />';
+  h += '</div>';
 
-    for enzyme_obj, positions in ins_results.items():
-        ename = str(enzyme_obj)
-        if ename in enzyme_info:
-            enzyme_info[ename]["insert_cuts"] = sorted(positions)
-            enzyme_info[ename]["num_insert_cuts"] = len(positions)
+  h += '<div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.7rem;flex-wrap:wrap;">';
+  h += '<button onclick="_saReRun()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (re.loading ? 'opacity:.6;pointer-events:none;' : '') + '">' + (re.loading ? '\u23f3 Analyzing\u2026' : '\u2702\ufe0f Analyze') + '</button>';
+  if (re.result) {
+    h += '<label style="display:flex;align-items:center;gap:.3rem;font-size:.75rem;color:#8a7f72;cursor:pointer;"><input type="checkbox" ' + (re.showOnMap ? 'checked' : '') + ' onchange="_saReToggleMap()" /> Show on map</label>';
+    // Filter
+    h += '<div style="display:flex;border:1px solid #d5cec0;border-radius:4px;overflow:hidden;margin-left:auto;">';
+    ['all', '1', '2+'].forEach(function(f) {
+      var label = f === 'all' ? 'All' : f === '1' ? 'Single cutters' : '2+ cuts';
+      var active = re.filterCuts === f;
+      h += '<button onclick="_saReFilter(\x27' + f + '\x27)" style="padding:.25rem .5rem;font-size:.68rem;border:none;cursor:pointer;' + (active ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#4a4139;') + '">' + label + '</button>';
+    });
+    h += '</div>';
+  }
+  h += '</div>';
 
-    # Simulate vector digest
-    vec_digest = simulate_digest(vec_seq, enzymes_to_use, circular=True)
+  if (re.result) {
+    var r = re.result;
+    h += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.5rem;">' + r.total_cutters + ' enzymes cut \u00b7 ' + r.single_cutters + ' single cutters \u00b7 ' + r.non_cutters + ' non-cutters</div>';
 
-    # Determine backbone (largest fragment)
-    vec_frags = vec_digest.get("fragments", [])
-    backbone = vec_frags[0] if vec_frags else {"size": len(vec_seq), "start": 0, "end": len(vec_seq)}
+    var enzymes = r.enzymes || [];
+    // Apply filter
+    if (re.filterCuts === '1') enzymes = enzymes.filter(function(e) { return e.num_cuts === 1; });
+    else if (re.filterCuts === '2+') enzymes = enzymes.filter(function(e) { return e.num_cuts >= 2; });
 
-    # Check compatibility
-    compatible = True
-    if enzyme2:
-        # Two-enzyme: directional cloning
-        if not (enzyme1 in [str(e) for e in vec_results] and enzyme2 in [str(e) for e in vec_results]):
-            compatible = False
-            warnings.append("Not all enzymes cut the vector")
-    else:
-        # Single enzyme
-        e1_info = enzyme_info.get(enzyme1, {})
-        if e1_info.get("num_vector_cuts", 0) < 1:
-            compatible = False
+    if (enzymes.length > 0) {
+      h += '<div style="max-height:280px;overflow-y:auto;border:1px solid #e8e2d8;border-radius:5px;">';
+      h += '<table style="width:100%;border-collapse:collapse;font-size:.76rem;">';
+      h += '<thead><tr style="background:#faf8f4;position:sticky;top:0;">';
+      h += '<th style="text-align:left;padding:.3rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Enzyme</th>';
+      h += '<th style="text-align:left;padding:.3rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Site</th>';
+      h += '<th style="text-align:center;padding:.3rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Cuts</th>';
+      h += '<th style="text-align:left;padding:.3rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Positions</th>';
+      h += '</tr></thead><tbody>';
+      enzymes.forEach(function(e) {
+        var cutColor = e.num_cuts === 1 ? '#e74c3c' : e.num_cuts === 2 ? '#f39c12' : '#8a7f72';
+        h += '<tr style="border-bottom:1px solid #f0ebe3;">';
+        h += '<td style="padding:.25rem .5rem;font-weight:500;color:#4a4139;">' + esc(e.name) + '</td>';
+        h += '<td style="padding:.25rem .5rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;color:#8a7f72;">' + esc(e.site) + '</td>';
+        h += '<td style="padding:.25rem .5rem;text-align:center;font-weight:600;color:' + cutColor + ';">' + e.num_cuts + '</td>';
+        h += '<td style="padding:.25rem .5rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.68rem;color:#8a7f72;">' + e.cut_positions.join(', ') + '</td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table></div>';
+    }
+  }
+  return h;
+}
 
-    # Design primers to add RE sites to insert if requested
-    primers = []
-    if design_primers and compatible:
-        # Forward primer: RE site + annealing to insert start
-        e1_info_dict = enzyme_info.get(enzyme1, {})
-        e1_site = e1_info_dict.get("site", "")
-        fwd_tail = "GA" + e1_site  # spacer + recognition site
-        fwd_candidates = _generate_primer_candidates(ins_seq, 0, "forward", fwd_tail, tm_target)
-        fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{ins_name}_Fwd_{enzyme1}")
-        if fwd_primer:
-            primers.append(fwd_primer)
-            if fwd_primer.get("hairpin"):
-                warnings.append(f"{ins_name}_Fwd may form hairpin")
-            if fwd_primer.get("homodimer_dg", 0) < -9.0:
-                warnings.append(f"{ins_name}_Fwd has strong self-dimer (ΔG = {fwd_primer['homodimer_dg']} kcal/mol)")
+/* ── DIGEST SIMULATOR TAB ──────────────────────────────────── */
+function _clRenderDigestTab() {
+  var d = _cl.sa.digest;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .6rem;">Pick 1\u20133 restriction enzymes to simulate a digest. Shows expected fragment sizes and a virtual gel.</p>';
 
-        # Reverse primer: RE site + annealing to insert end
-        e2_name = enzyme2 or enzyme1
-        e2_info_dict = enzyme_info.get(e2_name, {})
-        e2_site = e2_info_dict.get("site", "")
-        rev_tail = "GA" + _reverse_complement(e2_site) if e2_site else "GA"
-        rev_candidates = _generate_primer_candidates(ins_seq, len(ins_seq), "reverse", rev_tail, tm_target)
-        rev_primer = _pick_best_with_alternatives(rev_candidates, f"{ins_name}_Rev_{e2_name}")
-        if rev_primer:
-            primers.append(rev_primer)
-            if rev_primer.get("hairpin"):
-                warnings.append(f"{ins_name}_Rev may form hairpin")
-            if rev_primer.get("homodimer_dg", 0) < -9.0:
-                warnings.append(f"{ins_name}_Rev has strong self-dimer (ΔG = {rev_primer['homodimer_dg']} kcal/mol)")
+  h += '<div style="display:flex;gap:.5rem;align-items:end;margin-bottom:.7rem;flex-wrap:wrap;">';
+  h += '<div style="flex:1;min-width:200px;"><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Enzymes (comma-separated)</label>';
+  h += '<input type="text" value="' + esc(d.enzymes) + '" oninput="_saDigestSetEnz(this.value)" placeholder="e.g. EcoRI, BamHI" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.8rem;color:#4a4139;" /></div>';
+  h += '<button onclick="_saDigestRun()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (d.loading ? 'opacity:.6;pointer-events:none;' : '') + '">' + (d.loading ? '\u23f3 Digesting\u2026' : '\u2702\ufe0f Run Digest') + '</button>';
+  h += '</div>';
 
-    # Build ligation product
-    product_seq = vec_seq  # simplified: backbone + insert
-    product_len = backbone["size"] + len(ins_seq)
-    ligation_product = {
-        "seq_length": product_len,
-        "topology": "circular",
+  // Quick-pick from RE analysis results if available
+  if (_cl.sa.re.result && _cl.sa.re.result.enzymes) {
+    var singles = _cl.sa.re.result.enzymes.filter(function(e) { return e.num_cuts === 1; }).slice(0, 8);
+    if (singles.length > 0) {
+      h += '<div style="margin-bottom:.6rem;"><span style="font-size:.68rem;color:#8a7f72;">Quick pick (single cutters): </span>';
+      singles.forEach(function(e) {
+        h += '<button onclick="_saDigestQuickAdd(\x27' + esc(e.name) + '\x27)" style="padding:.15rem .4rem;font-size:.68rem;color:#4a4139;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;margin:.1rem .15rem;">' + esc(e.name) + '</button>';
+      });
+      h += '</div>';
+    }
+  }
+
+  if (d.result) {
+    var r = d.result;
+
+    // Enzyme summary
+    h += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.5rem;">';
+    r.enzymes.forEach(function(e) {
+      h += esc(e.name) + ' (' + e.cuts + ' cut' + (e.cuts !== 1 ? 's' : '') + ': ' + esc(e.site) + ')  ';
+    });
+    h += ' \u2014 <strong style="color:#4a4139;">' + r.num_fragments + ' fragment' + (r.num_fragments !== 1 ? 's' : '') + '</strong></div>';
+
+    // Layout: gel + fragment table side by side
+    h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;">';
+
+    // Virtual gel
+    h += '<div style="width:120px;flex-shrink:0;">';
+    h += '<div style="font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;text-align:center;">Virtual Gel</div>';
+    h += _clRenderGel(r.fragments);
+    h += '</div>';
+
+    // Fragment table
+    h += '<div style="flex:1;min-width:200px;">';
+    h += '<div style="border:1px solid #e8e2d8;border-radius:5px;overflow:hidden;">';
+    h += '<table style="width:100%;border-collapse:collapse;font-size:.76rem;">';
+    h += '<thead><tr style="background:#faf8f4;">';
+    h += '<th style="text-align:center;padding:.3rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">#</th>';
+    h += '<th style="text-align:right;padding:.3rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Size (bp)</th>';
+    h += '<th style="text-align:left;padding:.3rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Range</th>';
+    h += '</tr></thead><tbody>';
+    r.fragments.forEach(function(f, i) {
+      h += '<tr style="border-bottom:1px solid #f0ebe3;">';
+      h += '<td style="padding:.25rem .5rem;text-align:center;color:#8a7f72;">' + (i + 1) + '</td>';
+      h += '<td style="padding:.25rem .5rem;text-align:right;font-weight:500;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;">' + f.size.toLocaleString() + '</td>';
+      h += '<td style="padding:.25rem .5rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;">' + f.start + '..' + f.end + '</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div>';
+    h += '</div>';
+
+    h += '</div>'; // flex
+  }
+  return h;
+}
+
+function _clRenderGel(fragments) {
+  // Simple SVG gel visualization
+  var gelW = 120, gelH = 300;
+  var laneW = 40, laneX = (gelW - laneW) / 2;
+  // Log scale: position bands by log10(size)
+  var sizes = fragments.map(function(f) { return f.size; });
+  var maxLog = Math.log10(Math.max.apply(null, sizes) * 1.5);
+  var minLog = Math.log10(Math.max(Math.min.apply(null, sizes) * 0.5, 10));
+  var range = maxLog - minLog || 1;
+
+  var h = '<svg width="' + gelW + '" height="' + gelH + '" style="background:#1a1a2e;border-radius:4px;display:block;">';
+  // Lane background
+  h += '<rect x="' + laneX + '" y="15" width="' + laneW + '" height="' + (gelH - 30) + '" fill="#1a1a3a" rx="2" />';
+  // Well
+  h += '<rect x="' + (laneX + 2) + '" y="12" width="' + (laneW - 4) + '" height="6" fill="#2a2a4a" rx="1" />';
+
+  // Bands
+  fragments.forEach(function(f) {
+    var logSize = Math.log10(f.size);
+    // Larger fragments migrate less (closer to top)
+    var yFrac = 1 - (logSize - minLog) / range;
+    var y = 25 + yFrac * (gelH - 55);
+    // Band intensity roughly proportional to mass (size * copies, but copies = 1 each)
+    var intensity = Math.min(1, f.size / (Math.max.apply(null, sizes) || 1));
+    var opacity = 0.5 + intensity * 0.5;
+    h += '<rect x="' + (laneX + 4) + '" y="' + Math.round(y) + '" width="' + (laneW - 8) + '" height="3" fill="rgba(0,255,100,' + opacity.toFixed(2) + ')" rx="1" />';
+    // Size label
+    var label = f.size >= 1000 ? (f.size / 1000).toFixed(1) + 'kb' : f.size + '';
+    h += '<text x="' + (laneX + laneW + 4) + '" y="' + (Math.round(y) + 3) + '" fill="#8a9f8a" font-size="8" font-family="SF Mono,Monaco,monospace">' + label + '</text>';
+  });
+
+  // Ladder marks
+  var ladder = [10000, 5000, 3000, 1500, 1000, 500, 250];
+  ladder.forEach(function(sz) {
+    var logSz = Math.log10(sz);
+    if (logSz >= minLog && logSz <= maxLog) {
+      var yFrac = 1 - (logSz - minLog) / range;
+      var y = 25 + yFrac * (gelH - 55);
+      h += '<line x1="' + (laneX - 2) + '" y1="' + Math.round(y) + '" x2="' + laneX + '" y2="' + Math.round(y) + '" stroke="#555" stroke-width="0.5" />';
+    }
+  });
+
+  h += '</svg>';
+  return h;
+}
+
+/* ── KNOWN FEATURES SCAN TAB ───────────────────────────────── */
+function _clRenderScanTab() {
+  var sc = _cl.sa.scan;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .6rem;">Scan for common molecular biology features: purification tags (His, FLAG, HA, Strep), protease sites (TEV, Thrombin), promoters (T7, CMV, lac), terminators, resistance markers, recombination sites (loxP, FRT, att), and more.</p>';
+
+  h += '<div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.7rem;flex-wrap:wrap;">';
+  h += '<button onclick="_saScanRun()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (sc.loading ? 'opacity:.6;pointer-events:none;' : '') + '">' + (sc.loading ? '\u23f3 Scanning\u2026' : '\ud83d\udd2c Scan Sequence') + '</button>';
+  if (sc.result) {
+    h += '<label style="display:flex;align-items:center;gap:.3rem;font-size:.75rem;color:#8a7f72;cursor:pointer;"><input type="checkbox" ' + (sc.showOnMap ? 'checked' : '') + ' onchange="_saScanToggleMap()" /> Show on map</label>';
+  }
+  h += '</div>';
+
+  if (sc.result) {
+    var r = sc.result;
+    var features = r.features || [];
+
+    // Category summary
+    h += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.5rem;"><strong style="color:#4a4139;">' + r.count + '</strong> known feature' + (r.count !== 1 ? 's' : '') + ' found</div>';
+
+    if (r.categories && Object.keys(r.categories).length > 0) {
+      h += '<div style="display:flex;gap:.3rem;flex-wrap:wrap;margin-bottom:.6rem;">';
+      var cats = Object.keys(r.categories);
+      h += '<button onclick="_saScanFilter(\x27all\x27)" style="padding:.2rem .5rem;font-size:.68rem;border:1px solid #d5cec0;border-radius:3px;cursor:pointer;' + (sc.filterCat === 'all' ? 'background:#5b7a5e;color:#fff;border-color:#5b7a5e;' : 'background:#fff;color:#4a4139;') + '">All (' + r.count + ')</button>';
+      cats.forEach(function(cat) {
+        var active = sc.filterCat === cat;
+        h += '<button onclick="_saScanFilter(\x27' + esc(cat).replace(/'/g, '\\x27') + '\x27)" style="padding:.2rem .5rem;font-size:.68rem;border:1px solid #d5cec0;border-radius:3px;cursor:pointer;' + (active ? 'background:#5b7a5e;color:#fff;border-color:#5b7a5e;' : 'background:#fff;color:#4a4139;') + '">' + esc(cat) + ' (' + r.categories[cat] + ')</button>';
+      });
+      h += '</div>';
     }
 
-    # Build product sequence and annotations for preview
-    # Simplified: insert placed at first cut site in backbone
-    cut_pos = vec_digest.get("total_cuts", [0])[0] if vec_digest.get("total_cuts") else 0
-    product_seq = vec_seq[:cut_pos] + ins_seq + vec_seq[cut_pos:]
-    product_annotations = [
-        {"name": vec_name + " backbone", "start": 0, "end": cut_pos, "direction": 1, "color": "#4682B4", "type": "misc_feature"},
-        {"name": ins_name, "start": cut_pos, "end": cut_pos + len(ins_seq), "direction": 1, "color": "#2ecc71", "type": "misc_feature"},
-        {"name": vec_name + " cont.", "start": cut_pos + len(ins_seq), "end": len(product_seq), "direction": 1, "color": "#4682B4", "type": "misc_feature"},
-    ]
-
-    return {
-        "vector_digest": vec_digest,
-        "enzyme_info": enzyme_info,
-        "compatible": compatible,
-        "ligation_product": ligation_product,
-        "product_seq": product_seq,
-        "product_length": len(product_seq),
-        "product_annotations": product_annotations,
-        "primers": primers,
-        "warnings": warnings,
-        "sticky_ends": sticky_ends,
+    // Filter
+    var filtered = features;
+    if (sc.filterCat !== 'all') {
+      filtered = features.filter(function(f) { return f.category === sc.filterCat; });
     }
 
-
-# ---------------------------------------------------------------------------
-# Router
-# ---------------------------------------------------------------------------
-router = APIRouter(prefix="/api", tags=["cloning"])
-
-GB_DIR = "/data/gb_files"
-OC_DEFAULT_URL = os.environ.get("OPENCLONING_URL", "http://localhost:8001")
-
-
-@router.get("/cloning/config")
-def get_config():
-    return {"opencloning_url": OC_DEFAULT_URL}
-
-
-@router.get("/cloning/sequences")
-def list_sequences():
-    with get_db() as conn:
-        primers = conn.execute(
-            "SELECT id, name, sequence, use, box_number, gb_file, created "
-            "FROM primers WHERE gb_file IS NOT NULL AND gb_file != '' "
-            "ORDER BY name"
-        ).fetchall()
-        plasmids = conn.execute(
-            "SELECT id, name, use, box_location, glycerol_location, gb_file, created "
-            "FROM plasmids WHERE gb_file IS NOT NULL AND gb_file != '' "
-            "ORDER BY name"
-        ).fetchall()
-        # Kit parts
-        try:
-            kit_parts = conn.execute(
-                "SELECT id, name, kit_name, part_type, description, gb_file, created "
-                "FROM kit_parts WHERE gb_file IS NOT NULL AND gb_file != '' "
-                "ORDER BY kit_name, name"
-            ).fetchall()
-        except Exception:
-            kit_parts = []  # table may not exist yet
-
-    items = []
-    for p in primers:
-        d = dict(p)
-        d["type"] = "primer"
-        fpath = os.path.join(GB_DIR, f"primer_{d['id']}.gb")
-        d["has_file"] = os.path.isfile(fpath)
-        items.append(d)
-    for p in plasmids:
-        d = dict(p)
-        d["type"] = "plasmid"
-        fpath = os.path.join(GB_DIR, f"plasmid_{d['id']}.gb")
-        d["has_file"] = os.path.isfile(fpath)
-        items.append(d)
-    for p in kit_parts:
-        d = dict(p)
-        d["type"] = "kitpart"
-        fpath = os.path.join(GB_DIR, f"kitpart_{d['id']}.gb")
-        d["has_file"] = os.path.isfile(fpath)
-        items.append(d)
-
-    return {"items": items}
-
-
-@router.get("/cloning/sequences/{seq_type}/{seq_id}/parse")
-def parse_sequence(seq_type: str, seq_id: int):
-    if seq_type not in ("primer", "plasmid", "kitpart"):
-        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', or 'kitpart'")
-    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
-    return parse_genbank(fpath)
-
-
-@router.get("/cloning/sequences/{seq_type}/{seq_id}/raw")
-def raw_sequence(seq_type: str, seq_id: int):
-    if seq_type not in ("primer", "plasmid", "kitpart"):
-        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', or 'kitpart'")
-    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
-    if not os.path.isfile(fpath):
-        raise HTTPException(404, "GenBank file not found")
-    with open(fpath, "r") as f:
-        return PlainTextResponse(f.read(), media_type="text/plain")
-
-
-class UpdateFeaturesRequest(BaseModel):
-    annotations: List[dict]
-
-
-@router.post("/cloning/sequences/{seq_type}/{seq_id}/update-features")
-def update_features(seq_type: str, seq_id: int, body: UpdateFeaturesRequest):
-    """Update annotations in a .gb file, preserving the sequence."""
-    if seq_type not in ("primer", "plasmid"):
-        raise HTTPException(400, "seq_type must be 'primer' or 'plasmid'")
-    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
-    if not os.path.isfile(fpath):
-        raise HTTPException(404, "GenBank file not found")
-
-    from Bio import SeqIO as _SeqIO
-    from Bio.Seq import Seq
-    from Bio.SeqRecord import SeqRecord
-    from Bio.SeqFeature import SeqFeature, FeatureLocation
-    from io import StringIO
-
-    # Read existing record to preserve sequence + metadata
-    records = list(_SeqIO.parse(fpath, "genbank"))
-    if not records:
-        raise HTTPException(400, "No records found in GenBank file")
-    rec = records[0]
-
-    # Clear existing features
-    rec.features = []
-
-    # Add source feature spanning whole sequence
-    source = SeqFeature(
-        FeatureLocation(0, len(rec.seq)),
-        type="source",
-        qualifiers={"mol_type": ["other DNA"], "organism": ["synthetic construct"]},
-    )
-    rec.features.append(source)
-
-    # Add user-provided features
-    for a in body.annotations:
-        strand = 1 if a.get("direction", 1) == 1 else -1
-        start = int(a.get("start", 0))
-        end = int(a.get("end", 0))
-        if start < 0 or end > len(rec.seq) or start >= end:
-            continue  # skip invalid
-        feat = SeqFeature(
-            FeatureLocation(start, end, strand=strand),
-            type=a.get("type", "misc_feature"),
-            qualifiers={
-                "label": [a.get("name", "feature")],
-                "ApEinfo_fwdcolor": [a.get("color", "#95A5A6")],
-                "ApEinfo_revcolor": [a.get("color", "#95A5A6")],
-            },
-        )
-        rec.features.append(feat)
-
-    # Write back
-    output = StringIO()
-    _SeqIO.write(rec, output, "genbank")
-    with open(fpath, "w") as f:
-        f.write(output.getvalue())
-
-    return {"ok": True, "count": len(body.annotations)}
-
-
-class ReindexRequest(BaseModel):
-    new_origin: int
-
-
-@router.post("/cloning/sequences/{seq_type}/{seq_id}/reindex")
-def reindex_sequence(seq_type: str, seq_id: int, body: ReindexRequest):
-    """Reindex a circular sequence — rotate so new_origin becomes position 0.
-    Remaps all feature coordinates and rewrites the .gb file."""
-    if seq_type not in ("primer", "plasmid", "kitpart"):
-        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', or 'kitpart'")
-    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
-    if not os.path.isfile(fpath):
-        raise HTTPException(404, "GenBank file not found")
-
-    from Bio import SeqIO as _SeqIO
-    from Bio.Seq import Seq
-    from Bio.SeqFeature import SeqFeature, FeatureLocation
-    from io import StringIO
-
-    records = list(_SeqIO.parse(fpath, "genbank"))
-    if not records:
-        raise HTTPException(400, "No records found in GenBank file")
-    rec = records[0]
-    seq_str = str(rec.seq)
-    slen = len(seq_str)
-
-    topology = rec.annotations.get("topology", "linear")
-    if topology != "circular":
-        raise HTTPException(400, "Reindexing is only supported for circular sequences")
-
-    origin = body.new_origin % slen
-    if origin == 0:
-        return parse_genbank(fpath)  # no change needed
-
-    # Rotate sequence
-    new_seq = seq_str[origin:] + seq_str[:origin]
-    rec.seq = Seq(new_seq)
-
-    # Remap features
-    new_features = []
-    for feat in rec.features:
-        start = int(feat.location.start)
-        end = int(feat.location.end)
-        new_start = (start - origin) % slen
-        new_end = (end - origin) % slen
-
-        # Skip source features — we'll regenerate
-        if feat.type == "source":
-            continue
-
-        # If the feature doesn't wrap origin after reindex, keep it simple
-        if new_start < new_end:
-            new_feat = SeqFeature(
-                FeatureLocation(new_start, new_end, strand=feat.location.strand),
-                type=feat.type,
-                qualifiers=dict(feat.qualifiers),
-            )
-            new_features.append(new_feat)
-        else:
-            # Feature now wraps origin — BioPython can't represent this in a simple
-            # FeatureLocation, so store as-is (start < end by using the larger span)
-            # This is a known GenBank limitation for wrapped features
-            new_feat = SeqFeature(
-                FeatureLocation(new_start, slen, strand=feat.location.strand),
-                type=feat.type,
-                qualifiers=dict(feat.qualifiers),
-            )
-            new_features.append(new_feat)
-
-    # Rebuild feature list with source
-    rec.features = [SeqFeature(
-        FeatureLocation(0, slen),
-        type="source",
-        qualifiers={"mol_type": ["other DNA"], "organism": ["synthetic construct"]},
-    )] + new_features
-
-    # Write back
-    output = StringIO()
-    _SeqIO.write(rec, output, "genbank")
-    with open(fpath, "w") as f:
-        f.write(output.getvalue())
-
-    # Return freshly parsed data
-    return parse_genbank(fpath)
-
-
-# ---------------------------------------------------------------------------
-# Sequence analysis endpoints
-# ---------------------------------------------------------------------------
-@router.post("/cloning/find-orfs")
-def find_orfs_endpoint(body: FindOrfsRequest):
-    """Find open reading frames in all 6 frames."""
-    orfs = find_orfs(
-        seq=body.seq,
-        min_length=body.min_length or 100,
-        circular=body.circular if body.circular is not None else True,
-    )
-    return {"orfs": orfs, "count": len(orfs)}
-
-
-@router.post("/cloning/restriction-analysis")
-def restriction_endpoint(body: RestrictionRequest):
-    """Find restriction enzyme cut sites."""
-    return find_restriction_sites(
-        seq=body.seq,
-        enzyme_names=body.enzymes,
-        circular=body.circular if body.circular is not None else True,
-    )
-
-
-@router.post("/cloning/seq-tool")
-def seq_tool_endpoint(body: SeqToolRequest):
-    """Perform sequence operations: rc, complement, reverse, translate."""
-    seq = body.seq.upper().replace(" ", "").replace("\n", "")
-    op = body.operation
-    if op == "rc":
-        return {"result": _reverse_complement(seq), "operation": "reverse_complement"}
-    elif op == "complement":
-        comp = {"A": "T", "T": "A", "G": "C", "C": "G", "N": "N"}
-        return {"result": "".join(comp.get(b, "N") for b in seq), "operation": "complement"}
-    elif op == "reverse":
-        return {"result": seq[::-1], "operation": "reverse"}
-    elif op == "translate":
-        protein = _translate_seq(seq)
-        return {"result": protein, "operation": "translate", "length_aa": len(protein)}
-    else:
-        raise HTTPException(400, f"Unknown operation: {op}. Use: rc, complement, reverse, translate")
-
-
-@router.post("/cloning/tm-calc")
-def tm_calc_endpoint(body: TmCalcRequest):
-    """Calculate Tm for a sequence."""
-    seq = body.seq.upper().replace(" ", "").replace("\n", "")
-    tm = _calc_tm(seq)
-    gc = _gc_content(seq) * 100
-    return {"tm": tm, "gc_percent": round(gc, 1), "length": len(seq)}
-
-
-@router.post("/cloning/digest")
-def digest_endpoint(body: DigestRequest):
-    """Simulate a restriction digest."""
-    return simulate_digest(
-        seq=body.seq,
-        enzyme_names=body.enzymes,
-        circular=body.circular if body.circular is not None else True,
-    )
-
-
-@router.post("/cloning/blast")
-def blast_endpoint(body: BlastRequest):
-    """Run a BLAST search against NCBI. This can take 30-120 seconds."""
-    return run_blast(
-        seq=body.seq,
-        program=body.program or "blastn",
-        database=body.database or "nt",
-        max_hits=body.max_hits or 10,
-    )
-
-
-@router.post("/cloning/scan-features")
-def scan_features_endpoint(body: ScanFeaturesRequest):
-    """Scan for known molecular biology features (tags, promoters, etc.)."""
-    return scan_known_features(
-        seq=body.seq,
-        circular=body.circular if body.circular is not None else True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Assembly design endpoints
-# ---------------------------------------------------------------------------
-@router.post("/cloning/design-gibson")
-def gibson_endpoint(body: GibsonRequest):
-    """Design a Gibson assembly with overlapping primers."""
-    frags = [{"name": f.name, "seq": f.seq, "start": f.start, "end": f.end} for f in body.fragments]
-    return design_gibson(
-        fragments=frags,
-        circular=body.circular if body.circular is not None else True,
-        overlap_length=body.overlap_length or 25,
-        tm_target=body.tm_target or 62.0,
-    )
-
-
-@router.post("/cloning/design-goldengate")
-def goldengate_endpoint(body: GoldenGateRequest):
-    """Design a Golden Gate assembly with type IIS enzyme."""
-    bins_data = None
-    frags_data = None
-    vec_data = None
-
-    if body.bins:
-        bins_data = [{"name": b.name, "fragments": [{"name": f.name, "seq": f.seq} for f in b.fragments]} for b in body.bins]
-    elif body.fragments:
-        frags_data = [{"name": f.name, "seq": f.seq} for f in body.fragments]
-
-    if body.vector and body.vector.seq:
-        vec_data = {"name": body.vector.name, "seq": body.vector.seq}
-
-    return design_golden_gate(
-        bins=bins_data,
-        fragments=frags_data,
-        vector=vec_data,
-        enzyme=body.enzyme or "BsaI",
-        circular=body.circular if body.circular is not None else True,
-        tm_target=body.tm_target or 62.0,
-    )
-
-
-@router.post("/cloning/design-digest-ligate")
-def digest_ligate_endpoint(body: DigestLigateRequest):
-    """Design a digest-ligate cloning strategy."""
-    vec = {"name": body.vector.name, "seq": body.vector.seq}
-    ins = {"name": body.insert.name, "seq": body.insert.seq}
-    return design_digest_ligate(
-        vector=vec, insert=ins,
-        enzyme1=body.enzyme1,
-        enzyme2=body.enzyme2,
-        design_primers=body.design_primers if body.design_primers is not None else True,
-        tm_target=body.tm_target or 62.0,
-        vector_cut1_pos=body.vector_cut1_pos,
-        vector_cut2_pos=body.vector_cut2_pos,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Primer design endpoints
-# ---------------------------------------------------------------------------
-@router.post("/cloning/design-kld-primers")
-def kld_endpoint(body: KLDRequest):
-    # If the user didn't provide start/end (old UI), fallback to insertion_pos
-    s_pos = body.start_pos if body.start_pos is not None else body.insertion_pos
-    e_pos = body.end_pos if body.end_pos is not None else body.insertion_pos
-    
-    return design_kld_primers(
-        template_seq=body.template_seq,
-        insert_seq=body.insert_seq,
-        start_pos=s_pos,
-        end_pos=e_pos,
-        optimize=body.optimize,
-        tm_target=body.annealing_tm_target or 62.0,
-        max_len=body.max_primer_length or 60,
-    )
-
-
-@router.post("/cloning/evaluate-primer")
-def custom_primer_endpoint(body: CustomPrimerRequest):
-    return evaluate_custom_primer(
-        template_seq=body.template_seq,
-        start=body.start,
-        end=body.end,
-        direction=body.direction,
-    )
-
-
-@router.post("/cloning/design-pcr-primers")
-def pcr_endpoint(body: PCRPrimerRequest):
-    return design_pcr_primers(
-        template_seq=body.template_seq,
-        target_start=body.target_start,
-        target_end=body.target_end,
-        tm_target=body.tm_target or 62.0,
-    )
-
-
-@router.post("/cloning/design-seq-primers")
-def seq_primer_endpoint(body: SeqPrimerRequest):
-    return design_seq_primers(
-        template_seq=body.template_seq,
-        region_start=body.region_start,
-        region_end=body.region_end,
-        read_length=body.read_length or 900,
-        tm_target=body.tm_target or 62.0,
-    )
-
-
-@router.post("/cloning/save-primers")
-def save_primers(body: SavePrimersRequest):
-    """Save one or more designed primers to the primers table."""
-    now = datetime.utcnow().isoformat()
-
-    with get_db() as conn:
-        settings = conn.execute("SELECT primer_prefix FROM dna_settings WHERE id=1").fetchone()
-        prefix = dict(settings)["primer_prefix"] if settings else "P"
-
-        last = conn.execute(
-            "SELECT name FROM primers WHERE name LIKE ? ORDER BY id DESC LIMIT 1",
-            (prefix + "%",)
-        ).fetchone()
-        next_num = 1
-        if last:
-            last_name = dict(last)["name"]
-            digits = "".join(c for c in last_name[len(prefix):] if c.isdigit())
-            if digits:
-                next_num = int(digits) + 1
-
-        saved = []
-        for p in body.primers:
-            name = f"{prefix}{next_num}"
-            seq = p.get("seq", "")
-            use_desc = p.get("use_desc", "")
-            conn.execute(
-                "INSERT INTO primers (name, sequence, use, created) VALUES (?, ?, ?, ?)",
-                (name, seq, use_desc, now),
-            )
-            saved.append({"name": name, "seq": seq})
-            next_num += 1
-
-        conn.commit()
-
-    return {"saved": saved}
-
-
-# ---------------------------------------------------------------------------
-# Product generation endpoints
-# ---------------------------------------------------------------------------
-@router.post("/cloning/product-preview")
-def product_preview(body: ProductPreviewRequest):
-    """Generate product sequence with remapped features for SeqViz preview."""
-    return _build_product(
-        mode=body.mode,
-        template_seq=body.template_seq,
-        annotations=body.annotations or [],
-        template_name=body.template_name or "template",
-        template_topology=body.template_topology or "circular",
-        insertion_pos=body.insertion_pos,
-        start_pos=body.start_pos,
-        end_pos=body.end_pos,
-        insert_seq=body.insert_seq,
-        insert_label=body.insert_label,
-        target_start=body.target_start,
-        target_end=body.target_end,
-    )
-
-
-@router.post("/cloning/save-product")
-def save_product(body: SaveProductRequest):
-    """Generate product .gb file, save as a new plasmid, return parse data."""
-    product = _build_product(
-        mode=body.mode,
-        template_seq=body.template_seq,
-        annotations=body.annotations or [],
-        template_name=body.template_name or "template",
-        template_topology=body.template_topology or "circular",
-        insertion_pos=body.insertion_pos,
-        start_pos=body.start_pos,
-        end_pos=body.end_pos,
-        insert_seq=body.insert_seq,
-        insert_label=body.insert_label,
-        target_start=body.target_start,
-        target_end=body.target_end,
-    )
-
-    # Override name with user-provided name
-    product["name"] = body.product_name
-
-    # Write GenBank file
-    gb_content = _write_genbank(product)
-
-    now = datetime.utcnow().isoformat()
-    method = "KLD" if body.mode == "kld" else "PCR"
-    use_desc = f"{method} product from {body.template_name or 'template'}"
-
-    with get_db() as conn:
-        # Get plasmid prefix
-        settings = conn.execute("SELECT plasmid_prefix FROM dna_settings WHERE id=1").fetchone()
-        prefix = dict(settings)["plasmid_prefix"] if settings else "pMR"
-
-        last = conn.execute(
-            "SELECT name FROM plasmids WHERE name LIKE ? ORDER BY id DESC LIMIT 1",
-            (prefix + "%",)
-        ).fetchone()
-        next_num = 1
-        if last:
-            last_name = dict(last)["name"]
-            digits = "".join(c for c in last_name[len(prefix):] if c.isdigit())
-            if digits:
-                next_num = int(digits) + 1
-
-        plasmid_name = body.product_name or f"{prefix}{next_num}"
-
-        cur = conn.execute(
-            "INSERT INTO plasmids (name, use, gb_file, created) VALUES (?, ?, ?, ?)",
-            (plasmid_name, use_desc, "yes", now),
-        )
-        conn.commit()
-        plasmid_id = cur.lastrowid
-
-    # Save .gb file
-    os.makedirs(GB_DIR, exist_ok=True)
-    gb_path = os.path.join(GB_DIR, f"plasmid_{plasmid_id}.gb")
-    with open(gb_path, "w") as f:
-        f.write(gb_content)
-
-    return {
-        "plasmid_id": plasmid_id,
-        "plasmid_name": plasmid_name,
-        "product": product,
+    if (filtered.length > 0) {
+      h += '<div style="max-height:300px;overflow-y:auto;border:1px solid #e8e2d8;border-radius:5px;">';
+      h += '<table style="width:100%;border-collapse:collapse;font-size:.76rem;">';
+      h += '<thead><tr style="background:#faf8f4;position:sticky;top:0;">';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;width:22px;"></th>';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Feature</th>';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Category</th>';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Location</th>';
+      h += '<th style="text-align:left;padding:.25rem .5rem;font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Strand</th>';
+      h += '<th style="text-align:center;padding:.25rem .3rem;font-size:.64rem;width:40px;"></th>';
+      h += '</tr></thead><tbody>';
+      filtered.forEach(function(f, i) {
+        // Find original index for add-as-feature
+        var origIdx = features.indexOf(f);
+        h += '<tr style="border-bottom:1px solid #f0ebe3;" onmouseover="this.style.background=\x27#f5f1eb\x27" onmouseout="this.style.background=\x27transparent\x27">';
+        h += '<td style="padding:.2rem .3rem;text-align:center;"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + esc(f.color) + ';"></span></td>';
+        h += '<td style="padding:.2rem .5rem;font-weight:500;color:#4a4139;">' + esc(f.name) + '</td>';
+        h += '<td style="padding:.2rem .5rem;font-size:.7rem;color:#8a7f72;">' + esc(f.category) + '</td>';
+        h += '<td style="padding:.2rem .5rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;color:#8a7f72;">' + f.start + '..' + f.end + '</td>';
+        h += '<td style="padding:.2rem .5rem;color:#8a7f72;">' + (f.direction === 1 ? '\u2192 fwd' : '\u2190 rc') + '</td>';
+        h += '<td style="padding:.2rem .3rem;text-align:center;">';
+        h += '<button onclick="_saScanAddFeature(' + origIdx + ')" style="padding:.1rem .35rem;font-size:.66rem;color:#4682B4;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;" title="Add as annotation">\u2795</button>';
+        h += '</td>';
+        h += '</tr>';
+      });
+      h += '</tbody></table></div>';
+    } else {
+      h += '<div style="padding:1rem;text-align:center;color:#8a7f72;font-size:.82rem;">No features in this category.</div>';
     }
+  }
+  return h;
+}
 
+/* ── BLAST TAB ─────────────────────────────────────────────── */
+function _clRenderBlastTab() {
+  var b = _cl.sa.blast;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .6rem;">Search NCBI databases. <strong style="color:#5b7a5e;">Drag on the map</strong> to auto-fill, or paste a sequence. BLAST queries typically take 30\u2013120 seconds.</p>';
 
-# ---------------------------------------------------------------------------
-# OpenCloning CloningStrategy JSON export
-# ---------------------------------------------------------------------------
-def _build_oc_entry(seq_type, seq_id, source_id, seq_obj_id):
-    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
-    if not os.path.isfile(fpath):
-        return None
-    with open(fpath, "r") as f:
-        gb_content = f.read()
-    fname = f"{seq_type}_{seq_id}.gb"
-    circular = "circular" in gb_content[:500].lower()
-    source = {"id": source_id, "type": "UploadedFileSource", "input": [],
-              "file_name": fname, "index_in_file": 0, "sequence_file_format": "genbank"}
-    sequence = {"id": seq_obj_id, "type": "TextFileSequence",
-                "source": {"id": source_id}, "file_content": gb_content, "circular": circular}
-    file_entry = {"file_name": fname, "file_content": gb_content}
-    return source, sequence, file_entry
+  h += '<textarea id="cl-sa-blast-input" oninput="_saBlastSetSeq(this.value)" placeholder="Paste or select a DNA/protein sequence\u2026" style="width:100%;box-sizing:border-box;padding:.45rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.78rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:50px;resize:vertical;line-height:1.5;">' + esc(b.seq) + '</textarea>';
 
+  var cleanLen = _clCleanSeq(b.seq).length;
+  if (cleanLen > 0) {
+    h += '<div style="font-size:.72rem;color:#8a7f72;margin-top:.2rem;">' + cleanLen + ' bp</div>';
+  }
 
-@router.get("/cloning/export/{seq_type}/{seq_id}")
-def export_single(seq_type: str, seq_id: int):
-    if seq_type not in ("primer", "plasmid"):
-        raise HTTPException(400, "seq_type must be 'primer' or 'plasmid'")
-    result = _build_oc_entry(seq_type, seq_id, 1, 2)
-    if not result:
-        raise HTTPException(404, "GenBank file not found")
-    source, sequence, file_entry = result
-    return {"sources": [source], "sequences": [sequence], "primers": [], "files": [file_entry]}
+  h += '<div style="display:flex;gap:.5rem;align-items:end;margin-top:.5rem;margin-bottom:.3rem;flex-wrap:wrap;">';
+  // Program
+  h += '<div><label style="display:block;font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">Program</label>';
+  h += '<select onchange="_saBlastSet(\x27program\x27,this.value)" style="padding:.35rem .4rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.78rem;color:#4a4139;">';
+  ['blastn', 'blastp', 'blastx', 'tblastn', 'tblastx'].forEach(function(p) {
+    h += '<option value="' + p + '"' + (b.program === p ? ' selected' : '') + '>' + p + '</option>';
+  });
+  h += '</select></div>';
+  // Database
+  h += '<div><label style="display:block;font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">Database</label>';
+  h += '<select onchange="_saBlastSet(\x27database\x27,this.value)" style="padding:.35rem .4rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.78rem;color:#4a4139;">';
+  var dbs = [
+    { v: 'nt', l: 'nt (nucleotide)' }, { v: 'nr', l: 'nr (protein)' },
+    { v: 'swissprot', l: 'SwissProt' }, { v: 'refseq_rna', l: 'RefSeq RNA' },
+    { v: 'refseq_protein', l: 'RefSeq Protein' }, { v: 'pdb', l: 'PDB' },
+  ];
+  dbs.forEach(function(db) {
+    h += '<option value="' + db.v + '"' + (b.database === db.v ? ' selected' : '') + '>' + db.l + '</option>';
+  });
+  h += '</select></div>';
+  // Max hits
+  h += '<div><label style="display:block;font-size:.65rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">Max Hits</label>';
+  h += '<input type="number" min="1" max="50" value="' + b.maxHits + '" onchange="_saBlastSet(\x27maxHits\x27,this.value)" style="width:60px;padding:.35rem .4rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.78rem;color:#4a4139;" /></div>';
 
+  h += '<button onclick="_saBlastRun()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (b.loading ? 'opacity:.6;pointer-events:none;' : '') + '">' + (b.loading ? '\u23f3 Searching NCBI\u2026' : '\ud83c\udf10 Run BLAST') + '</button>';
+  h += '</div>';
 
-@router.get("/cloning/export-all")
-def export_all():
-    with get_db() as conn:
-        primers = conn.execute("SELECT id FROM primers WHERE gb_file IS NOT NULL AND gb_file != ''").fetchall()
-        plasmids = conn.execute("SELECT id FROM plasmids WHERE gb_file IS NOT NULL AND gb_file != ''").fetchall()
-    sources, sequences, files = [], [], []
-    sid = 1
-    for row in plasmids:
-        result = _build_oc_entry("plasmid", row["id"], sid, sid + 1)
-        if result:
-            sources.append(result[0]); sequences.append(result[1]); files.append(result[2]); sid += 2
-    for row in primers:
-        result = _build_oc_entry("primer", row["id"], sid, sid + 1)
-        if result:
-            sources.append(result[0]); sequences.append(result[1]); files.append(result[2]); sid += 2
-    if not sources:
-        raise HTTPException(404, "No sequences with GenBank files found")
-    return {"sources": sources, "sequences": sequences, "primers": [], "files": files}
+  if (b.loading) {
+    h += '<div style="padding:1.5rem;text-align:center;color:#8a7f72;font-size:.82rem;">';
+    h += '<div style="font-size:1.5rem;margin-bottom:.4rem;">\u23f3</div>';
+    h += 'Querying NCBI BLAST\u2026 this usually takes 30\u2013120 seconds.<br>';
+    h += '<span style="font-size:.72rem;">Do not close or navigate away.</span>';
+    h += '</div>';
+  }
 
+  if (b.result) {
+    var r = b.result;
+    h += '<div style="font-size:.78rem;color:#8a7f72;margin-top:.6rem;margin-bottom:.5rem;"><strong style="color:#4a4139;">' + r.num_hits + ' hit' + (r.num_hits !== 1 ? 's' : '') + '</strong> found \u2014 ' + r.program + ' vs ' + r.database + ' (' + r.query_length + ' bp query)</div>';
 
-# ---------------------------------------------------------------------------
-# Cloning project CRUD
-# ---------------------------------------------------------------------------
-@router.get("/cloning/projects")
-def list_projects():
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM cloning_projects ORDER BY updated DESC").fetchall()
-    return {"items": [dict(r) for r in rows]}
+    if (r.hits.length > 0) {
+      h += '<div style="max-height:350px;overflow-y:auto;border:1px solid #e8e2d8;border-radius:5px;">';
+      r.hits.forEach(function(hit, idx) {
+        var expanded = b.expandedHit === idx;
+        var pctColor = hit.identity_pct >= 95 ? '#27ae60' : hit.identity_pct >= 80 ? '#f39c12' : '#e74c3c';
+        h += '<div style="border-bottom:1px solid #f0ebe3;">';
+        // Header
+        h += '<div onclick="_saBlastExpand(' + idx + ')" style="display:flex;align-items:center;gap:.5rem;padding:.4rem .6rem;cursor:pointer;" onmouseover="this.style.background=\x27#f5f1eb\x27" onmouseout="this.style.background=\x27transparent\x27">';
+        h += '<span style="font-size:.75rem;font-weight:600;color:' + pctColor + ';min-width:42px;">' + hit.identity_pct + '%</span>';
+        h += '<span style="font-size:.72rem;color:#4a4139;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(hit.title.substring(0, 100)) + '</span>';
+        h += '<span style="font-size:.68rem;color:#8a7f72;white-space:nowrap;">E=' + hit.evalue + '</span>';
+        h += '<span style="font-size:.68rem;color:#8a7f72;">' + (expanded ? '\u25b2' : '\u25bc') + '</span>';
+        h += '</div>';
+        // Expanded: alignment
+        if (expanded) {
+          h += '<div style="padding:.4rem .6rem .6rem 1rem;background:#faf8f4;font-size:.72rem;">';
+          h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.4rem;color:#8a7f72;">';
+          h += '<span>Accession: <strong style="color:#4a4139;">' + esc(hit.accession) + '</strong></span>';
+          h += '<span>Score: ' + hit.bits + ' bits</span>';
+          h += '<span>Identity: ' + hit.identity + '</span>';
+          h += '<span>Gaps: ' + hit.gaps + '</span>';
+          h += '<span>Strand: ' + esc(hit.strand) + '</span>';
+          h += '<span>Subject len: ' + hit.length.toLocaleString() + '</span>';
+          h += '</div>';
+          h += '<div style="font-size:.65rem;color:#8a7f72;margin-bottom:.2rem;">Query ' + hit.query_start + '-' + hit.query_end + ' \u21c4 Subject ' + hit.subject_start + '-' + hit.subject_end + '</div>';
+          // Alignment
+          h += '<div style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.68rem;line-height:1.5;background:#fff;padding:.4rem;border:1px solid #e8e2d8;border-radius:3px;overflow-x:auto;white-space:pre;">';
+          h += 'Query  ' + esc(hit.query_seq.substring(0, 80)) + '\n';
+          h += '       ' + esc(hit.match_seq.substring(0, 80)) + '\n';
+          h += 'Sbjct  ' + esc(hit.subject_seq.substring(0, 80));
+          if (hit.query_seq.length > 80) h += '\n       \u2026';
+          h += '</div>';
+          h += '<div style="margin-top:.3rem;"><a href="https://www.ncbi.nlm.nih.gov/nucleotide/' + esc(hit.accession) + '" target="_blank" style="font-size:.7rem;color:#5b7a5e;">View on NCBI \u2197</a></div>';
+          h += '</div>';
+        }
+        h += '</div>';
+      });
+      h += '</div>';
+    }
+  }
+  return h;
+}
 
+/* ── SEQUENCE TOOLS TAB ────────────────────────────────────── */
+function _clRenderToolsTab() {
+  var t = _cl.sa.tools;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .6rem;">Paste or type a sequence, then apply an operation. Or select a region in the viewer above — it will auto-fill here.</p>';
 
-@router.post("/cloning/projects")
-def create_project(body: CreateProject):
-    now = datetime.utcnow().isoformat()
-    with get_db() as conn:
-        cur = conn.execute(
-            "INSERT INTO cloning_projects (name, description, method, sequences, notes, created, updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (body.name, body.description, body.method, body.sequences, body.notes, now, now))
-        conn.commit()
-        row = dict(conn.execute("SELECT * FROM cloning_projects WHERE id=?", (cur.lastrowid,)).fetchone())
-    return row
+  h += '<textarea id="cl-sa-tools-input" oninput="_saToolsInput(this.value)" placeholder="Paste DNA sequence\u2026" style="width:100%;box-sizing:border-box;padding:.45rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.78rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:50px;resize:vertical;line-height:1.5;">' + esc(t.input) + '</textarea>';
 
+  var cleanLen = _clCleanSeq(t.input).length;
+  if (cleanLen > 0) {
+    h += '<div style="font-size:.72rem;color:#8a7f72;margin-top:.2rem;">' + cleanLen + ' bp</div>';
+  }
 
-@router.put("/cloning/projects/{pid}")
-def update_project(pid: int, body: UpdateProject):
-    now = datetime.utcnow().isoformat()
-    with get_db() as conn:
-        existing = conn.execute("SELECT * FROM cloning_projects WHERE id=?", (pid,)).fetchone()
-        if not existing:
-            raise HTTPException(404, "Project not found")
-        existing = dict(existing)
-        updates = body.dict(exclude_unset=True)
-        for k, v in updates.items():
-            existing[k] = v
-        conn.execute(
-            "UPDATE cloning_projects SET name=?, description=?, method=?, sequences=?, notes=?, status=?, updated=? WHERE id=?",
-            (existing["name"], existing["description"], existing["method"],
-             existing["sequences"], existing["notes"], existing["status"], now, pid))
-        conn.commit()
-        row = dict(conn.execute("SELECT * FROM cloning_projects WHERE id=?", (pid,)).fetchone())
-    return row
+  h += '<div style="display:flex;gap:.4rem;margin-top:.5rem;flex-wrap:wrap;">';
+  h += '<button onclick="_saToolsRun(\x27rc\x27)" style="padding:.4rem .7rem;font-size:.78rem;background:#4682B4;color:#fff;border:none;border-radius:4px;cursor:pointer;">Reverse Complement</button>';
+  h += '<button onclick="_saToolsRun(\x27complement\x27)" style="padding:.4rem .7rem;font-size:.78rem;background:#8E44AD;color:#fff;border:none;border-radius:4px;cursor:pointer;">Complement</button>';
+  h += '<button onclick="_saToolsRun(\x27reverse\x27)" style="padding:.4rem .7rem;font-size:.78rem;background:#e67e22;color:#fff;border:none;border-radius:4px;cursor:pointer;">Reverse</button>';
+  h += '<button onclick="_saToolsRun(\x27translate\x27)" style="padding:.4rem .7rem;font-size:.78rem;background:#2ecc71;color:#fff;border:none;border-radius:4px;cursor:pointer;">Translate</button>';
+  h += '<button onclick="_saToolsTm()" style="padding:.4rem .7rem;font-size:.78rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:#fff;cursor:pointer;">\ud83c\udf21 Tm</button>';
+  h += '</div>';
 
+  if (t.result) {
+    h += '<div style="margin-top:.7rem;border:1px solid #e8e2d8;border-radius:5px;overflow:hidden;">';
+    h += '<div style="display:flex;align-items:center;justify-content:space-between;padding:.35rem .6rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;">';
+    h += '<span style="font-size:.72rem;font-weight:600;color:#4a4139;">' + esc(t.lastOp) + '</span>';
+    h += '<button onclick="_saToolsCopy()" style="padding:.2rem .45rem;font-size:.68rem;color:#5b7a5e;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">Copy</button>';
+    h += '</div>';
+    h += '<div style="padding:.5rem .6rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.76rem;color:#4a4139;word-break:break-all;line-height:1.6;max-height:150px;overflow-y:auto;">' + esc(t.result) + '</div>';
+    h += '</div>';
+  }
+  return h;
+}
 
-@router.delete("/cloning/projects/{pid}")
-def delete_project(pid: int):
-    with get_db() as conn:
-        r = conn.execute("DELETE FROM cloning_projects WHERE id=?", (pid,))
-        conn.commit()
-    if r.rowcount == 0:
-        raise HTTPException(404, "Project not found")
-    return {"deleted": True}
+/* ── Analysis action handlers ──────────────────────────────── */
+function _saToggle() { _cl.sa.expanded = !_cl.sa.expanded; _clRender(); }
+function _saSetMode(m) { _cl.sa.mode = m; _clRender(); }
+
+// ORFs
+function _saOrfSetMin(val) { _cl.sa.orfs.minLen = parseInt(val, 10) || 100; }
+function _saOrfRun() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var o = _cl.sa.orfs;
+  o.loading = true; o.result = null; o.hiddenOrfs = {}; o.expandedOrf = null; _clRender();
+  api('POST', '/api/cloning/find-orfs', {
+    seq: _cl.parsed.seq, min_length: o.minLen,
+    circular: (_cl.parsed.topology || '').toLowerCase() === 'circular',
+  }).then(function(data) {
+    o.loading = false; o.result = data;
+    o.hiddenOrfs = {}; // Start with all visible
+    _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 80);
+  }).catch(function(err) { o.loading = false; toast('ORF search failed: ' + (err.message || err), true); _clRender(); });
+}
+function _saOrfToggleMap() {
+  _cl.sa.orfs.showOnMap = !_cl.sa.orfs.showOnMap;
+  _cl.sa.orfs.hiddenOrfs = {}; // Reset individual visibility
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 80);
+}
+function _saOrfExpand(idx) {
+  _cl.sa.orfs.expandedOrf = _cl.sa.orfs.expandedOrf === idx ? null : idx;
+  _clRenderKeepScroll('cl-orf-list');
+}
+function _saOrfCopyProt(idx) {
+  var orfs = (_cl.sa.orfs.result || {}).orfs || [];
+  if (orfs[idx]) { navigator.clipboard.writeText(orfs[idx].protein).then(function() { toast('Protein copied'); }); }
+}
+function _saOrfCopyDna(idx) {
+  if (!_cl.parsed) return;
+  var orfs = (_cl.sa.orfs.result || {}).orfs || [];
+  var o = orfs[idx];
+  if (!o) return;
+  var seq = _cl.parsed.seq;
+  var dna = o.start < o.end ? seq.substring(o.start, o.end) : seq.substring(o.start) + seq.substring(0, o.end);
+  if (o.direction === -1) dna = _clRcSeq(dna);
+  navigator.clipboard.writeText(dna).then(function() { toast('DNA copied (' + dna.length + ' bp)'); });
+}
+
+// Simple client-side RC for copy
+function _clRcSeq(s) {
+  var comp = { A: 'T', T: 'A', G: 'C', C: 'G', N: 'N', a: 't', t: 'a', g: 'c', c: 'g' };
+  return s.split('').reverse().map(function(b) { return comp[b] || 'N'; }).join('');
+}
+
+// Toggle individual ORF on/off the map
+function _saOrfToggleOne(idx) {
+  if (_cl.sa.orfs.hiddenOrfs[idx]) {
+    delete _cl.sa.orfs.hiddenOrfs[idx];
+  } else {
+    _cl.sa.orfs.hiddenOrfs[idx] = true;
+  }
+  // Save scroll, re-render list only, then explicitly refresh SeqViz
+  var listEl = document.getElementById('cl-orf-list');
+  var scrollY = listEl ? listEl.scrollTop : 0;
+  _clRender();
+  setTimeout(function() {
+    var listEl2 = document.getElementById('cl-orf-list');
+    if (listEl2) listEl2.scrollTop = scrollY;
+    _clRenderSeqViz();
+  }, 80);
+}
+
+// Render helper that preserves scroll position of a container
+function _clRenderKeepScroll(containerId) {
+  var el = document.getElementById(containerId);
+  var scrollTop = el ? el.scrollTop : 0;
+  _clRender();
+  setTimeout(function() {
+    var el2 = document.getElementById(containerId);
+    if (el2) el2.scrollTop = scrollTop;
+  }, 10);
+}
+
+// Add an ORF as a feature/annotation
+function _saOrfAddFeature(idx) {
+  var orfs = (_cl.sa.orfs.result || {}).orfs || [];
+  var orf = orfs[idx];
+  if (!orf || !_cl.parsed) return;
+  var orfColors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c'];
+  var color = orfColors[idx % orfColors.length];
+  var name = prompt('Feature name:', 'ORF ' + orf.length_aa + 'aa (frame ' + (orf.direction === 1 ? '+' : '') + orf.frame + ')');
+  if (!name) return;
+  if (!_cl.parsed.annotations) _cl.parsed.annotations = [];
+  _cl.parsed.annotations.push({
+    name: name,
+    start: orf.start,
+    end: orf.end,
+    direction: orf.direction,
+    color: color,
+    type: 'CDS',
+  });
+  _cl.featuresDirty = true;
+  _cl.featuresOpen = true;
+  toast('Added "' + name + '" as CDS feature');
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+// Add any feature from stash (used by primer cards, etc.)
+function _clAddAsFeature(stashIdx) {
+  var feat = (window._featStash || [])[stashIdx];
+  if (!feat || !_cl.parsed) return;
+  var name = prompt('Feature name:', feat.name || 'feature');
+  if (!name) return;
+  if (!_cl.parsed.annotations) _cl.parsed.annotations = [];
+  _cl.parsed.annotations.push({
+    name: name,
+    start: feat.start,
+    end: feat.end,
+    direction: feat.direction || 1,
+    color: feat.color || '#E67E22',
+    type: feat.type || 'primer_bind',
+  });
+  _cl.featuresDirty = true;
+  _cl.featuresOpen = true;
+  toast('Added "' + name + '" as ' + (feat.type || 'primer_bind') + ' feature');
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+// RE
+function _saReSetEnz(val) { _cl.sa.re.enzymes = val; }
+function _saReRun() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var re = _cl.sa.re;
+  re.loading = true; re.result = null; _clRender();
+  var enzList = re.enzymes ? re.enzymes.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : null;
+  api('POST', '/api/cloning/restriction-analysis', {
+    seq: _cl.parsed.seq, enzymes: enzList,
+    circular: (_cl.parsed.topology || '').toLowerCase() === 'circular',
+  }).then(function(data) {
+    re.loading = false; re.result = data; _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }).catch(function(err) { re.loading = false; toast('RE analysis failed: ' + (err.message || err), true); _clRender(); });
+}
+function _saReToggleMap() { _cl.sa.re.showOnMap = !_cl.sa.re.showOnMap; _clRender(); setTimeout(function() { _clRenderSeqViz(); }, 50); }
+function _saReFilter(f) { _cl.sa.re.filterCuts = f; _clRender(); }
+
+// Digest
+function _saDigestSetEnz(val) { _cl.sa.digest.enzymes = val; }
+function _saDigestQuickAdd(name) {
+  var cur = _cl.sa.digest.enzymes;
+  var list = cur ? cur.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+  if (list.indexOf(name) === -1) {
+    list.push(name);
+    _cl.sa.digest.enzymes = list.join(', ');
+    _clRender();
+  }
+}
+function _saDigestRun() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var d = _cl.sa.digest;
+  var enzList = d.enzymes ? d.enzymes.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+  if (enzList.length < 1) { toast('Enter at least one enzyme', true); return; }
+  if (enzList.length > 3) { toast('Maximum 3 enzymes', true); return; }
+  d.loading = true; d.result = null; _clRender();
+  api('POST', '/api/cloning/digest', {
+    seq: _cl.parsed.seq, enzymes: enzList,
+    circular: (_cl.parsed.topology || '').toLowerCase() === 'circular',
+  }).then(function(data) {
+    d.loading = false; d.result = data; _clRender();
+  }).catch(function(err) { d.loading = false; toast('Digest failed: ' + (err.message || err), true); _clRender(); });
+}
+
+// BLAST
+function _saBlastSetSeq(val) { _cl.sa.blast.seq = val; }
+function _saBlastSet(field, val) {
+  if (field === 'maxHits') _cl.sa.blast.maxHits = parseInt(val, 10) || 10;
+  else _cl.sa.blast[field] = val;
+}
+function _saBlastExpand(idx) { _cl.sa.blast.expandedHit = _cl.sa.blast.expandedHit === idx ? null : idx; _clRender(); }
+function _saBlastRun() {
+  var b = _cl.sa.blast;
+  var seq = _clCleanSeq(b.seq);
+  if (seq.length < 10) { toast('Sequence too short (min 10bp)', true); return; }
+  if (seq.length > 10000) { toast('Sequence too long for web BLAST (max 10,000bp)', true); return; }
+  b.loading = true; b.result = null; b.expandedHit = null; _clRender();
+  api('POST', '/api/cloning/blast', {
+    seq: seq, program: b.program, database: b.database, max_hits: b.maxHits,
+  }).then(function(data) {
+    b.loading = false; b.result = data; _clRender();
+  }).catch(function(err) {
+    b.loading = false;
+    toast('BLAST failed: ' + (err.message || err), true);
+    _clRender();
+  });
+}
+
+// Known features scan
+function _saScanRun() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var sc = _cl.sa.scan;
+  sc.loading = true; sc.result = null; sc.filterCat = 'all'; _clRender();
+  api('POST', '/api/cloning/scan-features', {
+    seq: _cl.parsed.seq,
+    circular: (_cl.parsed.topology || '').toLowerCase() === 'circular',
+  }).then(function(data) {
+    sc.loading = false; sc.result = data; _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 80);
+  }).catch(function(err) { sc.loading = false; toast('Scan failed: ' + (err.message || err), true); _clRender(); });
+}
+function _saScanToggleMap() {
+  _cl.sa.scan.showOnMap = !_cl.sa.scan.showOnMap;
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 80);
+}
+function _saScanFilter(cat) { _cl.sa.scan.filterCat = cat; _clRender(); }
+function _saScanAddFeature(idx) {
+  var features = (_cl.sa.scan.result || {}).features || [];
+  var f = features[idx];
+  if (!f || !_cl.parsed) return;
+  var name = prompt('Feature name:', f.name);
+  if (!name) return;
+  if (!_cl.parsed.annotations) _cl.parsed.annotations = [];
+  _cl.parsed.annotations.push({
+    name: name, start: f.start, end: f.end,
+    direction: f.direction, color: f.color, type: f.type,
+  });
+  _cl.featuresDirty = true;
+  _cl.featuresOpen = true;
+  toast('Added "' + name + '" as ' + f.type + ' feature');
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 80);
+}
+
+// Seq tools
+function _saToolsInput(val) { _cl.sa.tools.input = val; }
+function _saToolsRun(op) {
+  var seq = _clCleanSeq(_cl.sa.tools.input);
+  if (!seq) { toast('Enter a sequence first', true); return; }
+  var labels = { rc: 'Reverse Complement', complement: 'Complement', reverse: 'Reverse', translate: 'Translation' };
+  api('POST', '/api/cloning/seq-tool', { seq: seq, operation: op })
+    .then(function(data) {
+      _cl.sa.tools.result = data.result;
+      _cl.sa.tools.lastOp = labels[op] || op;
+      _clRender();
+      // Keep textarea focused
+      var ta = document.getElementById('cl-sa-tools-input');
+      if (ta) ta.focus();
+    }).catch(function(err) { toast('Error: ' + (err.message || err), true); });
+}
+function _saToolsTm() {
+  var seq = _clCleanSeq(_cl.sa.tools.input);
+  if (!seq) { toast('Enter a sequence first', true); return; }
+  api('POST', '/api/cloning/tm-calc', { seq: seq })
+    .then(function(data) {
+      _cl.sa.tools.result = 'Tm: ' + data.tm + '\u00b0C  |  GC: ' + data.gc_percent + '%  |  Length: ' + data.length + ' bp';
+      _cl.sa.tools.lastOp = 'Tm Calculator';
+      _clRender();
+    }).catch(function(err) { toast('Error: ' + (err.message || err), true); });
+}
+function _saToolsCopy() {
+  if (_cl.sa.tools.result) { navigator.clipboard.writeText(_cl.sa.tools.result).then(function() { toast('Copied'); }); }
+}
+
+/* ── global actions ────────────────────────────────────────── */
+function _clSetTab(tab) { _cl.tab = tab; _clRender(); }
+function _clToggleView(which) {
+  if (which === 'circular') _cl.showCircular = !_cl.showCircular;
+  else _cl.showLinear = !_cl.showLinear;
+  // Ensure at least one is visible
+  if (!_cl.showCircular && !_cl.showLinear) {
+    if (which === 'circular') _cl.showLinear = true;
+    else _cl.showCircular = true;
+  }
+  _clRender();
+}
+function _clFilterChange(val) { _cl.filter = val; _clRender(); }
+function _clOcFilterChange(val) { _cl.ocFilter = val; _clRender(); }
+function _clToggleSidebar() { _cl.sidebarOpen = !_cl.sidebarOpen; _clRender(); }
+function _clToggleOcSidebar() { _cl.ocSidebarOpen = !_cl.ocSidebarOpen; _clRender(); }
+function _clToggleFeatures() { _cl.featuresOpen = !_cl.featuresOpen; _clRender(); }
+
+/* ── Reindex origin ───────────────────────────────────────── */
+function _clReindex() {
+  if (!_cl.parsed || !_cl.selected) { toast('No sequence loaded', true); return; }
+  if ((_cl.parsed.topology || '').toLowerCase() !== 'circular') { toast('Reindex only works on circular sequences', true); return; }
+
+  var sel = _cl.lastSelection || { start: 0, end: 0 };
+  var defaultPos = sel.start > 0 ? sel.start : 0;
+  var input = prompt('Enter new origin position (current selection start: ' + defaultPos + '):', String(defaultPos));
+  if (input === null) return;
+  var newOrigin = parseInt(input, 10);
+  if (isNaN(newOrigin) || newOrigin < 0 || newOrigin >= _cl.parsed.length) {
+    toast('Invalid position (0\u2013' + (_cl.parsed.length - 1) + ')', true);
+    return;
+  }
+  if (newOrigin === 0) { toast('Already at origin 0', false); return; }
+
+  _cl.loading = true;
+  _clRender();
+  api('POST', '/api/cloning/sequences/' + _cl.selected.type + '/' + _cl.selected.id + '/reindex', {
+    new_origin: newOrigin,
+  }).then(function(data) {
+    _cl.parsed = data;
+    _cl.loading = false;
+    _cl.lastSelection = { start: 0, end: 0 };
+    toast('Origin moved to position ' + newOrigin + ' \u2014 sequence reindexed');
+    _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }).catch(function(err) {
+    _cl.loading = false;
+    toast('Reindex failed: ' + (err.message || err), true);
+    _clRender();
+  });
+}
+
+/* ── Sequence search (forward + reverse complement) ──────── */
+function _clSearchToggle() {
+  _cl.search.open = !_cl.search.open;
+  if (!_cl.search.open) {
+    _cl.search.query = '';
+    _cl.search.results = null;
+    _cl.search.activeIdx = 0;
+  }
+  _clRender();
+  if (_cl.search.open) {
+    setTimeout(function() {
+      var el = document.getElementById('cl-search-input');
+      if (el) el.focus();
+    }, 50);
+  }
+  setTimeout(function() { _clRenderSeqViz(); }, 60);
+}
+
+function _clSearchRun(query) {
+  _cl.search.query = query;
+  var q = query.toUpperCase().replace(/[^ATGCN]/g, '');
+  if (q.length < 3) {
+    _cl.search.results = null;
+    _cl.search.activeIdx = 0;
+    _clRender();
+    return;
+  }
+  if (!_cl.parsed || !_cl.parsed.seq) return;
+
+  var seq = _cl.parsed.seq.toUpperCase();
+  var results = [];
+
+  // Search forward strand
+  var pos = 0;
+  while (true) {
+    var idx = seq.indexOf(q, pos);
+    if (idx === -1) break;
+    results.push({ start: idx, end: idx + q.length, strand: 'fwd', pos: idx });
+    pos = idx + 1;
+  }
+
+  // RC the query and search forward strand (finds reverse complement matches)
+  var rcQ = _clRcSeq(q);
+  if (rcQ !== q) { // avoid duplicate matches for palindromes
+    pos = 0;
+    while (true) {
+      var idx2 = seq.indexOf(rcQ, pos);
+      if (idx2 === -1) break;
+      results.push({ start: idx2, end: idx2 + rcQ.length, strand: 'rc', pos: idx2 });
+      pos = idx2 + 1;
+    }
+  }
+
+  // Sort by position
+  results.sort(function(a, b) { return a.start - b.start; });
+
+  _cl.search.results = results;
+  _cl.search.activeIdx = 0;
+  _clRender();
+  setTimeout(function() {
+    var el = document.getElementById('cl-search-input');
+    if (el) { el.focus(); el.setSelectionRange(query.length, query.length); }
+    _clRenderSeqViz();
+  }, 30);
+}
+
+function _clSearchNext() {
+  if (!_cl.search.results || _cl.search.results.length === 0) return;
+  _cl.search.activeIdx = (_cl.search.activeIdx + 1) % _cl.search.results.length;
+  _clRender();
+  setTimeout(function() {
+    var el = document.getElementById('cl-search-input');
+    if (el) el.focus();
+    _clRenderSeqViz();
+  }, 30);
+}
+
+function _clSearchPrev() {
+  if (!_cl.search.results || _cl.search.results.length === 0) return;
+  _cl.search.activeIdx = (_cl.search.activeIdx - 1 + _cl.search.results.length) % _cl.search.results.length;
+  _clRender();
+  setTimeout(function() {
+    var el = document.getElementById('cl-search-input');
+    if (el) el.focus();
+    _clRenderSeqViz();
+  }, 30);
+}
+
+/* ── Feature editor functions ──────────────────────────────── */
+var _featureTypes = ['CDS', 'gene', 'promoter', 'terminator', 'rep_origin', 'primer_bind', 'misc_feature', 'regulatory', 'protein_bind', 'RBS', 'enhancer', 'polyA_signal', 'sig_peptide'];
+
+// Draggable panel position (persists across re-renders)
+var _featPanelPos = { x: -1, y: -1 };
+
+function _clRenderFeaturePanel() {
+  var isNew = _cl.editFeature === 'new';
+  var a;
+  if (isNew) {
+    // Auto-fill from last SeqViz selection
+    var ls = _cl.lastSelection || { start: 0, end: 0 };
+    var useSelection = ls.end > ls.start;
+    a = { name: '', type: 'misc_feature', start: useSelection ? ls.start : 0, end: useSelection ? ls.end : 100, direction: 1, color: '#95A5A6' };
+  } else {
+    a = (_cl.parsed.annotations[_cl.editFeature] || null);
+  }
+  if (!a) return '';
+
+  // Default position: top-right of viewport
+  if (_featPanelPos.x < 0) { _featPanelPos.x = Math.max(20, window.innerWidth - 420); _featPanelPos.y = 80; }
+
+  var h = '';
+  h += '<div id="cl-feat-panel" style="position:fixed;z-index:1000;left:' + _featPanelPos.x + 'px;top:' + _featPanelPos.y + 'px;width:360px;max-width:90vw;background:#faf8f4;border:1px solid #d5cec0;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.2);">';
+
+  // Drag handle / title bar
+  h += '<div id="cl-feat-drag" style="display:flex;align-items:center;justify-content:space-between;padding:.5rem .8rem;cursor:move;background:#f0ebe3;border-radius:8px 8px 0 0;border-bottom:1px solid #d5cec0;user-select:none;">';
+  h += '<span style="font-size:.82rem;font-weight:600;color:#4a4139;">' + (isNew ? '\u2795 Add Feature' : '\u270f\ufe0f Edit Feature') + '</span>';
+  h += '<button onclick="_clFeatModalClose()" style="padding:.1rem .35rem;font-size:.8rem;border:none;background:none;color:#8a7f72;cursor:pointer;" title="Close">\u2715</button>';
+  h += '</div>';
+
+  h += '<div style="padding:.8rem;">';
+
+  // Name
+  h += '<div style="margin-bottom:.5rem;"><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">Name</label>';
+  h += '<input id="cl-feat-name" type="text" value="' + esc(a.name) + '" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#fff;font-size:.82rem;color:#4a4139;" /></div>';
+
+  // Type + Color
+  h += '<div style="display:grid;grid-template-columns:1fr auto;gap:.5rem;margin-bottom:.5rem;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">Type</label>';
+  h += '<select id="cl-feat-type" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#fff;font-size:.8rem;color:#4a4139;">';
+  _featureTypes.forEach(function(t) {
+    h += '<option value="' + t + '"' + (a.type === t ? ' selected' : '') + '>' + t + '</option>';
+  });
+  h += '</select></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">Color</label>';
+  h += '<input id="cl-feat-color" type="color" value="' + esc(a.color || '#95A5A6') + '" style="width:40px;height:30px;border:1px solid #d5cec0;border-radius:4px;padding:0;cursor:pointer;" /></div>';
+  h += '</div>';
+
+  // Start + End + Direction
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr auto;gap:.5rem;margin-bottom:.5rem;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">Start</label>';
+  h += '<input id="cl-feat-start" type="number" min="0" value="' + a.start + '" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#fff;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">End</label>';
+  h += '<input id="cl-feat-end" type="number" min="0" value="' + a.end + '" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#fff;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.2rem;">Dir</label>';
+  h += '<div style="display:flex;border:1px solid #d5cec0;border-radius:4px;overflow:hidden;">';
+  h += '<button onclick="_clFeatSetDir(1)" id="cl-feat-dir-fwd" style="padding:.35rem .55rem;font-size:.8rem;border:none;cursor:pointer;' + (a.direction === 1 ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#4a4139;') + '">\u2192</button>';
+  h += '<button onclick="_clFeatSetDir(-1)" id="cl-feat-dir-rev" style="padding:.35rem .55rem;font-size:.8rem;border:none;cursor:pointer;' + (a.direction === -1 ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#4a4139;') + '">\u2190</button>';
+  h += '</div></div>';
+  h += '</div>';
+
+  // Hint
+  if (isNew) {
+    h += '<div style="font-size:.7rem;color:#8a7f72;margin-bottom:.5rem;font-style:italic;">Drag-select on the map to update start/end positions.</div>';
+  }
+
+  // Buttons
+  h += '<div style="display:flex;gap:.4rem;justify-content:flex-end;">';
+  h += '<button onclick="_clFeatModalClose()" style="padding:.35rem .7rem;font-size:.78rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:4px;background:#fff;cursor:pointer;">Cancel</button>';
+  h += '<button onclick="_clFeatModalSave()" style="padding:.35rem .7rem;font-size:.78rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;">' + (isNew ? 'Add' : 'Save') + '</button>';
+  h += '</div>';
+
+  h += '</div>'; // padding
+  h += '</div>'; // panel
+  return h;
+}
+
+// Direction toggle for the feature panel
+var _featEditDir = 1;
+function _clFeatSetDir(dir) {
+  _featEditDir = dir;
+  var fwd = document.getElementById('cl-feat-dir-fwd');
+  var rev = document.getElementById('cl-feat-dir-rev');
+  if (fwd) fwd.style.cssText = 'padding:.35rem .55rem;font-size:.8rem;border:none;cursor:pointer;' + (dir === 1 ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#4a4139;');
+  if (rev) rev.style.cssText = 'padding:.35rem .55rem;font-size:.8rem;border:none;cursor:pointer;' + (dir === -1 ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#4a4139;');
+}
+
+// Drag logic — init after render
+function _clInitFeatDrag() {
+  var panel = document.getElementById('cl-feat-panel');
+  var handle = document.getElementById('cl-feat-drag');
+  if (!panel || !handle) return;
+  var dragging = false, startX = 0, startY = 0, origX = 0, origY = 0;
+  handle.addEventListener('mousedown', function(e) {
+    dragging = true;
+    startX = e.clientX; startY = e.clientY;
+    origX = panel.offsetLeft; origY = panel.offsetTop;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e) {
+    if (!dragging) return;
+    var dx = e.clientX - startX, dy = e.clientY - startY;
+    var nx = origX + dx, ny = origY + dy;
+    // Clamp to viewport
+    nx = Math.max(0, Math.min(nx, window.innerWidth - 100));
+    ny = Math.max(0, Math.min(ny, window.innerHeight - 50));
+    panel.style.left = nx + 'px';
+    panel.style.top = ny + 'px';
+    _featPanelPos.x = nx;
+    _featPanelPos.y = ny;
+  });
+  document.addEventListener('mouseup', function() { dragging = false; });
+}
+
+function _clFeatColor(idx, color) {
+  if (!_cl.parsed || !_cl.parsed.annotations[idx]) return;
+  _cl.parsed.annotations[idx].color = color;
+  _cl.featuresDirty = true;
+  // Don't full re-render (would lose color picker focus), just update SeqViz
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+function _clFeatDir(idx) {
+  if (!_cl.parsed || !_cl.parsed.annotations[idx]) return;
+  _cl.parsed.annotations[idx].direction = _cl.parsed.annotations[idx].direction === 1 ? -1 : 1;
+  _cl.featuresDirty = true;
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+function _clFeatEdit(idx) {
+  _cl.editFeature = idx;
+  var a = (_cl.parsed && _cl.parsed.annotations) ? _cl.parsed.annotations[idx] : null;
+  _featEditDir = a ? a.direction : 1;
+  _clRender();
+  setTimeout(_clInitFeatDrag, 30);
+}
+
+function _clFeatAdd() {
+  _cl.editFeature = 'new';
+  _featEditDir = 1;
+  _clRender();
+  setTimeout(_clInitFeatDrag, 30);
+}
+
+function _clFeatRemove(idx) {
+  if (!_cl.parsed || !_cl.parsed.annotations[idx]) return;
+  var name = _cl.parsed.annotations[idx].name;
+  if (!confirm('Remove feature "' + name + '"?')) return;
+  _cl.parsed.annotations.splice(idx, 1);
+  _cl.featuresDirty = true;
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+function _clFeatModalClose() {
+  _cl.editFeature = null;
+  _clRender();
+}
+
+function _clFeatModalSave() {
+  var name = (document.getElementById('cl-feat-name') || {}).value || 'feature';
+  var type = (document.getElementById('cl-feat-type') || {}).value || 'misc_feature';
+  var color = (document.getElementById('cl-feat-color') || {}).value || '#95A5A6';
+  var start = parseInt((document.getElementById('cl-feat-start') || {}).value, 10) || 0;
+  var end = parseInt((document.getElementById('cl-feat-end') || {}).value, 10) || 0;
+  var direction = _featEditDir || 1;
+
+  if (start >= end) { toast('Start must be less than end', true); return; }
+
+  var feat = { name: name, type: type, color: color, start: start, end: end, direction: direction };
+
+  if (_cl.editFeature === 'new') {
+    if (!_cl.parsed.annotations) _cl.parsed.annotations = [];
+    _cl.parsed.annotations.push(feat);
+  } else {
+    _cl.parsed.annotations[_cl.editFeature] = feat;
+  }
+
+  _cl.featuresDirty = true;
+  _cl.editFeature = null;
+  _clRender();
+  setTimeout(function() { _clRenderSeqViz(); }, 50);
+}
+
+function _clFeatRevert() {
+  if (!_cl.selected) return;
+  _cl.featuresDirty = false;
+  _cl.editFeature = null;
+  // Re-parse the original .gb file
+  _clSelectSequence(_cl.selected.type, _cl.selected.id);
+}
+
+function _clFeatSave() {
+  if (!_cl.parsed || !_cl.selected) return;
+  toast('Saving annotations to .gb\u2026');
+  api('POST', '/api/cloning/sequences/' + _cl.selected.type + '/' + _cl.selected.id + '/update-features', {
+    annotations: _cl.parsed.annotations || [],
+  })
+  .then(function(data) {
+    _cl.featuresDirty = false;
+    toast('Saved ' + (data.count || 0) + ' features to .gb file');
+    _clRender();
+  })
+  .catch(function(err) { toast('Save failed: ' + (err.message || err), true); });
+}
+
+function _clSendToOC() {
+  if (!_cl.selected || !_cl.parsed) { toast('Select and load a sequence first', true); return; }
+  var seqName = _cl.parsed.name || 'Sequence';
+  fetch('/api/cloning/export/' + _cl.selected.type + '/' + _cl.selected.id)
+    .then(function(r) { if (!r.ok) throw new Error('Export failed'); return r.json(); })
+    .then(function(strategy) {
+      var blob = new Blob([JSON.stringify(strategy, null, 2)], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a'); a.href = url; a.download = seqName + '_opencloning.json';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      toast('JSON exported \u2014 in OpenCloning click \u2630 \u2192 Load file');
+    }).catch(function(err) { toast('Failed to export: ' + (err.message || err), true); });
+}
+
+function _pdGenerateProduct(mode) {
+  if (!_cl.parsed || !_cl.selected) { toast('Load a sequence first', true); return; }
+
+  var baseBody = {
+    mode: mode,
+    template_seq: _cl.parsed.seq,
+    annotations: (_cl.parsed.annotations || []).map(function(a) {
+      return { name: a.name, start: a.start, end: a.end, direction: a.direction, color: a.color, type: a.type };
+    }),
+    template_name: _cl.parsed.name || 'template',
+    template_topology: _cl.parsed.topology || 'circular',
+  };
+
+  if (mode === 'kld' && _cl.pd.kld.result) {
+    var kldResult = _cl.pd.kld.result;
+    baseBody.start_pos = parseInt(kldResult.start_used, 10) || parseInt(_cl.pd.kld.startPos, 10);
+    baseBody.end_pos = parseInt(kldResult.end_used, 10) || parseInt(_cl.pd.kld.endPos, 10);
+    baseBody.insert_seq = _clCleanSeq(_cl.pd.kld.insertSeq);
+    baseBody.insert_label = _cl.pd.kld.insertSeq.length > 20 ? _cl.pd.kld.insertSeq.substring(0, 20) : (_cl.pd.kld.insertSeq || 'insert');
+  } else if (mode === 'pcr' && _cl.pd.pcr.result) {
+    baseBody.target_start = parseInt(_cl.pd.pcr.targetStart, 10);
+    baseBody.target_end = parseInt(_cl.pd.pcr.targetEnd, 10);
+  } else {
+    toast('Design primers first', true); return;
+  }
+
+  // Step 1: Preview product in SeqViz
+  toast('Generating product preview\u2026');
+  api('POST', '/api/cloning/product-preview', baseBody)
+    .then(function(product) {
+      // Load product into SeqViz viewer
+      _cl.pd._productPreview = product;
+      _cl.pd._productBaseBody = baseBody;
+      _cl.parsed = product;
+      _cl.pd._viewingProduct = true;
+      _clRender();
+      setTimeout(function() { _clRenderSeqViz(); }, 50);
+      toast('Product preview loaded \u2014 ' + product.length.toLocaleString() + ' bp');
+    })
+    .catch(function(err) { toast('Preview failed: ' + (err.message || err), true); });
+}
+
+function _pdSaveProduct() {
+  var baseBody = _cl.pd._productBaseBody;
+  var product = _cl.pd._productPreview;
+  if (!baseBody || !product) { toast('Generate a preview first', true); return; }
+
+  // Prompt for product name
+  var defaultName = product.name || 'product';
+  var name = prompt('Name for the new plasmid:', defaultName);
+  if (!name) return;
+
+  var saveBody = JSON.parse(JSON.stringify(baseBody));
+  saveBody.product_name = name;
+
+  toast('Saving product\u2026');
+  api('POST', '/api/cloning/save-product', saveBody)
+    .then(function(data) {
+      toast('Saved as plasmid: ' + data.plasmid_name);
+      // Clear product preview state
+      _cl.pd._viewingProduct = false;
+      _cl.pd._productPreview = null;
+      _cl.pd._productBaseBody = null;
+      // Reload sequences and select the new plasmid
+      _clLoadSequences().then(function() {
+        _clSelectSequence('plasmid', data.plasmid_id);
+      });
+    })
+    .catch(function(err) { toast('Save failed: ' + (err.message || err), true); });
+}
+
+function _pdExitProductPreview() {
+  if (!_cl.selected) return;
+  _cl.pd._viewingProduct = false;
+  _cl.pd._productPreview = null;
+  _cl.pd._productBaseBody = null;
+  // Reload original sequence
+  _clSelectSequence(_cl.selected.type, _cl.selected.id);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ASSEMBLY DESIGNER PANEL
+   ═══════════════════════════════════════════════════════════ */
+function _clRenderAssemblyPanel() {
+  var ad = _cl.ad;
+  var h = '';
+  h += '<div style="border:1px solid #d5cec0;border-radius:6px;background:#fff;overflow:hidden;">';
+
+  // Collapsible header
+  h += '<div onclick="_adToggle()" style="display:flex;align-items:center;justify-content:space-between;padding:.6rem .9rem;cursor:pointer;background:#faf8f4;border-bottom:' + (ad.expanded ? '1px solid #e8e2d8' : 'none') + ';user-select:none;" onmouseover="this.style.background=\x27#f0ebe3\x27" onmouseout="this.style.background=\x27#faf8f4\x27">';
+  h += '<span style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#5b7a5e;">Assembly Designer</span>';
+  h += '<span style="font-size:.8rem;color:#8a7f72;transition:transform .2s;display:inline-block;transform:rotate(' + (ad.expanded ? '180' : '0') + 'deg);">\u25bc</span>';
+  h += '</div>';
+  if (!ad.expanded) { h += '</div>'; return h; }
+
+  // Mode tabs
+  h += '<div style="display:flex;border-bottom:1px solid #e8e2d8;background:#faf8f4;">';
+  var modes = [
+    { key: 'gibson', label: 'Gibson', icon: '\ud83e\udde9' },
+    { key: 'goldengate', label: 'Golden Gate', icon: '\u2728' },
+    { key: 'digestligate', label: 'Digest-Ligate', icon: '\u2702\ufe0f' },
+  ];
+  modes.forEach(function(m) {
+    var active = ad.mode === m.key;
+    h += '<button onclick="_adSetMode(\x27' + m.key + '\x27)" style="flex:1;padding:.5rem .3rem;font-size:.75rem;font-weight:' + (active ? '600' : '400') + ';border:none;border-bottom:2px solid ' + (active ? '#5b7a5e' : 'transparent') + ';cursor:pointer;background:' + (active ? '#fff' : 'transparent') + ';color:' + (active ? '#4a4139' : '#8a7f72') + ';transition:all .15s;">' + m.icon + ' ' + m.label + '</button>';
+  });
+  h += '</div>';
+
+  h += '<div style="padding:.9rem;">';
+  if (ad.mode === 'gibson') { h += _clRenderGibsonTab(); }
+  else if (ad.mode === 'goldengate') { h += _clRenderGoldenGateTab(); }
+  else if (ad.mode === 'digestligate') { h += _clRenderDigestLigateTab(); }
+  h += '</div>';
+  h += '</div>';
+  return h;
+}
+
+/* ── Shared fragment list renderer ────────────────────────── */
+function _clRenderFragmentList(fragments, modeKey) {
+  var h = '';
+  h += '<div style="margin-bottom:.6rem;">';
+  h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem;">';
+  h += '<span style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Fragments (' + fragments.length + ')</span>';
+  h += '<div style="display:flex;gap:.3rem;">';
+  h += '<button onclick="_adAddFromLoaded(\x27' + modeKey + '\x27)" style="padding:.25rem .5rem;font-size:.7rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;background:#fff;cursor:pointer;" title="Add the currently loaded sequence (or selection) as a fragment">+ From loaded</button>';
+  h += '<button onclick="_adOpenLib(\x27' + modeKey + '\x27)" style="padding:.25rem .5rem;font-size:.7rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;" title="Pick from saved plasmids and primers">\ud83d\udcc2 From library</button>';
+  h += '<button onclick="_adAddPaste(\x27' + modeKey + '\x27)" style="padding:.25rem .5rem;font-size:.7rem;color:#4682B4;border:1px solid #4682B4;border-radius:3px;background:#fff;cursor:pointer;" title="Paste a raw DNA sequence">+ Paste</button>';
+  h += '</div></div>';
+
+  // ── Inline library picker
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === modeKey) {
+    h += _clRenderLibPicker(modeKey);
+  }
+
+  if (fragments.length === 0) {
+    h += '<div style="padding:.8rem;text-align:center;color:#8a7f72;font-size:.78rem;border:1px dashed #d5cec0;border-radius:5px;">No fragments added yet. Use the buttons above or drag-select a region on the map.</div>';
+  } else {
+    h += '<div style="border:1px solid #e8e2d8;border-radius:5px;overflow:hidden;">';
+    fragments.forEach(function(f, i) {
+      h += '<div style="display:flex;align-items:center;gap:.5rem;padding:.4rem .6rem;border-bottom:1px solid #f0ebe3;background:#fff;" onmouseover="this.style.background=\x27#f5f1eb\x27" onmouseout="this.style.background=\x27#fff\x27">';
+      h += '<span style="font-size:.7rem;color:#8a7f72;min-width:18px;">' + (i + 1) + '.</span>';
+      h += '<span style="font-size:.8rem;font-weight:500;color:#4a4139;flex:1;">' + esc(f.name) + '</span>';
+      h += '<span style="font-size:.7rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;">' + f.seq.length + ' bp</span>';
+      if (i > 0) {
+        h += '<button onclick="_adFragMove(\x27' + modeKey + '\x27,' + i + ',-1)" style="padding:.1rem .3rem;font-size:.68rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;" title="Move up">\u25b2</button>';
+      }
+      if (i < fragments.length - 1) {
+        h += '<button onclick="_adFragMove(\x27' + modeKey + '\x27,' + i + ',1)" style="padding:.1rem .3rem;font-size:.68rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;" title="Move down">\u25bc</button>';
+      }
+      h += '<button onclick="_adFragRemove(\x27' + modeKey + '\x27,' + i + ')" style="padding:.1rem .3rem;font-size:.68rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Remove">\u2715</button>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+/* ── Library picker (inline dropdown of saved sequences) ──── */
+function _clRenderLibPicker(target) {
+  var lp = _cl.ad._libPicker;
+  var h = '';
+  h += '<div style="border:1px solid #8E44AD;border-radius:5px;background:#faf8f4;margin-bottom:.6rem;overflow:hidden;">';
+  // Header with search + close
+  h += '<div style="display:flex;align-items:center;gap:.4rem;padding:.4rem .6rem;border-bottom:1px solid #e8e2d8;background:#f3eef8;">';
+  h += '<span style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8E44AD;font-weight:600;white-space:nowrap;">\ud83d\udcc2 Library</span>';
+  h += '<input id="cl-lib-filter" type="text" placeholder="Filter\u2026" value="' + esc(lp.filter || '') + '" oninput="_adLibFilter(this.value)" style="flex:1;padding:.25rem .4rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;font-size:.76rem;color:#4a4139;" />';
+  if (_cl.ad._libLoading) {
+    h += '<span style="font-size:.72rem;color:#8a7f72;">\u23f3</span>';
+  }
+  h += '<button onclick="_adCloseLib()" style="padding:.15rem .35rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#8a7f72;cursor:pointer;">\u2715</button>';
+  h += '</div>';
+
+  // Sequence list — plasmids, kit parts, primers
+  var plasmids = _cl.sequences.filter(function(s) { return s.type === 'plasmid' && s.has_file; });
+  var kitparts = _cl.sequences.filter(function(s) { return s.type === 'kitpart' && s.has_file; });
+  var primers = _cl.sequences.filter(function(s) { return s.type === 'primer' && s.has_file; });
+  if (lp.filter) {
+    var f = lp.filter.toLowerCase();
+    plasmids = plasmids.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.use && s.use.toLowerCase().indexOf(f) !== -1); });
+    kitparts = kitparts.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.kit_name && s.kit_name.toLowerCase().indexOf(f) !== -1) || (s.part_type && s.part_type.toLowerCase().indexOf(f) !== -1); });
+    primers = primers.filter(function(s) { return s.name.toLowerCase().indexOf(f) !== -1 || (s.sequence && s.sequence.toLowerCase().indexOf(f) !== -1); });
+  }
+
+  var totalCount = plasmids.length + kitparts.length + primers.length;
+
+  h += '<div style="max-height:240px;overflow-y:auto;">';
+
+  // Kit Parts (shown first — most relevant for assembly)
+  if (kitparts.length > 0) {
+    h += '<div style="padding:.25rem .6rem;font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:#8E44AD;font-weight:600;background:#f3eef8;border-bottom:1px solid #e8e2d8;">\ud83e\uddf0 Kit Parts (' + kitparts.length + ')</div>';
+    kitparts.forEach(function(s) {
+      h += '<div onclick="_adLibPick(\x27' + esc(target) + '\x27,\x27' + s.type + '\x27,' + s.id + ')" style="padding:.35rem .6rem;cursor:pointer;border-bottom:1px solid #f0ebe3;display:flex;align-items:center;gap:.5rem;" onmouseover="this.style.background=\x27#eee8f4\x27" onmouseout="this.style.background=\x27transparent\x27">';
+      h += '<span style="font-size:.8rem;color:#4a4139;font-weight:500;flex:1;">' + esc(s.name) + '</span>';
+      var meta = [];
+      if (s.kit_name) meta.push(s.kit_name);
+      if (s.part_type) meta.push(s.part_type);
+      if (meta.length > 0) h += '<span style="font-size:.66rem;color:#8E44AD;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(meta.join(' \u00b7 ')) + '</span>';
+      h += '</div>';
+    });
+  }
+
+  // Plasmids
+  if (plasmids.length > 0) {
+    h += '<div style="padding:.25rem .6rem;font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;background:#f0ebe3;border-bottom:1px solid #e8e2d8;">Plasmids (' + plasmids.length + ')</div>';
+    plasmids.forEach(function(s) {
+      h += '<div onclick="_adLibPick(\x27' + esc(target) + '\x27,\x27' + s.type + '\x27,' + s.id + ')" style="padding:.35rem .6rem;cursor:pointer;border-bottom:1px solid #f0ebe3;display:flex;align-items:center;gap:.5rem;" onmouseover="this.style.background=\x27#eee8f4\x27" onmouseout="this.style.background=\x27transparent\x27">';
+      h += '<span style="font-size:.8rem;color:#4a4139;font-weight:500;flex:1;">' + esc(s.name) + '</span>';
+      if (s.use) h += '<span style="font-size:.68rem;color:#8a7f72;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(s.use) + '</span>';
+      h += '</div>';
+    });
+  }
+
+  // Primers
+  if (primers.length > 0) {
+    h += '<div style="padding:.25rem .6rem;font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;background:#f0ebe3;border-bottom:1px solid #e8e2d8;">Primers (' + primers.length + ')</div>';
+    primers.forEach(function(s) {
+      h += '<div onclick="_adLibPick(\x27' + esc(target) + '\x27,\x27' + s.type + '\x27,' + s.id + ')" style="padding:.35rem .6rem;cursor:pointer;border-bottom:1px solid #f0ebe3;display:flex;align-items:center;gap:.5rem;" onmouseover="this.style.background=\x27#eee8f4\x27" onmouseout="this.style.background=\x27transparent\x27">';
+      h += '<span style="font-size:.8rem;color:#4a4139;font-weight:500;flex:1;">' + esc(s.name) + '</span>';
+      if (s.sequence) h += '<span style="font-size:.66rem;color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(s.sequence.substring(0, 25)) + '</span>';
+      h += '</div>';
+    });
+  }
+
+  if (totalCount === 0) {
+    h += '<div style="padding:.8rem;text-align:center;color:#8a7f72;font-size:.78rem;">' + (lp.filter ? 'No matches.' : 'No sequences with .gb files found.') + '</div>';
+  }
+  h += '</div></div>';
+  return h;
+}
+
+/* ── GIBSON TAB ───────────────────────────────────────────── */
+function _clRenderGibsonTab() {
+  var g = _cl.ad.gibson;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Gibson assembly joins 2+ fragments with overlapping primer tails. Set the <strong style="color:#4a4139;">vector</strong> (backbone), add <strong style="color:#4a4139;">insert fragments</strong>, then design primers with ~25bp overlaps.</p>';
+
+  // ── Loaded sequence banner
+  if (_cl.parsed) {
+    var sel = _cl.lastSelection || { start: 0, end: 0 };
+    var hasSelection = sel.end > sel.start && sel.end - sel.start < _cl.parsed.seq.length;
+    var isVec = g.vector && g.vector._sourceId === (_cl.selected.type + '_' + _cl.selected.id);
+    h += '<div style="border:1px solid ' + (isVec ? '#5b7a5e' : '#4682B4') + ';border-radius:5px;padding:.5rem .7rem;margin-bottom:.7rem;background:' + (isVec ? '#eef4ee' : '#eef2f8') + ';display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;">';
+    h += '<span style="font-size:.72rem;font-weight:600;color:#4a4139;">\ud83e\uddec ' + esc(_cl.parsed.name) + '</span>';
+    h += '<span style="font-size:.7rem;color:#8a7f72;">' + _cl.parsed.length.toLocaleString() + ' bp \u00b7 ' + esc(_cl.parsed.topology) + '</span>';
+    if (hasSelection) {
+      h += '<span style="font-size:.7rem;color:#5b7a5e;font-weight:500;">Selection: ' + sel.start + '\u2013' + sel.end + ' (' + (sel.end - sel.start) + ' bp)</span>';
+    }
+    h += '<div style="display:flex;gap:.3rem;margin-left:auto;">';
+    if (!isVec) {
+      h += '<button onclick="_adGibsonUseAsVec()" style="padding:.25rem .55rem;font-size:.7rem;font-weight:600;color:#fff;background:#5b7a5e;border:none;border-radius:3px;cursor:pointer;">Use as Vector</button>';
+    } else {
+      h += '<span style="font-size:.68rem;color:#5b7a5e;font-weight:600;padding:.25rem .4rem;">\u2705 Vector</span>';
+    }
+    h += '<button onclick="_adGibsonAddLoaded()" style="padding:.25rem .55rem;font-size:.7rem;color:#4682B4;border:1px solid #4682B4;border-radius:3px;background:#fff;cursor:pointer;">' + (hasSelection ? 'Add Selection as Fragment' : 'Add as Fragment') + '</button>';
+    h += '</div></div>';
+  }
+
+  // ── Vector section
+  h += '<div style="margin-bottom:.6rem;">';
+  h += '<div style="display:flex;align-items:center;gap:.4rem;margin-bottom:.3rem;">';
+  h += '<label style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Vector (backbone)</label>';
+  if (g.vector) {
+    h += '<span style="font-size:.76rem;color:#4a4139;font-weight:500;padding:.2rem .5rem;background:#eef4ee;border-radius:3px;border:1px solid #5b7a5e;">' + esc(g.vector.name) + ' (' + g.vector.seq.length + ' bp)</span>';
+    h += '<button onclick="_adGibsonClearVec()" style="padding:.15rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Remove vector">\u2715</button>';
+  } else {
+    h += '<button onclick="_adOpenLib(\x27gibson-vector\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;">\ud83d\udcc2 From library</button>';
+    h += '<span style="font-size:.72rem;color:#8a7f72;font-style:italic;">select above or pick from library</span>';
+  }
+  h += '</div>';
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'gibson-vector') {
+    h += _clRenderLibPicker('gibson-vector');
+  }
+  h += '</div>';
+
+  // ── Insert fragments
+  h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Insert Fragments</div>';
+  h += _clRenderFragmentList(g.fragments, 'gibson');
+
+  // ── Settings + design
+  h += '<div style="display:flex;gap:.6rem;margin-bottom:.7rem;align-items:end;flex-wrap:wrap;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Overlap (bp)</label>';
+  h += '<input type="number" min="15" max="60" value="' + g.overlapLen + '" oninput="_adGibsonSet(\x27overlapLen\x27,this.value)" style="width:80px;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Tm Target (\u00b0C)</label>';
+  h += '<input type="number" min="50" max="75" value="' + g.tmTarget + '" oninput="_adGibsonSet(\x27tmTarget\x27,this.value)" style="width:80px;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+
+  var totalFrags = g.fragments.length + (g.vector ? 1 : 0);
+  h += '<button onclick="_adGibsonDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (g.designing ? 'opacity:.6;pointer-events:none;' : '') + (totalFrags < 2 ? 'opacity:.5;pointer-events:none;' : '') + '">' + (g.designing ? '\u23f3 Designing\u2026' : '\ud83e\udde9 Design Gibson Assembly') + '</button>';
+  h += '</div>';
+
+  if (g.result) { h += _clRenderAssemblyResult(g.result, 'gibson'); }
+  return h;
+}
+
+/* ── GOLDEN GATE TAB ──────────────────────────────────────── */
+function _clRenderGoldenGateTab() {
+  var gg = _cl.ad.goldengate;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Golden Gate uses type IIS enzymes to join parts via programmable 4bp overhangs. Add <strong style="color:#4a4139;">bins</strong> (positions) \u2014 each bin can hold multiple part options for combinatorial assemblies.</p>';
+
+  // Enzyme selector
+  h += '<div style="display:flex;gap:.6rem;align-items:end;margin-bottom:.7rem;flex-wrap:wrap;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Type IIS Enzyme</label>';
+  h += '<select onchange="_adGGSet(\x27enzyme\x27,this.value)" style="padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;">';
+  ['BsaI', 'BbsI', 'BpiI', 'SapI', 'BsmBI'].forEach(function(e) {
+    h += '<option value="' + e + '"' + (gg.enzyme === e ? ' selected' : '') + '>' + e + '</option>';
+  });
+  h += '</select></div>';
+
+  // Vector selector
+  h += '<div style="display:flex;align-items:center;gap:.3rem;">';
+  h += '<label style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Vector:</label>';
+  if (gg.vector) {
+    h += '<span style="font-size:.76rem;color:#4a4139;font-weight:500;padding:.25rem .5rem;background:#eef4ee;border-radius:3px;">' + esc(gg.vector.name) + ' (' + gg.vector.seq.length + ' bp)</span>';
+    h += '<button onclick="_adGGClearVec()" style="padding:.15rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;">\u2715</button>';
+  } else {
+    h += '<button onclick="_adGGLoadVec()" style="padding:.25rem .5rem;font-size:.7rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;background:#fff;cursor:pointer;">Use loaded</button>';
+    h += '<button onclick="_adOpenLib(\x27gg-vector\x27)" style="padding:.25rem .5rem;font-size:.7rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;">\ud83d\udcc2 Library</button>';
+    h += '<span style="font-size:.72rem;color:#8a7f72;font-style:italic;">optional backbone</span>';
+  }
+  h += '</div>';
+  h += '</div>';
+
+  // Vector library picker
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'gg-vector') {
+    h += _clRenderLibPicker('gg-vector');
+  }
+
+  // Internal sites warning
+  if (gg.result && gg.result.internal_sites && gg.result.internal_sites.length > 0) {
+    h += '<div style="background:#fdf2e9;border:1px solid #e8a838;border-radius:5px;padding:.5rem .7rem;margin-bottom:.6rem;">';
+    gg.result.internal_sites.forEach(function(is) {
+      h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(is.fragment) + (is.bin ? ' (bin ' + esc(is.bin) + ')' : '') + ' has internal ' + esc(gg.enzyme) + ' sites at: ' + is.positions.join(', ') + '</div>';
+    });
+    h += '</div>';
+  }
+
+  // ── Bins
+  h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.4rem;">Assembly Bins (' + gg.bins.length + ')</div>';
+
+  if (gg.bins.length === 0) {
+    h += '<div style="padding:.8rem;text-align:center;color:#8a7f72;font-size:.78rem;border:1px dashed #d5cec0;border-radius:5px;margin-bottom:.5rem;">No bins yet. Click \u201c+ Add Bin\u201d to create assembly positions (e.g. Promoter \u2192 RBS \u2192 CDS \u2192 Terminator).</div>';
+  } else {
+    var comboCount = 1;
+    gg.bins.forEach(function(bin, bi) {
+      comboCount *= Math.max(1, bin.fragments.length);
+      var binColors = ['#4682B4', '#2ecc71', '#e67e22', '#9b59b6', '#e74c3c', '#1abc9c'];
+      var bc = binColors[bi % binColors.length];
+      h += '<div style="border:1px solid #d5cec0;border-left:3px solid ' + bc + ';border-radius:5px;margin-bottom:.5rem;overflow:hidden;">';
+      // Bin header
+      h += '<div style="display:flex;align-items:center;gap:.4rem;padding:.4rem .6rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;">';
+      h += '<span style="font-size:.72rem;color:' + bc + ';font-weight:700;min-width:18px;">B' + (bi + 1) + '</span>';
+      h += '<input type="text" value="' + esc(bin.name) + '" onchange="_adGGBinRename(' + bi + ',this.value)" style="flex:1;padding:.2rem .4rem;border:1px solid transparent;border-radius:3px;background:transparent;font-size:.8rem;font-weight:500;color:#4a4139;min-width:0;" onfocus="this.style.borderColor=\x27#d5cec0\x27;this.style.background=\x27#fff\x27" onblur="this.style.borderColor=\x27transparent\x27;this.style.background=\x27transparent\x27" />';
+      h += '<span style="font-size:.68rem;color:#8a7f72;">' + bin.fragments.length + ' part' + (bin.fragments.length !== 1 ? 's' : '') + '</span>';
+      if (bi > 0) h += '<button onclick="_adGGBinMove(' + bi + ',-1)" style="padding:.1rem .3rem;font-size:.65rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">\u25c0</button>';
+      if (bi < gg.bins.length - 1) h += '<button onclick="_adGGBinMove(' + bi + ',1)" style="padding:.1rem .3rem;font-size:.65rem;color:#8a7f72;border:1px solid #d5cec0;border-radius:3px;background:#fff;cursor:pointer;">\u25b6</button>';
+      h += '<button onclick="_adGGBinRemove(' + bi + ')" style="padding:.1rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Remove bin">\u2715</button>';
+      h += '</div>';
+
+      // Fragments in this bin
+      if (bin.fragments.length > 0) {
+        bin.fragments.forEach(function(f, fi) {
+          h += '<div style="display:flex;align-items:center;gap:.4rem;padding:.3rem .6rem .3rem 1.4rem;border-bottom:1px solid #f0ebe3;font-size:.78rem;">';
+          h += '<span style="color:#8a7f72;min-width:14px;font-size:.68rem;">' + (fi + 1) + '.</span>';
+          h += '<span style="color:#4a4139;flex:1;">' + esc(f.name) + '</span>';
+          h += '<span style="color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;">' + f.seq.length + ' bp</span>';
+          h += '<button onclick="_adGGFragRemove(' + bi + ',' + fi + ')" style="padding:0 .25rem;font-size:.64rem;color:#c0392b;border:none;background:none;cursor:pointer;">\u2715</button>';
+          h += '</div>';
+        });
+      }
+
+      // Add part buttons
+      h += '<div style="display:flex;gap:.3rem;padding:.35rem .6rem .35rem 1.4rem;background:#faf8f4;">';
+      h += '<button onclick="_adGGFragFromLoaded(' + bi + ')" style="padding:.2rem .4rem;font-size:.66rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;background:#fff;cursor:pointer;">+ Loaded</button>';
+      h += '<button onclick="_adOpenLib(\x27gg-bin-' + bi + '\x27)" style="padding:.2rem .4rem;font-size:.66rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;">\ud83d\udcc2 Library</button>';
+      h += '<button onclick="_adGGFragPaste(' + bi + ')" style="padding:.2rem .4rem;font-size:.66rem;color:#4682B4;border:1px solid #4682B4;border-radius:3px;background:#fff;cursor:pointer;">+ Paste</button>';
+      h += '</div>';
+
+      // Library picker for this bin
+      if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'gg-bin-' + bi) {
+        h += '<div style="padding:0 .6rem .4rem .6rem;">' + _clRenderLibPicker('gg-bin-' + bi) + '</div>';
+      }
+
+      h += '</div>';
+    });
+
+    // Combinatorial count
+    if (comboCount > 1) {
+      h += '<div style="font-size:.78rem;color:#4a4139;margin-bottom:.5rem;padding:.35rem .6rem;background:#f3eef8;border:1px solid #d5cec0;border-radius:4px;">\u2728 <strong>' + comboCount + ' possible combination' + (comboCount > 1 ? 's' : '') + '</strong> \u2014 all share the same overhang scheme, compatible in a single reaction.</div>';
+    }
+  }
+
+  // Add bin button
+  h += '<div style="margin-bottom:.7rem;">';
+  h += '<button onclick="_adGGAddBin()" style="padding:.35rem .7rem;font-size:.75rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:#fff;cursor:pointer;">+ Add Bin</button>';
+  h += '</div>';
+
+  // Design button
+  var canDesign = gg.bins.length >= 1 && gg.bins.every(function(b) { return b.fragments.length > 0; });
+  h += '<button onclick="_adGGDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (gg.designing ? 'opacity:.6;pointer-events:none;' : '') + (!canDesign ? 'opacity:.5;pointer-events:none;' : '') + '">' + (gg.designing ? '\u23f3 Designing\u2026' : '\u2728 Design Golden Gate Assembly') + '</button>';
+
+  if (gg.result) { h += _clRenderGGResult(gg.result); }
+  return h;
+}
+
+/* ── Golden Gate result renderer ──────────────────────────── */
+function _clRenderGGResult(r) {
+  var h = '<div style="margin-top:.8rem;">';
+
+  if (r.warnings && r.warnings.length > 0) {
+    h += '<div style="background:#fdf2e9;border:1px solid #e8a838;border-radius:5px;padding:.5rem .7rem;margin-bottom:.6rem;">';
+    r.warnings.forEach(function(w) { h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(w) + '</div>'; });
+    h += '</div>';
+  }
+
+  h += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.5rem;">Enzyme: <strong style="color:#4a4139;">' + esc(r.enzyme.name) + '</strong> (site: ' + esc(r.enzyme.site) + ')</div>';
+
+  // Overhang map
+  if (r.overhang_map && r.overhang_map.length > 0) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Overhang Scheme</div>';
+    h += '<div style="display:flex;gap:.3rem;flex-wrap:wrap;margin-bottom:.6rem;">';
+    r.overhang_map.forEach(function(om) {
+      h += '<div style="padding:.25rem .5rem;background:#f3eef8;border:1px solid #d5cec0;border-radius:4px;font-size:.72rem;">';
+      h += '<span style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-weight:600;color:#8E44AD;">' + esc(om.overhang) + '</span>';
+      h += ' <span style="color:#8a7f72;">' + esc(om.label) + '</span>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // Per-bin primers
+  if (r.bins && r.bins.length > 0) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.4rem;">Primers by Bin</div>';
+    r.bins.forEach(function(bin, bi) {
+      var binColors = ['#4682B4', '#2ecc71', '#e67e22', '#9b59b6', '#e74c3c', '#1abc9c'];
+      var bc = binColors[bi % binColors.length];
+      h += '<div style="border:1px solid #e8e2d8;border-left:3px solid ' + bc + ';border-radius:5px;margin-bottom:.5rem;overflow:hidden;">';
+      h += '<div style="padding:.35rem .6rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;display:flex;align-items:center;gap:.4rem;">';
+      h += '<span style="font-size:.78rem;font-weight:600;color:#4a4139;">' + esc(bin.name) + '</span>';
+      h += '<span style="font-size:.68rem;color:#8a7f72;">overhang: <span style="font-family:\'SF Mono\',Monaco,Consolas,monospace;color:#8E44AD;">' + esc(bin.left_overhang) + '</span> \u2192 <span style="font-family:\'SF Mono\',Monaco,Consolas,monospace;color:#8E44AD;">' + esc(bin.right_overhang) + '</span></span>';
+      if (bin.num_options > 1) h += '<span style="font-size:.68rem;color:#5b7a5e;font-weight:600;">' + bin.num_options + ' options</span>';
+      h += '</div>';
+
+      bin.fragments.forEach(function(frag) {
+        h += '<div style="padding:.3rem .6rem;border-bottom:1px solid #f0ebe3;">';
+        h += '<div style="font-size:.76rem;font-weight:500;color:#4a4139;margin-bottom:.3rem;">' + esc(frag.name) + ' <span style="font-weight:400;color:#8a7f72;">(' + frag.length + ' bp)</span></div>';
+        h += _clRenderTailedPrimer('Fwd', frag.fwd_primer, '#2980b9', 'ad-ggf-' + bi + '-' + frag.name.replace(/\s/g, ''), null);
+        h += _clRenderTailedPrimer('Rev', frag.rev_primer, '#8e44ad', 'ad-ggr-' + bi + '-' + frag.name.replace(/\s/g, ''), null);
+        h += '</div>';
+      });
+      h += '</div>';
+    });
+  }
+
+  // Vector primers
+  if (r.vector_primers) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Vector Primers (' + esc(r.vector_name || 'Vector') + ')</div>';
+    h += _clRenderTailedPrimer('Vector Fwd', r.vector_primers.fwd, '#2980b9', 'ad-gg-vec-fwd', null);
+    h += _clRenderTailedPrimer('Vector Rev', r.vector_primers.rev, '#8e44ad', 'ad-gg-vec-rev', null);
+  }
+
+  // Summary
+  h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;padding:.5rem .7rem;background:#faf8f4;border:1px solid #e8e2d8;border-radius:5px;margin-top:.5rem;">';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Product: <strong style="color:#4a4139;">' + (r.product_length || 0).toLocaleString() + ' bp</strong></span>';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Bins: <strong style="color:#4a4139;">' + (r.num_bins || 0) + '</strong></span>';
+  if (r.combo_count > 1) h += '<span style="font-size:.78rem;color:#8E44AD;font-weight:600;">' + r.combo_count + ' combinations</span>';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Primers: <strong style="color:#4a4139;">' + (r.primers || []).length + '</strong></span>';
+  h += '<button onclick="_adCopyAllPrimers(\x27goldengate\x27)" style="margin-left:auto;padding:.3rem .6rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:transparent;cursor:pointer;">\ud83d\udccb Copy All</button>';
+  h += '</div>';
+
+  if (r.primers && r.primers.length > 0) {
+    var saveItems = r.primers.map(function(p) { return { seq: p.full_seq, label: p.name || 'GG primer' }; });
+    h += _clRenderSaveBtn(saveItems);
+  }
+
+  h += '</div>';
+  return h;
+}
+
+/* ── DIGEST-LIGATE TAB ────────────────────────────────────── */
+function _clRenderDigestLigateTab() {
+  var dl = _cl.ad.digestligate;
+  var h = '';
+  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">Classical cloning \u2014 digest vector and insert with restriction enzymes, then ligate compatible sticky ends. Select enzymes and provide sequences below.</p>';
+
+  // Vector input
+  h += '<div style="margin-bottom:.6rem;">';
+  h += '<div style="display:flex;align-items:center;gap:.4rem;margin-bottom:.3rem;">';
+  h += '<label style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Vector</label>';
+  h += '<button onclick="_adDLLoadVector()" style="padding:.2rem .45rem;font-size:.68rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:3px;background:#fff;cursor:pointer;" title="Use currently loaded sequence as vector">Use loaded</button>';
+  h += '<button onclick="_adOpenLib(\x27dl-vector\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;" title="Pick from saved plasmids">\ud83d\udcc2 From library</button>';
+  if (dl.vectorSeq) {
+    h += '<span style="font-size:.72rem;color:#4a4139;font-weight:500;">' + esc(dl.vectorName || 'vector') + ' (' + dl.vectorSeq.length + ' bp)</span>';
+    h += '<button onclick="_adDLClear(\x27vector\x27)" style="padding:.1rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Clear vector">\u2715</button>';
+  }
+  h += '</div>';
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'dl-vector') {
+    h += _clRenderLibPicker('dl-vector');
+  }
+  if (!dl.vectorSeq) {
+    h += '<textarea oninput="_adDLSet(\x27vectorSeq\x27,this.value)" placeholder="Paste vector sequence, click \'Use loaded\', or pick from library\u2026" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.76rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:40px;resize:vertical;"></textarea>';
+  }
+  h += '</div>';
+
+  // Insert input
+  h += '<div style="margin-bottom:.6rem;">';
+  h += '<div style="display:flex;align-items:center;gap:.4rem;margin-bottom:.3rem;">';
+  h += '<label style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;">Insert</label>';
+  h += '<button onclick="_adOpenLib(\x27dl-insert\x27)" style="padding:.2rem .45rem;font-size:.68rem;color:#8E44AD;border:1px solid #8E44AD;border-radius:3px;background:#fff;cursor:pointer;" title="Pick from saved sequences">\ud83d\udcc2 From library</button>';
+  if (dl.insertSeq) {
+    h += '<span style="font-size:.72rem;color:#4a4139;font-weight:500;">' + esc(dl.insertName || 'insert') + ' (' + dl.insertSeq.length + ' bp)</span>';
+    h += '<button onclick="_adDLClear(\x27insert\x27)" style="padding:.1rem .3rem;font-size:.66rem;color:#c0392b;border:none;background:none;cursor:pointer;" title="Clear insert">\u2715</button>';
+  }
+  h += '</div>';
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === 'dl-insert') {
+    h += _clRenderLibPicker('dl-insert');
+  }
+  if (!dl.insertSeq) {
+    h += '<textarea oninput="_adDLSet(\x27insertSeq\x27,this.value)" placeholder="Paste insert sequence or pick from library\u2026" style="width:100%;box-sizing:border-box;padding:.35rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.76rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;min-height:40px;resize:vertical;">' + esc(dl.insertSeq) + '</textarea>';
+  }
+  h += '</div>';
+
+  // Enzymes
+  h += '<div style="display:flex;gap:.6rem;margin-bottom:.7rem;align-items:end;flex-wrap:wrap;">';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Enzyme 1</label>';
+  h += '<input type="text" value="' + esc(dl.enzyme1) + '" oninput="_adDLSet(\x27enzyme1\x27,this.value)" placeholder="e.g. EcoRI" style="width:120px;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Enzyme 2 (optional)</label>';
+  h += '<input type="text" value="' + esc(dl.enzyme2) + '" oninput="_adDLSet(\x27enzyme2\x27,this.value)" placeholder="e.g. BamHI" style="width:120px;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  h += '<button onclick="_adDLDesign()" style="padding:.45rem 1rem;font-size:.82rem;font-weight:600;background:#5b7a5e;color:#fff;border:none;border-radius:5px;cursor:pointer;' + (dl.designing ? 'opacity:.6;pointer-events:none;' : '') + (!dl.vectorSeq || !dl.insertSeq || !dl.enzyme1 ? 'opacity:.5;pointer-events:none;' : '') + '">' + (dl.designing ? '\u23f3 Designing\u2026' : '\u2702\ufe0f Design Digest-Ligate') + '</button>';
+  h += '</div>';
+
+  if (dl.result) { h += _clRenderDLResult(dl.result); }
+  return h;
+}
+
+/* ── Shared assembly result renderer ──────────────────────── */
+function _clRenderAssemblyResult(r, mode) {
+  var h = '<div style="margin-top:.8rem;">';
+
+  // Warnings
+  if (r.warnings && r.warnings.length > 0) {
+    h += '<div style="background:#fdf2e9;border:1px solid #e8a838;border-radius:5px;padding:.5rem .7rem;margin-bottom:.6rem;">';
+    r.warnings.forEach(function(w) { h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(w) + '</div>'; });
+    h += '</div>';
+  }
+
+  // Enzyme info for Golden Gate
+  if (mode === 'goldengate' && r.enzyme) {
+    h += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.5rem;">Enzyme: <strong style="color:#4a4139;">' + esc(r.enzyme.name) + '</strong> (site: ' + esc(r.enzyme.site) + ')</div>';
+  }
+
+  // Junctions
+  if (r.junctions && r.junctions.length > 0) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.4rem;">Junctions (' + r.junctions.length + ')</div>';
+    r.junctions.forEach(function(jn, ji) {
+      h += '<div style="border:1px solid #e8e2d8;border-radius:5px;overflow:hidden;margin-bottom:.5rem;">';
+      h += '<div style="padding:.35rem .6rem;background:#faf8f4;border-bottom:1px solid #e8e2d8;display:flex;align-items:center;gap:.5rem;">';
+      h += '<span style="font-size:.78rem;font-weight:600;color:#4a4139;">Junction ' + (ji + 1) + '</span>';
+      if (jn.name) h += '<span style="font-size:.72rem;color:#8a7f72;">' + esc(jn.name) + '</span>';
+      if (jn.overlap_seq) h += '<span style="font-size:.7rem;color:#8a7f72;">overlap Tm: ' + (jn.overlap_tm || '?') + '\u00b0C</span>';
+      if (jn.overhang) h += '<span style="font-size:.72rem;font-family:\'SF Mono\',Monaco,Consolas,monospace;color:#5b7a5e;font-weight:600;">' + esc(jn.overhang) + '</span>';
+      h += '</div>';
+
+      // Primer cards
+      if (jn.fwd_primer) {
+        h += _clRenderTailedPrimer('Forward', jn.fwd_primer, '#2980b9', 'ad-fwd-' + ji, null);
+      }
+      if (jn.rev_primer) {
+        h += _clRenderTailedPrimer('Reverse', jn.rev_primer, '#8e44ad', 'ad-rev-' + ji, null);
+      }
+      h += '</div>';
+    });
+  }
+
+  // Product summary + actions
+  h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;padding:.5rem .7rem;background:#faf8f4;border:1px solid #e8e2d8;border-radius:5px;margin-top:.5rem;">';
+  h += '<span style="font-size:.78rem;color:#8a7f72;">Product: <strong style="color:#4a4139;">' + (r.product_length || 0).toLocaleString() + ' bp</strong></span>';
+  if (r.num_fragments) h += '<span style="font-size:.78rem;color:#8a7f72;">Fragments: <strong style="color:#4a4139;">' + r.num_fragments + '</strong></span>';
+  h += '<button onclick="_adCopyAllPrimers(\x27' + mode + '\x27)" style="margin-left:auto;padding:.3rem .6rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:transparent;cursor:pointer;">\ud83d\udccb Copy All Primers</button>';
+  h += '</div>';
+
+  // Save primers button
+  if (r.primers && r.primers.length > 0) {
+    var saveItems = r.primers.map(function(p) { return { seq: p.full_seq, label: p.name || 'assembly primer' }; });
+    h += _clRenderSaveBtn(saveItems);
+  }
+
+  h += '</div>';
+  return h;
+}
+
+/* ── Digest-Ligate result renderer ────────────────────────── */
+function _clRenderDLResult(r) {
+  var h = '<div style="margin-top:.8rem;">';
+
+  // Warnings
+  if (r.warnings && r.warnings.length > 0) {
+    h += '<div style="background:#fdf2e9;border:1px solid #e8a838;border-radius:5px;padding:.5rem .7rem;margin-bottom:.6rem;">';
+    r.warnings.forEach(function(w) { h += '<div style="font-size:.78rem;color:#8a6d3b;">\u26a0\ufe0f ' + esc(w) + '</div>'; });
+    h += '</div>';
+  }
+
+  // Compatibility
+  h += '<div style="font-size:.82rem;margin-bottom:.5rem;padding:.4rem .6rem;border-radius:4px;' + (r.compatible ? 'background:#eef9ee;color:#2d6a2d;' : 'background:#fdf2e9;color:#8a6d3b;') + '">';
+  h += (r.compatible ? '\u2705 Ends are compatible' : '\u274c Ends are not compatible') + '</div>';
+
+  // Enzyme info
+  if (r.enzyme_info) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Enzyme Details</div>';
+    h += '<div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem;">';
+    Object.keys(r.enzyme_info).forEach(function(ename) {
+      var ei = r.enzyme_info[ename];
+      h += '<div style="padding:.3rem .5rem;border:1px solid #e8e2d8;border-radius:4px;font-size:.75rem;">';
+      h += '<strong style="color:#4a4139;">' + esc(ename) + '</strong>';
+      h += ' <span style="color:#8a7f72;">(site: ' + esc(ei.site) + ')</span>';
+      h += ' <span style="color:#8a7f72;">Vector cuts: ' + (ei.num_vector_cuts || 0) + '</span>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // Sticky ends
+  if (r.sticky_ends) {
+    h += '<div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem;">';
+    Object.keys(r.sticky_ends).forEach(function(ename) {
+      var se = r.sticky_ends[ename];
+      h += '<span style="font-size:.75rem;padding:.2rem .5rem;background:#f0ebe3;border-radius:3px;color:#4a4139;">' + esc(ename) + ': ' + se.type.replace('_', '\u2032 ') + ' overhang (' + se.length + 'bp)</span>';
+    });
+    h += '</div>';
+  }
+
+  // Vector digest fragments
+  if (r.vector_digest && r.vector_digest.fragments) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;">Vector Digest Fragments</div>';
+    h += '<div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.5rem;">';
+    r.vector_digest.fragments.forEach(function(f, i) {
+      h += '<span style="font-size:.75rem;padding:.2rem .5rem;background:' + (i === 0 ? '#eef4ee' : '#f0ebe3') + ';border:1px solid #d5cec0;border-radius:3px;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;">' + f.size.toLocaleString() + ' bp' + (i === 0 ? ' (backbone)' : '') + '</span>';
+    });
+    h += '</div>';
+  }
+
+  // Primers
+  if (r.primers && r.primers.length > 0) {
+    h += '<div style="font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.3rem;margin-top:.5rem;">Primers (add RE sites to insert)</div>';
+    r.primers.forEach(function(p, pi) {
+      h += _clRenderTailedPrimer(p.name || ('Primer ' + (pi + 1)), p, pi === 0 ? '#2980b9' : '#8e44ad', 'ad-dl-' + pi, null);
+    });
+
+    // Product summary
+    h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;padding:.5rem .7rem;background:#faf8f4;border:1px solid #e8e2d8;border-radius:5px;margin-top:.5rem;">';
+    h += '<span style="font-size:.78rem;color:#8a7f72;">Expected product: <strong style="color:#4a4139;">' + (r.product_length || 0).toLocaleString() + ' bp</strong> (circular)</span>';
+    h += '<button onclick="_adCopyAllPrimers(\x27digestligate\x27)" style="margin-left:auto;padding:.3rem .6rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:transparent;cursor:pointer;">\ud83d\udccb Copy Primers</button>';
+    h += '</div>';
+
+    var saveItems = r.primers.map(function(p) { return { seq: p.full_seq, label: p.name || 'DL primer' }; });
+    h += _clRenderSaveBtn(saveItems);
+  }
+
+  h += '</div>';
+  return h;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ASSEMBLY DESIGNER ACTION HANDLERS
+   ═══════════════════════════════════════════════════════════ */
+function _adToggle() { _cl.ad.expanded = !_cl.ad.expanded; _cl.ad._libPicker = null; _clRender(); }
+function _adSetMode(m) { _cl.ad.mode = m; _cl.ad._libPicker = null; _clRender(); }
+
+// ── Library picker
+function _adOpenLib(target) {
+  if (_cl.ad._libPicker && _cl.ad._libPicker.target === target) {
+    _cl.ad._libPicker = null; // toggle off
+  } else {
+    _cl.ad._libPicker = { target: target, filter: '' };
+  }
+  _clRender();
+  setTimeout(function() { var el = document.getElementById('cl-lib-filter'); if (el) el.focus(); }, 40);
+}
+
+function _adCloseLib() {
+  _cl.ad._libPicker = null;
+  _clRender();
+}
+
+function _adLibFilter(val) {
+  if (_cl.ad._libPicker) {
+    _cl.ad._libPicker.filter = val;
+    _clRender();
+    setTimeout(function() {
+      var el = document.getElementById('cl-lib-filter');
+      if (el) { el.focus(); el.setSelectionRange(val.length, val.length); }
+    }, 20);
+  }
+}
+
+function _adLibPick(target, seqType, seqId) {
+  // Fetch the parsed sequence from the server, then add it
+  _cl.ad._libLoading = true;
+  _clRender();
+  api('GET', '/api/cloning/sequences/' + seqType + '/' + seqId + '/parse')
+    .then(function(data) {
+      _cl.ad._libLoading = false;
+      _cl.ad._libPicker = null;
+      var name = data.name || (seqType + '_' + seqId);
+      var seq = data.seq || '';
+      if (!seq) { toast('Sequence is empty', true); _clRender(); return; }
+
+      if (target === 'gibson') {
+        _cl.ad.gibson.fragments.push({ name: name, seq: seq });
+        toast('Added "' + name + '" (' + seq.length + ' bp)');
+      } else if (target === 'gibson-vector') {
+        _cl.ad.gibson.vector = { name: name, seq: seq, _sourceId: seqType + '_' + seqId };
+        toast('Gibson vector set to "' + name + '" (' + seq.length + ' bp)');
+      } else if (target === 'gg-vector') {
+        _cl.ad.goldengate.vector = { name: name, seq: seq };
+        toast('Vector set to "' + name + '" (' + seq.length + ' bp)');
+      } else if (target.indexOf('gg-bin-') === 0) {
+        var binIdx = parseInt(target.replace('gg-bin-', ''), 10);
+        if (_cl.ad.goldengate.bins[binIdx]) {
+          _cl.ad.goldengate.bins[binIdx].fragments.push({ name: name, seq: seq });
+          toast('Added "' + name + '" to ' + _cl.ad.goldengate.bins[binIdx].name);
+        }
+      } else if (target === 'dl-vector') {
+        _cl.ad.digestligate.vectorSeq = seq;
+        _cl.ad.digestligate.vectorName = name;
+        toast('Vector set to "' + name + '" (' + seq.length + ' bp)');
+      } else if (target === 'dl-insert') {
+        _cl.ad.digestligate.insertSeq = seq;
+        _cl.ad.digestligate.insertName = name;
+        toast('Insert set to "' + name + '" (' + seq.length + ' bp)');
+      }
+      _clRender();
+    })
+    .catch(function(err) {
+      _cl.ad._libLoading = false;
+      toast('Failed to load sequence: ' + (err.message || err), true);
+      _clRender();
+    });
+}
+
+function _adDLClear(which) {
+  if (which === 'vector') {
+    _cl.ad.digestligate.vectorSeq = '';
+    _cl.ad.digestligate.vectorName = '';
+  } else {
+    _cl.ad.digestligate.insertSeq = '';
+    _cl.ad.digestligate.insertName = '';
+  }
+  _cl.ad.digestligate.result = null;
+  _clRender();
+}
+
+// ── Fragment management
+function _adAddFromLoaded(modeKey) {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var sel = _cl.lastSelection || { start: 0, end: 0 };
+  var seq = _cl.parsed.seq;
+  var name = _cl.parsed.name || 'fragment';
+  var selLen = _clSelLen(sel.start, sel.end);
+  if (selLen > 0 && selLen < seq.length) {
+    seq = _clGetSelSeq(sel.start, sel.end);
+    name = name + ' (' + sel.start + (sel.crossesOrigin ? '\u2192ori\u2192' : '-') + sel.end + ')';
+  }
+  var frags = _adGetFrags(modeKey);
+  frags.push({ name: name, seq: seq });
+  toast('Added "' + name + '" (' + seq.length + ' bp)');
+  _clRender();
+}
+
+function _adAddPaste(modeKey) {
+  var raw = prompt('Paste DNA sequence:');
+  if (!raw) return;
+  var seq = _clCleanSeq(raw);
+  if (seq.length < 10) { toast('Sequence too short (min 10bp)', true); return; }
+  var name = prompt('Fragment name:', 'Fragment ' + (_adGetFrags(modeKey).length + 1));
+  if (!name) name = 'Fragment ' + (_adGetFrags(modeKey).length + 1);
+  _adGetFrags(modeKey).push({ name: name, seq: seq });
+  toast('Added "' + name + '" (' + seq.length + ' bp)');
+  _clRender();
+}
+
+function _adGetFrags(modeKey) {
+  if (modeKey === 'gibson') return _cl.ad.gibson.fragments;
+  return [];
+}
+
+function _adFragMove(modeKey, idx, dir) {
+  var frags = _adGetFrags(modeKey);
+  var newIdx = idx + dir;
+  if (newIdx < 0 || newIdx >= frags.length) return;
+  var tmp = frags[idx];
+  frags[idx] = frags[newIdx];
+  frags[newIdx] = tmp;
+  _clRender();
+}
+
+function _adFragRemove(modeKey, idx) {
+  var frags = _adGetFrags(modeKey);
+  frags.splice(idx, 1);
+  _clRender();
+}
+
+// ── Gibson
+function _adGibsonSet(field, val) {
+  if (field === 'overlapLen') _cl.ad.gibson.overlapLen = parseInt(val, 10) || 25;
+  else if (field === 'tmTarget') _cl.ad.gibson.tmTarget = parseInt(val, 10) || 62;
+}
+
+function _adGibsonUseAsVec() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  _cl.ad.gibson.vector = {
+    name: _cl.parsed.name || 'vector',
+    seq: _cl.parsed.seq,
+    _sourceId: _cl.selected.type + '_' + _cl.selected.id,
+  };
+  toast('Vector set to "' + (_cl.parsed.name || 'loaded sequence') + '"');
+  _clRender();
+}
+
+function _adGibsonClearVec() {
+  _cl.ad.gibson.vector = null;
+  _cl.ad.gibson.result = null;
+  _clRender();
+}
+
+function _adGibsonAddLoaded() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var sel = _cl.lastSelection || { start: 0, end: 0 };
+  var seq = _cl.parsed.seq;
+  var name = _cl.parsed.name || 'fragment';
+  var selLen = _clSelLen(sel.start, sel.end);
+  if (selLen > 0 && selLen < seq.length) {
+    seq = _clGetSelSeq(sel.start, sel.end);
+    name = name + ' (' + sel.start + (sel.crossesOrigin ? '\u2192ori\u2192' : '-') + sel.end + ')';
+  }
+  _cl.ad.gibson.fragments.push({ name: name, seq: seq });
+  toast('Added "' + name + '" as fragment (' + seq.length + ' bp)');
+  _clRender();
+}
+
+function _adGibsonDesign() {
+  var g = _cl.ad.gibson;
+  // Build fragment list: vector first (if set), then inserts
+  var allFrags = [];
+  if (g.vector) {
+    allFrags.push({ name: g.vector.name, seq: g.vector.seq });
+  }
+  g.fragments.forEach(function(f) { allFrags.push({ name: f.name, seq: f.seq }); });
+
+  if (allFrags.length < 2) { toast('Need at least a vector + 1 insert, or 2+ fragments', true); return; }
+  g.designing = true; g.result = null; _clRender();
+  api('POST', '/api/cloning/design-gibson', {
+    fragments: allFrags, circular: true,
+    overlap_length: g.overlapLen, tm_target: g.tmTarget,
+  }).then(function(data) {
+    g.designing = false; g.result = data; _clRender();
+  }).catch(function(err) {
+    g.designing = false; toast('Gibson design failed: ' + (err.message || err), true); _clRender();
+  });
+}
+
+// ── Golden Gate (bin-based)
+function _adGGSet(field, val) {
+  _cl.ad.goldengate[field] = val;
+  if (field === 'enzyme') _clRender();
+}
+
+function _adGGAddBin() {
+  var idx = _cl.ad.goldengate.bins.length;
+  var defaults = ['Promoter', 'RBS', 'CDS', 'Terminator', 'Bin ' + (idx + 1)];
+  _cl.ad.goldengate.bins.push({ name: defaults[idx] || 'Bin ' + (idx + 1), fragments: [] });
+  _clRender();
+}
+
+function _adGGBinRename(bi, val) {
+  if (_cl.ad.goldengate.bins[bi]) _cl.ad.goldengate.bins[bi].name = val;
+}
+
+function _adGGBinMove(bi, dir) {
+  var bins = _cl.ad.goldengate.bins;
+  var ni = bi + dir;
+  if (ni < 0 || ni >= bins.length) return;
+  var tmp = bins[bi]; bins[bi] = bins[ni]; bins[ni] = tmp;
+  _clRender();
+}
+
+function _adGGBinRemove(bi) {
+  _cl.ad.goldengate.bins.splice(bi, 1);
+  _cl.ad._libPicker = null;
+  _clRender();
+}
+
+function _adGGFragFromLoaded(bi) {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  var sel = _cl.lastSelection || { start: 0, end: 0 };
+  var seq = _cl.parsed.seq;
+  var name = _cl.parsed.name || 'part';
+  var selLen = _clSelLen(sel.start, sel.end);
+  if (selLen > 0 && selLen < seq.length) {
+    seq = _clGetSelSeq(sel.start, sel.end);
+    name = name + ' (' + sel.start + (sel.crossesOrigin ? '\u2192ori\u2192' : '-') + sel.end + ')';
+  }
+  if (_cl.ad.goldengate.bins[bi]) {
+    _cl.ad.goldengate.bins[bi].fragments.push({ name: name, seq: seq });
+    toast('Added "' + name + '" to ' + _cl.ad.goldengate.bins[bi].name);
+  }
+  _clRender();
+}
+
+function _adGGFragPaste(bi) {
+  var raw = prompt('Paste DNA sequence:');
+  if (!raw) return;
+  var seq = _clCleanSeq(raw);
+  if (seq.length < 10) { toast('Sequence too short', true); return; }
+  var name = prompt('Part name:', 'Part ' + (_cl.ad.goldengate.bins[bi].fragments.length + 1));
+  if (!name) name = 'Part';
+  if (_cl.ad.goldengate.bins[bi]) {
+    _cl.ad.goldengate.bins[bi].fragments.push({ name: name, seq: seq });
+    toast('Added "' + name + '" to ' + _cl.ad.goldengate.bins[bi].name);
+  }
+  _clRender();
+}
+
+function _adGGFragRemove(bi, fi) {
+  if (_cl.ad.goldengate.bins[bi]) {
+    _cl.ad.goldengate.bins[bi].fragments.splice(fi, 1);
+    _clRender();
+  }
+}
+
+function _adGGLoadVec() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  _cl.ad.goldengate.vector = { name: _cl.parsed.name || 'vector', seq: _cl.parsed.seq };
+  toast('Vector set to "' + (_cl.parsed.name || 'loaded') + '"');
+  _clRender();
+}
+
+function _adGGClearVec() {
+  _cl.ad.goldengate.vector = null;
+  _clRender();
+}
+
+function _adGGDesign() {
+  var gg = _cl.ad.goldengate;
+  if (gg.bins.length < 1) { toast('Add at least 1 bin with parts', true); return; }
+  for (var i = 0; i < gg.bins.length; i++) {
+    if (gg.bins[i].fragments.length === 0) { toast('Bin "' + gg.bins[i].name + '" has no parts', true); return; }
+  }
+  gg.designing = true; gg.result = null; _clRender();
+  var binsData = gg.bins.map(function(b) {
+    return { name: b.name, fragments: b.fragments.map(function(f) { return { name: f.name, seq: f.seq }; }) };
+  });
+  var body = { bins: binsData, enzyme: gg.enzyme, circular: true, tm_target: 62 };
+  if (gg.vector) { body.vector = { name: gg.vector.name, seq: gg.vector.seq }; }
+  api('POST', '/api/cloning/design-goldengate', body).then(function(data) {
+    gg.designing = false; gg.result = data; _clRender();
+  }).catch(function(err) {
+    gg.designing = false; toast('Golden Gate design failed: ' + (err.message || err), true); _clRender();
+  });
+}
+
+// ── Digest-Ligate
+function _adDLSet(field, val) {
+  _cl.ad.digestligate[field] = val;
+}
+
+function _adDLLoadVector() {
+  if (!_cl.parsed) { toast('Load a sequence first', true); return; }
+  _cl.ad.digestligate.vectorSeq = _cl.parsed.seq;
+  _cl.ad.digestligate.vectorName = _cl.parsed.name || 'vector';
+  toast('Vector set to "' + (_cl.parsed.name || 'loaded sequence') + '"');
+  _clRender();
+}
+
+function _adDLDesign() {
+  var dl = _cl.ad.digestligate;
+  var vecSeq = _clCleanSeq(dl.vectorSeq);
+  var insSeq = _clCleanSeq(dl.insertSeq);
+  if (!vecSeq) { toast('Provide a vector sequence', true); return; }
+  if (!insSeq) { toast('Provide an insert sequence', true); return; }
+  if (!dl.enzyme1) { toast('Specify at least one enzyme', true); return; }
+  dl.designing = true; dl.result = null; _clRender();
+  api('POST', '/api/cloning/design-digest-ligate', {
+    vector: { name: dl.vectorName || 'vector', seq: vecSeq },
+    insert: { name: dl.insertName || 'insert', seq: insSeq },
+    enzyme1: dl.enzyme1.trim(), enzyme2: dl.enzyme2.trim() || null,
+    design_primers: true, tm_target: 62,
+  }).then(function(data) {
+    dl.designing = false; dl.result = data; _clRender();
+  }).catch(function(err) {
+    dl.designing = false; toast('Digest-Ligate design failed: ' + (err.message || err), true); _clRender();
+  });
+}
+
+// ── Toggle primer alternatives
+function _adToggleAlts(key) {
+  window._altExpanded[key] = !window._altExpanded[key];
+  _clRender();
+}
+
+// ── Copy all primers
+function _adCopyAllPrimers(mode) {
+  var result = null;
+  if (mode === 'gibson') result = _cl.ad.gibson.result;
+  else if (mode === 'goldengate') result = _cl.ad.goldengate.result;
+  else if (mode === 'digestligate') result = _cl.ad.digestligate.result;
+  if (!result || !result.primers || !result.primers.length) { toast('No primers to copy', true); return; }
+  var text = result.primers.map(function(p) { return (p.name || 'primer') + ': ' + p.full_seq; }).join('\n');
+  navigator.clipboard.writeText(text).then(function() { toast('All primers copied (' + result.primers.length + ')'); });
+}
+
+// ── Copy individual assembly primer
+function _adCopyPrimer(key) {
+  // key format: 'ad-fwd-0', 'ad-rev-1', 'ad-dl-0', etc.
+  var parts = key.split('-');
+  var mode = parts[0]; // 'ad'
+  var dir = parts[1];  // 'fwd', 'rev', 'dl'
+  var idx = parseInt(parts[2], 10);
+  var result = null;
+  if (_cl.ad.mode === 'gibson') result = _cl.ad.gibson.result;
+  else if (_cl.ad.mode === 'goldengate') result = _cl.ad.goldengate.result;
+  else if (_cl.ad.mode === 'digestligate') result = _cl.ad.digestligate.result;
+  if (!result || !result.primers) return;
+
+  // For junction-based modes, map to primer index
+  var primerIdx = dir === 'dl' ? idx : (dir === 'fwd' ? idx * 2 : idx * 2 + 1);
+  if (result.primers[primerIdx]) {
+    navigator.clipboard.writeText(result.primers[primerIdx].full_seq).then(function() { toast('Primer copied'); });
+  }
+}
+
+/* ── main entry ────────────────────────────────────────────── */
+async function renderCloning(el) {
+  _clEl = el;
+  el.innerHTML = '<div style="text-align:center;padding:3rem;color:#8a7f72;"><div style="font-size:1.4rem;margin-bottom:.5rem;">\u23f3</div>Loading Cloning Workbench\u2026</div>';
+  await Promise.all([_clLoadSequences(), _clLoadConfig(), _loadSeqVizDeps()]);
+  _clRender();
+}
+
+// ── expose globals
+window._clSelectSequence = _clSelectSequence;
+window._clSetTab = _clSetTab;
+window._clToggleView = _clToggleView;
+window._clFilterChange = _clFilterChange;
+window._clOcFilterChange = _clOcFilterChange;
+window._clSendToOC = _clSendToOC;
+window._clToggleSidebar = _clToggleSidebar;
+window._clToggleOcSidebar = _clToggleOcSidebar;
+window._clToggleFeatures = _clToggleFeatures;
+window._clReindex = _clReindex;
+window._clSearchToggle = _clSearchToggle;
+window._clSearchRun = _clSearchRun;
+window._clSearchNext = _clSearchNext;
+window._clSearchPrev = _clSearchPrev;
+window._clFeatColor = _clFeatColor;
+window._clFeatDir = _clFeatDir;
+window._clFeatEdit = _clFeatEdit;
+window._clFeatAdd = _clFeatAdd;
+window._clFeatRemove = _clFeatRemove;
+window._clFeatModalClose = _clFeatModalClose;
+window._clFeatModalSave = _clFeatModalSave;
+window._clFeatSetDir = _clFeatSetDir;
+window._clFeatRevert = _clFeatRevert;
+window._clFeatSave = _clFeatSave;
+window._pdToggle = _pdToggle;
+window._pdSetMode = _pdSetMode;
+window._pdCustomSet = _pdCustomSet;
+window._pdCustomDesign = _pdCustomDesign;
+window._pdPcrSet = _pdPcrSet;
+window._pdPcrDesign = _pdPcrDesign;
+window._pdSeqSet = _pdSeqSet;
+window._pdSeqDesign = _pdSeqDesign;
+window._pdKldSet = _pdKldSet;
+window._pdKldDesign = _pdKldDesign;
+window._pdKldSelectPrimer = _pdKldSelectPrimer;
+window._pdCopy = _pdCopy;
+window._pdCopyBoth = _pdCopyBoth;
+window._pdSavePrimers = _pdSavePrimers;
+window._pdGenerateProduct = _pdGenerateProduct;
+window._pdSaveProduct = _pdSaveProduct;
+window._pdExitProductPreview = _pdExitProductPreview;
+window._saToggle = _saToggle;
+window._saSetMode = _saSetMode;
+window._saOrfSetMin = _saOrfSetMin;
+window._saOrfRun = _saOrfRun;
+window._saOrfToggleMap = _saOrfToggleMap;
+window._saOrfExpand = _saOrfExpand;
+window._saOrfCopyProt = _saOrfCopyProt;
+window._saOrfCopyDna = _saOrfCopyDna;
+window._saOrfToggleOne = _saOrfToggleOne;
+window._saOrfAddFeature = _saOrfAddFeature;
+window._clAddAsFeature = _clAddAsFeature;
+window._saReSetEnz = _saReSetEnz;
+window._saReRun = _saReRun;
+window._saReToggleMap = _saReToggleMap;
+window._saReFilter = _saReFilter;
+window._saToolsInput = _saToolsInput;
+window._saToolsRun = _saToolsRun;
+window._saToolsTm = _saToolsTm;
+window._saToolsCopy = _saToolsCopy;
+window._saDigestSetEnz = _saDigestSetEnz;
+window._saDigestQuickAdd = _saDigestQuickAdd;
+window._saDigestRun = _saDigestRun;
+window._saBlastSetSeq = _saBlastSetSeq;
+window._saBlastSet = _saBlastSet;
+window._saBlastExpand = _saBlastExpand;
+window._saBlastRun = _saBlastRun;
+window._saScanRun = _saScanRun;
+window._saScanToggleMap = _saScanToggleMap;
+window._saScanFilter = _saScanFilter;
+window._saScanAddFeature = _saScanAddFeature;
+window._adToggle = _adToggle;
+window._adSetMode = _adSetMode;
+window._adOpenLib = _adOpenLib;
+window._adCloseLib = _adCloseLib;
+window._adLibFilter = _adLibFilter;
+window._adLibPick = _adLibPick;
+window._adDLClear = _adDLClear;
+window._adAddFromLoaded = _adAddFromLoaded;
+window._adAddPaste = _adAddPaste;
+window._adFragMove = _adFragMove;
+window._adFragRemove = _adFragRemove;
+window._adGibsonSet = _adGibsonSet;
+window._adGibsonDesign = _adGibsonDesign;
+window._adGibsonUseAsVec = _adGibsonUseAsVec;
+window._adGibsonClearVec = _adGibsonClearVec;
+window._adGibsonAddLoaded = _adGibsonAddLoaded;
+window._adGGSet = _adGGSet;
+window._adGGAddBin = _adGGAddBin;
+window._adGGBinRename = _adGGBinRename;
+window._adGGBinMove = _adGGBinMove;
+window._adGGBinRemove = _adGGBinRemove;
+window._adGGFragFromLoaded = _adGGFragFromLoaded;
+window._adGGFragPaste = _adGGFragPaste;
+window._adGGFragRemove = _adGGFragRemove;
+window._adGGLoadVec = _adGGLoadVec;
+window._adGGClearVec = _adGGClearVec;
+window._adGGDesign = _adGGDesign;
+window._adDLSet = _adDLSet;
+window._adDLLoadVector = _adDLLoadVector;
+window._adDLDesign = _adDLDesign;
+window._adCopyAllPrimers = _adCopyAllPrimers;
+window._adToggleAlts = _adToggleAlts;
+window._adCopyPrimer = _adCopyPrimer;
+
+registerView('cloning', renderCloning);
