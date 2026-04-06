@@ -1162,8 +1162,8 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData, sele
   h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + displayPrimer.length + 'bp \u00b7 Tm ' + displayPrimer.tm + '\u00b0C \u00b7 GC ' + displayPrimer.gc_percent + '%</span>';
   // Show dimer/hairpin badges if data is present
   if (typeof displayPrimer.homodimer_dg === 'number') {
-    var dimerColor = displayPrimer.homodimer_dg < -9.5 ? '#c0392b' : displayPrimer.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
-    h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (displayPrimer.homodimer_dg < -7 ? '#fde8e8' : displayPrimer.homodimer_dg < -5 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + displayPrimer.homodimer_dg + '</span>';
+    var dimerColor = displayPrimer.homodimer_dg < -12 ? '#c0392b' : displayPrimer.homodimer_dg < -9 ? '#e67e22' : '#5b7a5e';
+    h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (displayPrimer.homodimer_dg < -12 ? '#fde8e8' : displayPrimer.homodimer_dg < -9 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + displayPrimer.homodimer_dg + '</span>';
   }
   if (displayPrimer.hairpin) {
     h += '<span style="font-size:.66rem;margin-left:.3rem;padding:.1rem .35rem;border-radius:3px;background:#fde8e8;color:#c0392b;">hairpin</span>';
@@ -1211,7 +1211,7 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData, sele
       allOptions.forEach(function(opt, oi) {
         var isRec = (oi === 0);
         var isSel = (oi === selIdx);
-        var dimerC = opt.homodimer_dg < -7 ? '#c0392b' : opt.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
+        var dimerC = opt.homodimer_dg < -12 ? '#c0392b' : opt.homodimer_dg < -9 ? '#e67e22' : '#5b7a5e';
         var rowBg = isSel ? 'background:#dbeafe;' : isRec ? 'background:#eef4ee;' : '';
         var rowCursor = selectInfo ? 'cursor:pointer;' : '';
         var rowClick = selectInfo ? ' onclick="_pdKldSelectPrimer(\x27' + selectInfo.direction + '\x27,' + oi + ')"' : '';
@@ -1230,7 +1230,7 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData, sele
         h += '</tr>';
       });
       h += '</tbody></table>';
-      h += '<div style="font-size:.64rem;color:#8a7f72;margin-top:.3rem;">' + (selectInfo ? '\u25C9 = selected on map \u00b7 ' : '') + '\u2605 = recommended (lowest score is best) \u00b7 Dimer \u0394G: green > -5, amber -5 to -7, red < -7 kcal/mol</div>';
+      h += '<div style="font-size:.64rem;color:#8a7f72;margin-top:.3rem;">' + (selectInfo ? '\u25C9 = selected on map \u00b7 ' : '') + '\u2605 = recommended (lowest score is best) \u00b7 Dimer \u0394G: green > -9, amber -9 to -12, red < -12 kcal/mol</div>';
       h += '</div>';
     }
     h += '</div>';
