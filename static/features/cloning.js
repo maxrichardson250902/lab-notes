@@ -590,7 +590,20 @@ function _clRenderViewerTab() {
       h += '<a href="/api/' + esc(_cl.selected.type) + 's/' + _cl.selected.id + '/gb" download style="padding:.25rem .5rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;text-decoration:none;">\u2b07 .gb</a>';
       if ((_cl.parsed.topology || '').toLowerCase() === 'circular') {
         h += '<button onclick="_clReindex()" style="padding:.25rem .5rem;font-size:.72rem;color:#e67e22;border:1px solid #e67e22;border-radius:4px;background:#fff;cursor:pointer;" title="Set a new origin (position 0) for this circular sequence">\ud83d\udd04 Reindex</button>';
+      var isCircular = (_cl.parsed.topology || '').toLowerCase().includes('circular');
+
+      if (!_cl.pd._viewingProduct) {
+        h += '<a href="/api/' + esc(_cl.selected.type) + 's/' + _cl.selected.id + '/gb" download style="padding:.25rem .5rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;text-decoration:none;">\u2b07 .gb</a>';
+  
+      // Show reindex if it looks circular OR if topology is missing (fallback)
+      if (isCircular || !_cl.parsed.topology) {
+        h += '<button onclick="_clReindex()" style="padding:.25rem .5rem;font-size:.72rem;color:#e67e22;border:1px solid #e67e22;border-radius:4px;background:#fff;cursor:pointer;margin:0 .2rem;" title="Set a new origin (position 0)">\ud83d\udd04 Reindex</button>';
       }
+      
+      h += '<button onclick="_clSendToOC()" style="padding:.25rem .5rem;font-size:.72rem;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;">\ud83d\udce4 Send to OC</button>';
+    }
+          }
+          
       h += '<button onclick="_clSendToOC()" style="padding:.25rem .5rem;font-size:.72rem;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;">\ud83d\udce4 Send to OC</button>';
     }
     h += '<button onclick="_clSearchToggle()" style="padding:.25rem .5rem;font-size:.72rem;border:1px solid ' + (_cl.search.open ? '#5b7a5e' : '#d5cec0') + ';border-radius:4px;background:' + (_cl.search.open ? '#5b7a5e' : '#faf8f4') + ';color:' + (_cl.search.open ? '#fff' : '#8a7f72') + ';cursor:pointer;" title="Search sequence (fwd + RC)">\ud83d\udd0d</button>';
@@ -615,6 +628,7 @@ function _clRenderViewerTab() {
       h += '<button onclick="_clSearchToggle()" style="padding:.15rem .35rem;font-size:.72rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#8a7f72;cursor:pointer;">\u2715</button>';
       h += '</div>';
     }
+    
 
     // ── Product preview banner
     if (_cl.pd._viewingProduct) {
