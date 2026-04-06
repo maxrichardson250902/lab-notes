@@ -557,60 +557,52 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                 print(f"[KLD]   split {si}/{len(split_points)} SKIP (tail too long: fwd_tail={len(fwd_tail)} rev_tail={len(rev_tail)})", flush=True)
                 continue
 
-            # Pre-compute forward candidates for each possible end position
+            # Pre-compute forward candidates (LIGHTWEIGHT — Tm/GC only, no dimer/hairpin)
             fwd_cache = {}
             for pos in positions:
                 cands = _generate_primer_candidates(
                     template_seq, pos, "forward", fwd_tail, tm_target,
-                    min_len=12, max_len=f_max_ann, max_total=max_len)
+                    min_len=12, max_len=f_max_ann, max_total=max_len, lightweight=True)
                 search_stats["candidates_generated"] += len(cands)
                 if cands:
                     fwd_cache[pos] = cands
 
             t_fwd = time.time()
 
-            # Pre-compute reverse candidates for each possible start position
+            # Pre-compute reverse candidates (LIGHTWEIGHT)
             rev_cache = {}
             for pos in positions:
                 cands = _generate_primer_candidates(
                     template_seq, pos, "reverse", rev_tail, tm_target,
-                    min_len=12, max_len=r_max_ann, max_total=max_len)
+                    min_len=12, max_len=r_max_ann, max_total=max_len, lightweight=True)
                 search_stats["candidates_generated"] += len(cands)
                 if cands:
                     rev_cache[pos] = cands
 
             t_rev = time.time()
 
-            # Score all valid (s, e) pairs from cached results
+            # Score all valid (s, e) pairs from cached results (Tm-only scoring)
             pairs_this_split = 0
             for s in positions:
                 if s not in rev_cache:
                     continue
-                r_cands = rev_cache[s]
-                r_best = r_cands[0]
+                r_best = rev_cache[s][0]
                 for e in positions:
                     if e < s:
                         continue
                     if e not in fwd_cache:
                         continue
-                    f_cands = fwd_cache[e]
-                    f_best = f_cands[0]
+                    f_best = fwd_cache[e][0]
 
                     tm_err = abs(f_best['tm'] - tm_target) + abs(r_best['tm'] - tm_target)
                     tm_delta = abs(f_best['tm'] - r_best['tm'])
-                    ss_penalty = 0
-                    if f_best.get('hairpin') or r_best.get('hairpin'):
-                        ss_penalty += 25
-                    if f_best.get('homodimer_dg', 0) < -8.0:
-                        ss_penalty += 15
-                    score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
+                    score = -(tm_err * 2) - (tm_delta * 4)
                     search_stats["pairs_scored"] += 1
                     pairs_this_split += 1
 
                     if score > best_overall_score:
                         best_overall_score = score
                         best_result = {
-                            "fwd_all": f_cands, "rev_all": r_cands,
                             "actual_start": s, "actual_end": e,
                             "split": sp,
                         }
@@ -621,8 +613,24 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                   f"scoring={t_score-t_rev:.2f}s  pairs={pairs_this_split}  "
                   f"total_elapsed={t_score-t0:.1f}s", flush=True)
 
-        print(f"[KLD] optimize done in {time.time()-t0:.2f}s  "
+        print(f"[KLD] scan done in {time.time()-t0:.2f}s  "
               f"candidates={search_stats['candidates_generated']}  pairs_scored={search_stats['pairs_scored']}", flush=True)
+
+        # ── Re-generate the winning combination with FULL thermodynamic analysis
+        if best_result:
+            t_full = time.time()
+            win_sp = best_result["split"]
+            win_fwd_tail = insert_seq[win_sp:]
+            win_rev_tail = _reverse_complement(insert_seq[:win_sp])
+            win_f_max = max_len - len(win_fwd_tail)
+            win_r_max = max_len - len(win_rev_tail)
+            best_result["fwd_all"] = _generate_primer_candidates(
+                template_seq, best_result["actual_end"], "forward", win_fwd_tail, tm_target,
+                min_len=12, max_len=win_f_max, max_total=max_len, lightweight=False)
+            best_result["rev_all"] = _generate_primer_candidates(
+                template_seq, best_result["actual_start"], "reverse", win_rev_tail, tm_target,
+                min_len=12, max_len=win_r_max, max_total=max_len, lightweight=False)
+            print(f"[KLD] full analysis for winner in {time.time()-t_full:.3f}s", flush=True)
 
     if not best_result:
         raise HTTPException(400, "No viable primers found in this range.")
@@ -1666,10 +1674,13 @@ def _calc_homodimer_dg(seq: str, temp_c: float = 60.0) -> float:
 
 def _generate_primer_candidates(template: str, pos: int, direction: str, tail: str,
                                  tm_target: float, min_len: int = 18, max_len: int = 40,
-                                 max_total: int = 60) -> list:
+                                 max_total: int = 60, lightweight: bool = False) -> list:
     """Generate multiple primer candidates with different annealing lengths.
     Returns a list of candidate dicts sorted by score (best first), each containing
-    full primer properties including dimer/hairpin/ΔG analysis."""
+    full primer properties including dimer/hairpin/ΔG analysis.
+    
+    lightweight=True skips expensive homodimer/hairpin/quality analysis — used for
+    fast scanning in the optimize loop.  Only Tm and GC are computed."""
     tpl_len = len(template)
     candidates = []
 
@@ -1691,34 +1702,49 @@ def _generate_primer_candidates(template: str, pos: int, direction: str, tail: s
         full_seq = tail + anneal_seq
         tm = _calc_tm(anneal_seq)
         gc = round(_gc_content(full_seq) * 100, 1)
-        dg = _calc_delta_g(anneal_seq, temp_c=tm if tm > 0 else 60.0)
-        homodimer_dg = _calc_homodimer_dg(full_seq, temp_c=60.0)
-        hairpin = _has_hairpin(full_seq)
-        self_dimer = _has_self_dimer(full_seq)
-        quality = _check_primer_quality(anneal_seq, tm)
 
         # Score: lower is better
-        # Penalise Tm deviation, strong homodimers, hairpins, poor GC
         tm_penalty = abs(tm - tm_target) * 2.0
-        dimer_penalty = max(0, -homodimer_dg - 5.0) * 3.0  # penalise ΔG < -5 kcal/mol
-        hairpin_penalty = 5.0 if hairpin else 0.0
-        gc_penalty = max(0, abs(gc - 50) - 10) * 0.5  # penalise GC outside 40-60
-        score = tm_penalty + dimer_penalty + hairpin_penalty + gc_penalty
+        gc_penalty = max(0, abs(gc - 50) - 10) * 0.5
 
-        candidates.append({
-            "full_seq": full_seq,
-            "tail": tail,
-            "annealing": anneal_seq,
-            "tm": tm,
-            "length": len(full_seq),
-            "gc_percent": gc,
-            "delta_g": dg,
-            "homodimer_dg": homodimer_dg,
-            "hairpin": hairpin,
-            "self_dimer": self_dimer,
-            "quality": quality,
-            "score": round(score, 2),
-        })
+        if lightweight:
+            # Fast path: skip expensive O(L²) analysis
+            score = tm_penalty + gc_penalty
+            candidates.append({
+                "full_seq": full_seq,
+                "tail": tail,
+                "annealing": anneal_seq,
+                "tm": tm,
+                "length": len(full_seq),
+                "gc_percent": gc,
+                "score": round(score, 2),
+            })
+        else:
+            # Full path: complete thermodynamic analysis
+            dg = _calc_delta_g(anneal_seq, temp_c=tm if tm > 0 else 60.0)
+            homodimer_dg = _calc_homodimer_dg(full_seq, temp_c=60.0)
+            hairpin = _has_hairpin(full_seq)
+            self_dimer = _has_self_dimer(full_seq)
+            quality = _check_primer_quality(anneal_seq, tm)
+
+            dimer_penalty = max(0, -homodimer_dg - 5.0) * 3.0
+            hairpin_penalty = 5.0 if hairpin else 0.0
+            score = tm_penalty + dimer_penalty + hairpin_penalty + gc_penalty
+
+            candidates.append({
+                "full_seq": full_seq,
+                "tail": tail,
+                "annealing": anneal_seq,
+                "tm": tm,
+                "length": len(full_seq),
+                "gc_percent": gc,
+                "delta_g": dg,
+                "homodimer_dg": homodimer_dg,
+                "hairpin": hairpin,
+                "self_dimer": self_dimer,
+                "quality": quality,
+                "score": round(score, 2),
+            })
 
     # Sort by score (best first)
     candidates.sort(key=lambda c: c["score"])
