@@ -39,7 +39,8 @@ var _cl = {
         endPos: '', 
         insertSeq: '', 
         tmTarget: 62, 
-        optimize: false, // New field
+        maxLen: 60,
+        optimize: false,
         result: null, 
         designing: false 
     },
@@ -182,17 +183,29 @@ function _clRenderSeqViz() {
 
   // Add markers based on current primer design mode
   if (pd.mode === 'kld') {
-    var insPos = parseInt(pd.kld.insertionPos, 10);
-    if (!isNaN(insPos) && insPos >= 0 && insPos <= seqLen) {
-      annotations.push({ name: '\u2702 Insert here', start: Math.max(0, insPos - 1), end: Math.min(seqLen, insPos + 1), direction: 1, color: '#e74c3c' });
+    var kldStart = parseInt(pd.kld.startPos, 10);
+    var kldEnd = parseInt(pd.kld.endPos, 10);
+    if (isNaN(kldEnd)) kldEnd = kldStart;
+    if (!isNaN(kldStart) && kldStart >= 0 && kldStart <= seqLen) {
+      if (kldEnd > kldStart) {
+        // Range deletion/replacement — highlight the region being removed
+        annotations.push({ name: '\u2702 Delete region', start: kldStart, end: Math.min(kldEnd, seqLen), direction: 1, color: '#e74c3c' });
+      } else {
+        // Pure insertion point
+        annotations.push({ name: '\u2702 Insert here', start: Math.max(0, kldStart - 1), end: Math.min(seqLen, kldStart + 1), direction: 1, color: '#e74c3c' });
+      }
     }
     if (pd.kld.result) {
       var r = pd.kld.result;
-      if (!isNaN(insPos)) {
-        var fEnd = (insPos + r.forward.annealing.length) % seqLen;
-        annotations.push({ name: 'Fwd anneal', start: insPos, end: fEnd > insPos ? fEnd : fEnd || seqLen, direction: 1, color: '#2980b9' });
-        var rStart = ((insPos - r.reverse.annealing.length) % seqLen + seqLen) % seqLen;
-        annotations.push({ name: 'Rev anneal', start: rStart, end: insPos, direction: -1, color: '#8e44ad' });
+      var rStart = parseInt(r.start_used, 10);
+      var rEnd = parseInt(r.end_used, 10);
+      if (!isNaN(rEnd)) {
+        var fAnnEnd = (rEnd + r.forward.annealing.length) % seqLen;
+        annotations.push({ name: 'Fwd anneal', start: rEnd, end: fAnnEnd > rEnd ? fAnnEnd : fAnnEnd || seqLen, direction: 1, color: '#2980b9' });
+      }
+      if (!isNaN(rStart)) {
+        var rAnnStart = ((rStart - r.reverse.annealing.length) % seqLen + seqLen) % seqLen;
+        annotations.push({ name: 'Rev anneal', start: rAnnStart, end: rStart, direction: -1, color: '#8e44ad' });
       }
     }
   } else if (pd.mode === 'custom' && pd.custom.result) {
@@ -357,10 +370,21 @@ function _clOnSeqVizSelection(sel) {
   if (_cl.pd.expanded) {
     var mode = _cl.pd.mode;
     if (mode === 'kld') {
-      var pos = isSingleClick ? start : start;
-      _cl.pd.kld.insertionPos = String(pos);
-      _clSetInputVal('cl-pd-kld-insertionPos', pos);
-      toast('Insertion point set to ' + pos, false);
+      if (isSingleClick) {
+        // Single click: set both start and end to same position (pure insertion)
+        _cl.pd.kld.startPos = String(start);
+        _cl.pd.kld.endPos = String(start);
+        _clSetInputVal('cl-pd-kld-startPos', start);
+        _clSetInputVal('cl-pd-kld-endPos', start);
+        toast('Insertion point set to ' + start, false);
+      } else {
+        // Drag selection: set start/end range (deletion/replacement)
+        _cl.pd.kld.startPos = String(start);
+        _cl.pd.kld.endPos = String(end);
+        _clSetInputVal('cl-pd-kld-startPos', start);
+        _clSetInputVal('cl-pd-kld-endPos', end);
+        toast('KLD range: ' + selText, false);
+      }
       filled = true;
     } else if (mode === 'custom' && !isSingleClick) {
       _cl.pd.custom.start = String(start);
@@ -943,10 +967,10 @@ h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Li
   // Row 1: Start and End Positions
   h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
   h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Start Position</label>';
-  h += '  <input type="number" min="0" value="' + esc(String(_cl.pd.kld.startPos || '')) + '" oninput="_pdKldSet(\x27startPos\x27,this.value)" placeholder="e.g. 100" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:monospace;" /></div>';
+  h += '  <input id="cl-pd-kld-startPos" type="number" min="0" value="' + esc(String(_cl.pd.kld.startPos || '')) + '" oninput="_pdKldSet(\x27startPos\x27,this.value)" placeholder="e.g. 100" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:monospace;" /></div>';
   
   h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">End Position</label>';
-  h += '  <input type="number" min="0" value="' + esc(String(_cl.pd.kld.endPos || '')) + '" oninput="_pdKldSet(\x27endPos\x27,this.value)" placeholder="Same as start for insertion" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:monospace;" /></div>';
+  h += '  <input id="cl-pd-kld-endPos" type="number" min="0" value="' + esc(String(_cl.pd.kld.endPos || '')) + '" oninput="_pdKldSet(\x27endPos\x27,this.value)" placeholder="Same as start for insertion" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:monospace;" /></div>';
   h += '</div>';
 
   // Row 2: Optimization toggle
@@ -991,9 +1015,9 @@ function _clRenderKLDResult(r) {
     h += '</div>';
   }
 
-  // Forward
-  var kldStart = parseInt(_cl.pd.kld.start_used || _cl.pd.kld.startPos, 10) || 0;
-  var kldEnd = parseInt(_cl.pd.kld.end_used || _cl.pd.kld.endPos, 10) || 0;
+  // Use start_used/end_used from the API response (the actual positions the algorithm chose)
+  var kldStart = parseInt(r.start_used, 10) || parseInt(_cl.pd.kld.startPos, 10) || 0;
+  var kldEnd = parseInt(r.end_used, 10) || parseInt(_cl.pd.kld.endPos, 10) || 0;
   var kldSeqLen = _cl.parsed ? _cl.parsed.length : 99999;
   
   h += _clRenderTailedPrimer('Forward', r.forward, '#2980b9', 'kld-fwd', {
@@ -1013,18 +1037,22 @@ function _clRenderKLDResult(r) {
   });
 
   h += '<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;padding:.5rem .7rem;background:#faf8f4;border:1px solid #e8e2d8;border-radius:5px;margin-top:.5rem;">';
-  h += '<span style="font-size:.78rem;color:#8a7f72;">Split: <strong style="color:#4a4139;">pos ' + r.split_position + '/' + r.insert_length + '</strong></span>';
-  h += '<span style="font-size:.78rem;color:#8a7f72;">GC score: <strong style="color:#4a4139;">' + r.split_gc_score.toFixed(2) + '</strong></span>';
+  if (r.insert_length > 0) {
+    h += '<span style="font-size:.78rem;color:#8a7f72;">Split: <strong style="color:#4a4139;">pos ' + (r.split_position || r.insert_split || 0) + '/' + (r.insert_length || 0) + '</strong></span>';
+    h += '<span style="font-size:.78rem;color:#8a7f72;">GC score: <strong style="color:#4a4139;">' + (r.split_gc_score != null ? r.split_gc_score.toFixed(2) : '—') + '</strong></span>';
+  }
+  if (kldEnd > kldStart) {
+    h += '<span style="font-size:.78rem;color:#8a7f72;">Deleted: <strong style="color:#e74c3c;">' + (kldEnd - kldStart) + ' bp</strong></span>';
+  }
   h += '<span style="font-size:.78rem;color:#8a7f72;">Product: <strong style="color:#4a4139;">' + r.product_length.toLocaleString() + ' bp</strong></span>';
   h += '<button onclick="_pdCopyBoth(\x27kld\x27)" style="margin-left:auto;padding:.3rem .6rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:transparent;cursor:pointer;">\ud83d\udccb Copy Both</button>';
   h += '<button onclick="_pdGenerateProduct(\x27kld\x27)" style="padding:.3rem .6rem;font-size:.72rem;background:#8E44AD;color:#fff;border:none;border-radius:4px;cursor:pointer;" title="Generate circularised KLD product as new .gb plasmid">\ud83d\udd04 Generate Circular Product</button>';
   h += '</div>';
 
-  var insDesc = _cl.pd.kld.insertSeq.substring(0, 20);
-  if (_cl.pd.kld.insertSeq.length > 20) insDesc += '\u2026';
+  var posLabel = kldEnd > kldStart ? kldStart + '-' + kldEnd : String(kldStart);
   h += _clRenderSaveBtn([
-    { seq: r.forward.full_seq, label: 'FWD KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at pos ' + (_cl.pd.kld.insertionPos || '?') },
-    { seq: r.reverse.full_seq, label: 'REV KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at pos ' + (_cl.pd.kld.insertionPos || '?') },
+    { seq: r.forward.full_seq, label: 'FWD KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at ' + posLabel },
+    { seq: r.reverse.full_seq, label: 'REV KLD into ' + (_cl.parsed ? _cl.parsed.name : 'plasmid') + ' at ' + posLabel },
   ]);
   h += '</div>';
   return h;
@@ -2544,9 +2572,11 @@ function _pdGenerateProduct(mode) {
   };
 
   if (mode === 'kld' && _cl.pd.kld.result) {
-    baseBody.insertion_pos = parseInt(_cl.pd.kld.insertionPos, 10);
+    var kldResult = _cl.pd.kld.result;
+    baseBody.start_pos = parseInt(kldResult.start_used, 10) || parseInt(_cl.pd.kld.startPos, 10);
+    baseBody.end_pos = parseInt(kldResult.end_used, 10) || parseInt(_cl.pd.kld.endPos, 10);
     baseBody.insert_seq = _clCleanSeq(_cl.pd.kld.insertSeq);
-    baseBody.insert_label = _cl.pd.kld.insertSeq.length > 20 ? _cl.pd.kld.insertSeq.substring(0, 20) : _cl.pd.kld.insertSeq;
+    baseBody.insert_label = _cl.pd.kld.insertSeq.length > 20 ? _cl.pd.kld.insertSeq.substring(0, 20) : (_cl.pd.kld.insertSeq || 'insert');
   } else if (mode === 'pcr' && _cl.pd.pcr.result) {
     baseBody.target_start = parseInt(_cl.pd.pcr.targetStart, 10);
     baseBody.target_end = parseInt(_cl.pd.pcr.targetEnd, 10);
