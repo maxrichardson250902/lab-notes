@@ -1637,7 +1637,17 @@ def _ensure_gc_clamp(seq, max_len=60):
 
 
 def _has_hairpin(seq, min_stem=4, min_loop=3):
-    """Check whether seq can form a hairpin (stem-loop)."""
+    """Check whether seq can form a hairpin (stem-loop).
+    Uses primer3 for accuracy, falls back to pattern search."""
+    try:
+        import primer3
+        result = primer3.calc_hairpin(
+            seq.upper(), mv_conc=50, dv_conc=0, dntp_conc=0, dna_conc=250, temp_c=25)
+        # Consider it a hairpin if ΔG < -2 kcal/mol (stable enough to form)
+        return result.structure_found and result.dg < -2000  # cal/mol
+    except Exception:
+        pass
+    # Fallback
     n = len(seq)
     for stem_len in range(min_stem, min(8, n // 2)):
         for i in range(n - 2 * stem_len - min_loop + 1):
@@ -1660,49 +1670,46 @@ def _has_self_dimer(seq, min_match=4):
     return False
 
 def _calc_homodimer_dg(seq: str, temp_c: float = 25.0) -> float:
-    """Calculate the most stable self-dimer ΔG by sliding the primer against its own RC.
-    Uses SantaLucia 1998 nearest-neighbor parameters. Each contiguous stretch of
-    matched base pairs is scored independently with initiation penalties.
-    Returns the most negative (most stable) ΔG found across all alignments."""
+    """Calculate self-dimer ΔG using primer3 (same engine as IDT OligoAnalyzer).
+    Falls back to NN sliding-window if primer3 is unavailable."""
     seq = seq.upper()
+    if len(seq) < 4:
+        return 0.0
+    try:
+        import primer3
+        result = primer3.calc_homodimer(
+            seq, mv_conc=50, dv_conc=0, dntp_conc=0, dna_conc=250, temp_c=temp_c)
+        return round(result.dg / 1000.0, 2)  # primer3 returns cal/mol
+    except Exception:
+        pass
+
+    # Fallback: NN sliding-window (less accurate, ignores mismatches)
     rc = _reverse_complement(seq)
     n = len(seq)
-    if n < 4:
-        return 0.0
-
-    best_dg = 0.0  # 0 = no interaction; more negative = worse dimer
+    best_dg = 0.0
     temp_k = temp_c + 273.15
+    INIT_DH = 0.2
+    INIT_DS = -5.7
 
-    # Initiation parameters (SantaLucia 1998)
-    # Each independent duplex stretch gets an initiation cost
-    INIT_DH = 0.2   # kcal/mol  (average of GC and AT init)
-    INIT_DS = -5.7   # cal/K/mol (average of GC and AT init)
-
-    # Slide rc across seq in all possible alignments (at least 4bp overlap)
     for offset in range(-(n - 4), n - 3):
         if offset < 0:
-            s_start = 0
-            r_start = -offset
+            s_start, r_start = 0, -offset
         else:
-            s_start = offset
-            r_start = 0
+            s_start, r_start = offset, 0
         overlap_len = min(n - s_start, n - r_start)
         if overlap_len < 4:
             continue
 
-        # Find contiguous stretches of matched dinucleotides
-        # A "stretch" breaks whenever a position doesn't match
         stretch_dh = 0.0
         stretch_ds = 0.0
         stretch_len = 0
-        alignment_best_dg = 0.0
+        alignment_total_dg = 0.0
 
         for i in range(overlap_len - 1):
             sb = seq[s_start + i]
             rb = rc[r_start + i]
             sb2 = seq[s_start + i + 1]
             rb2 = rc[r_start + i + 1]
-
             if sb == rb and sb2 == rb2:
                 pair = sb + sb2
                 if pair in NN_THERMO:
@@ -1711,27 +1718,21 @@ def _calc_homodimer_dg(seq: str, temp_c: float = 25.0) -> float:
                     stretch_ds += s
                 stretch_len += 1
             else:
-                # Mismatch — score the completed stretch (if any)
-                if stretch_len >= 2:
-                    total_dh = stretch_dh + INIT_DH
-                    total_ds = stretch_ds + INIT_DS
-                    dg = total_dh - (temp_k * total_ds / 1000.0)
-                    if dg < alignment_best_dg:
-                        alignment_best_dg = dg
+                if stretch_len >= 1:
+                    dg = (stretch_dh + INIT_DH) - (temp_k * (stretch_ds + INIT_DS) / 1000.0)
+                    if dg < 0:
+                        alignment_total_dg += dg
                 stretch_dh = 0.0
                 stretch_ds = 0.0
                 stretch_len = 0
 
-        # Score any remaining stretch at end of overlap
-        if stretch_len >= 2:
-            total_dh = stretch_dh + INIT_DH
-            total_ds = stretch_ds + INIT_DS
-            dg = total_dh - (temp_k * total_ds / 1000.0)
-            if dg < alignment_best_dg:
-                alignment_best_dg = dg
+        if stretch_len >= 1:
+            dg = (stretch_dh + INIT_DH) - (temp_k * (stretch_ds + INIT_DS) / 1000.0)
+            if dg < 0:
+                alignment_total_dg += dg
 
-        if alignment_best_dg < best_dg:
-            best_dg = alignment_best_dg
+        if alignment_total_dg < best_dg:
+            best_dg = alignment_total_dg
 
     return round(best_dg, 2)
 
