@@ -41,6 +41,7 @@ var _cl = {
         tmTarget: 62, 
         maxLen: 60,
         optimize: false,
+        exhaustive: false,
         result: null, 
         designing: false,
         selectedFwdIdx: 0,
@@ -988,6 +989,12 @@ h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Li
   h += '    <input type="checkbox" ' + (_cl.pd.kld.optimize ? 'checked' : '') + ' onchange="_pdKldSet(\x27optimize\x27,this.checked)" style="margin:0;">';
   h += '    Optimize junction (find best primers within range)';
   h += '  </label>';
+  if (_cl.pd.kld.optimize) {
+    h += '  <label style="display:flex; align-items:center; gap:8px; font-size:.74rem; color:#8a7f72; cursor:pointer; margin-top:.35rem; padding-left:1.5rem;">';
+    h += '    <input type="checkbox" ' + (_cl.pd.kld.exhaustive ? 'checked' : '') + ' onchange="_pdKldSet(\x27exhaustive\x27,this.checked)" style="margin:0;">';
+    h += '    Exhaustive \u2014 full \u0394G analysis at every position (slow but thorough)';
+    h += '  </label>';
+  }
   h += '</div>';
 
   // Row 3: Tm and Max Length
@@ -1097,6 +1104,7 @@ function _clRenderKLDResult(r) {
     h += '<span>= <strong>' + ss.pairs_scored.toLocaleString() + '</strong> combos scored</span>';
     h += '<span>(<strong>' + ss.candidates_generated.toLocaleString() + '</strong> candidates)</span>';
     if (ss.shortlist_refined) h += '<span>\u2192 top <strong>' + ss.shortlist_refined + '</strong> refined with full \u0394G</span>';
+    if (ss.exhaustive) h += '<span style="color:#8E44AD;font-weight:600;">\u2714 Exhaustive (full \u0394G at every position)</span>';
     h += '</div>';
   }
 
@@ -1333,8 +1341,13 @@ function _pdSeqDesign() {
     _cl.pd.kld.endPos = val;
   }
 
+  // Clear exhaustive if optimize is turned off
+  if (field === 'optimize' && !val) {
+    _cl.pd.kld.exhaustive = false;
+  }
+
   // 3. Map Refresh: If start or end positions change, update the SeqViz map highlights
-  if (field === 'startPos' || field === 'endPos' || field === 'optimize') {
+  if (field === 'startPos' || field === 'endPos' || field === 'optimize' || field === 'exhaustive') {
     clearTimeout(window._pdKldTimer);
     window._pdKldTimer = setTimeout(function() { 
       _clRenderSeqViz(); 
@@ -1361,7 +1374,7 @@ function _pdSeqDesign() {
 
   // 1. Get and Validate Start/End positions
   var s = parseInt(k.startPos, 10);
-  var e = parseInt(k.endPos || k.startPos, 10); // Fallback to start if end is empty
+  var e = parseInt(k.endPos || k.startPos, 10);
   
   if (isNaN(s) || s < 0 || s >= _cl.parsed.length) { 
     toast('Enter a valid Start Position', true); return; 
@@ -1370,9 +1383,27 @@ function _pdSeqDesign() {
     toast('Enter a valid End Position', true); return; 
   }
 
-  // 2. Clean the insert (Allow empty for pure deletions)
   var insert = _clCleanSeq(k.insertSeq || "");
-  
+  var isOpt = !!k.optimize;
+  var isExhaustive = isOpt && !!k.exhaustive;
+
+  // 2. Exhaustive confirmation popup
+  if (isExhaustive) {
+    var range = Math.abs(e - s) + 1;
+    var splits = insert.length > 0 ? insert.length + 1 : 1;
+    var pairs = range * (range + 1) / 2;
+    var totalCombos = pairs * splits;
+    var estMin = Math.ceil(totalCombos * 2 / 400 / 60); // ~400 full calls/sec
+    if (!confirm(
+      'Exhaustive mode: full \u0394G analysis at every position.\n\n' +
+      '\u2022 ' + range + ' positions \u00d7 ' + splits + ' splits = ' + totalCombos.toLocaleString() + ' combos\n' +
+      '\u2022 Each combo runs full thermodynamic analysis (homodimer, hairpin, \u0394G)\n' +
+      '\u2022 Estimated time: ' + (estMin < 1 ? '<1' : '~' + estMin) + ' minute' + (estMin !== 1 ? 's' : '') + '\n\n' +
+      'The page will remain responsive but the server will be working hard.\n\n' +
+      'Continue?'
+    )) return;
+  }
+
   // 3. UI State
   k.designing = true; 
   k.result = null;
@@ -1383,26 +1414,23 @@ function _pdSeqDesign() {
   // 4. Animate progress bar
   var range = Math.abs(e - s) + 1;
   var splits = insert.length > 0 ? insert.length + 1 : 1;
-  var isOpt = !!k.optimize;
-  // Estimate: baseline (splits×2 full calls) + optimize scan (range×splits×2 lightweight)
-  // Lightweight calls are ~10x faster than full, so weigh accordingly
   var baselineCalls = splits * 2;
   var scanCalls = isOpt ? range * splits * 2 : 0;
-  var refineCalls = isOpt ? 100 : 0; // ~50 shortlist × 2 full calls
-  var estMs = Math.max(2000, Math.ceil((baselineCalls / 400 + scanCalls / 4000 + refineCalls / 400) * 1000));
+  var refineCalls = isOpt ? 100 : 0;
+  var estMs;
+  if (isExhaustive) {
+    // Full analysis everywhere — much slower
+    estMs = Math.max(5000, Math.ceil((baselineCalls + scanCalls) / 400 * 1000));
+  } else {
+    estMs = Math.max(2000, Math.ceil((baselineCalls / 400 + scanCalls / 4000 + refineCalls / 400) * 1000));
+  }
   var progressStart = Date.now();
-  var progressMessages = [
-    'Running baseline analysis\u2026',
-    'Scanning junction positions\u2026',
-    'Testing insert split points\u2026',
-    'Scoring primer pairs\u2026',
-    'Refining top candidates\u2026',
-    'Final thermodynamic analysis\u2026'
-  ];
+  var progressMessages = isExhaustive
+    ? ['Running baseline analysis\u2026', 'Full \u0394G scan at every position\u2026', 'Evaluating homodimer stability\u2026', 'Scoring all junction pairs\u2026', 'Comparing all candidates\u2026', 'Finalising best primers\u2026']
+    : ['Running baseline analysis\u2026', 'Scanning junction positions\u2026', 'Testing insert split points\u2026', 'Scoring primer pairs\u2026', 'Refining top candidates\u2026', 'Final thermodynamic analysis\u2026'];
+
   window._kldProgressIv = setInterval(function() {
     var elapsed = Date.now() - progressStart;
-    // Asymptotic curve: approaches 95% but never reaches it
-    // Fast at first, slows as it gets closer — never looks stuck
     var pct = 95 * (1 - Math.exp(-elapsed / (estMs * 0.7)));
     var bar = document.getElementById('cl-kld-progress-bar');
     var txt = document.getElementById('cl-kld-progress-text');
@@ -1414,7 +1442,6 @@ function _pdSeqDesign() {
         var secLeft = Math.max(1, Math.ceil((estMs - elapsed) / 1000));
         txt.textContent = progressMessages[msgIdx] + ' (~' + secLeft + 's remaining)';
       } else {
-        // Past the estimate — show elapsed instead of misleading countdown
         txt.textContent = progressMessages[msgIdx] + ' (' + elapsedSec + 's elapsed, still working\u2026)';
       }
     }
@@ -1427,6 +1454,7 @@ function _pdSeqDesign() {
     start_pos: s,
     end_pos: e,
     optimize: isOpt,
+    exhaustive: isExhaustive,
     annealing_tm_target: parseInt(k.tmTarget, 10) || 62,
     max_primer_length: parseInt(k.maxLen, 10) || 60
   }).then(function(data) {
