@@ -34,7 +34,15 @@ var _cl = {
     // Sequencing primers
     seq: { regionStart: '', regionEnd: '', readLen: 900, tmTarget: 62, result: null, designing: false },
     // KLD
-    kld: { insertionPos: '', insertSeq: '', tmTarget: 62, maxLen: 60, result: null, designing: false },
+    kld: { 
+        startPos: '', 
+        endPos: '', 
+        insertSeq: '', 
+        tmTarget: 62, 
+        optimize: false, // New field
+        result: null, 
+        designing: false 
+    },
   },
   // Sequence analysis
   sa: {
@@ -916,15 +924,32 @@ function _clRenderSeqResult(r) {
 function _clRenderKLDMode() {
   var k = _cl.pd.kld;
   var h = '';
-  h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Ligation-DpnI) \u2014 design back-to-back primers for inserting DNA via inverse PCR. <strong style="color:#5b7a5e;">Click on the map</strong> to set the insertion point. The insert is split across the 5\u2032 tails.</p>';
+h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Ligation-DpnI) \u2014 design primers for insertion, deletion, or replacement via inverse PCR. <strong style="color:#5b7a5e;">Set range</strong> to chop out DNA.</p>';
 
-  h += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
-  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Insertion Position</label>';
-  h += '<input id="cl-pd-kld-insertionPos" type="number" min="0" max="' + (_cl.parsed ? _cl.parsed.length : 99999) + '" value="' + esc(String(k.insertionPos)) + '" oninput="_pdKldSet(\x27insertionPos\x27,this.value)" placeholder="e.g. 1234" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:\'SF Mono\',Monaco,Consolas,monospace;" /></div>';
-  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Tm Target (\u00b0C)</label>';
-  h += '<input type="number" min="50" max="75" value="' + k.tmTarget + '" oninput="_pdKldSet(\x27tmTarget\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
-  h += '<div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Max Length (bp)</label>';
-  h += '<input type="number" min="30" max="100" value="' + k.maxLen + '" oninput="_pdKldSet(\x27maxLen\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  // Row 1: Start and End Positions
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Start Position</label>';
+  h += '  <input type="number" min="0" value="' + esc(String(_cl.pd.kld.startPos || '')) + '" oninput="_pdKldSet(\x27startPos\x27,this.value)" placeholder="e.g. 100" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:monospace;" /></div>';
+  
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">End Position</label>';
+  h += '  <input type="number" min="0" value="' + esc(String(_cl.pd.kld.endPos || '')) + '" oninput="_pdKldSet(\x27endPos\x27,this.value)" placeholder="Same as start for insertion" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;font-family:monospace;" /></div>';
+  h += '</div>';
+
+  // Row 2: Optimization toggle
+  h += '<div style="margin-bottom:.7rem;">';
+  h += '  <label style="display:flex; align-items:center; gap:8px; font-size:.78rem; color:#4a4139; cursor:pointer;">';
+  h += '    <input type="checkbox" ' + (_cl.pd.kld.optimize ? 'checked' : '') + ' onchange="_pdKldSet(\x27optimize\x27,this.checked)" style="margin:0;">';
+  h += '    Optimize junction (find best primers within range)';
+  h += '  </label>';
+  h += '</div>';
+
+  // Row 3: Tm and Max Length
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin-bottom:.7rem;">';
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Tm Target (\u00b0C)</label>';
+  h += '  <input type="number" min="50" max="75" value="' + k.tmTarget + '" oninput="_pdKldSet(\x27tmTarget\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
+  
+  h += '  <div><label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Max Length (bp)</label>';
+  h += '  <input type="number" min="30" max="100" value="' + k.maxLen + '" oninput="_pdKldSet(\x27maxLen\x27,this.value)" style="width:100%;box-sizing:border-box;padding:.4rem .5rem;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;font-size:.82rem;color:#4a4139;" /></div>';
   h += '</div>';
 
   h += '<label style="display:block;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:#8a7f72;font-weight:600;margin-bottom:.25rem;">Insert Sequence</label>';
@@ -953,16 +978,23 @@ function _clRenderKLDResult(r) {
   }
 
   // Forward
-  var kldInsPos = parseInt(_cl.pd.kld.insertionPos, 10) || 0;
+  var kldStart = parseInt(_cl.pd.kld.start_used || _cl.pd.kld.startPos, 10) || 0;
+  var kldEnd = parseInt(_cl.pd.kld.end_used || _cl.pd.kld.endPos, 10) || 0;
   var kldSeqLen = _cl.parsed ? _cl.parsed.length : 99999;
+  
   h += _clRenderTailedPrimer('Forward', r.forward, '#2980b9', 'kld-fwd', {
-    name: 'KLD Fwd anneal', start: kldInsPos, end: Math.min(kldInsPos + r.forward.annealing.length, kldSeqLen),
+    name: 'KLD Fwd anneal', 
+    start: kldEnd, 
+    end: Math.min(kldEnd + r.forward.annealing.length, kldSeqLen),
     direction: 1, color: '#2980b9', type: 'primer_bind'
   });
+  
   // Reverse
-  var revAnnStart = ((kldInsPos - r.reverse.annealing.length) % kldSeqLen + kldSeqLen) % kldSeqLen;
+  var revAnnStart = ((kldStart - r.reverse.annealing.length) % kldSeqLen + kldSeqLen) % kldSeqLen;
   h += _clRenderTailedPrimer('Reverse', r.reverse, '#8e44ad', 'kld-rev', {
-    name: 'KLD Rev anneal', start: revAnnStart, end: kldInsPos,
+    name: 'KLD Rev anneal', 
+    start: revAnnStart, 
+    end: kldStart,
     direction: -1, color: '#8e44ad', type: 'primer_bind'
   });
 
@@ -1186,16 +1218,35 @@ function _pdSeqDesign() {
   }).catch(function(err) { s.designing = false; toast('Error: ' + (err.message || err), true); _clRender(); });
 }
 
-// ── KLD
-function _pdKldSet(field, val) {
+  function _pdKldSet(field, val) {
+  // 1. Update the value in state
   _cl.pd.kld[field] = val;
-  if (field === 'insertionPos') {
-    clearTimeout(window._pdKldTimer);
-    window._pdKldTimer = setTimeout(function() { _clRenderSeqViz(); }, 300);
+
+  // 2. Auto-sync: If user sets Start but hasn't touched End, keep them the same (insertion mode)
+  if (field === 'startPos' && (!_cl.pd.kld.endPos || _cl.pd.kld.endPos === '')) {
+    _cl.pd.kld.endPos = val;
   }
+
+  // 3. Map Refresh: If start or end positions change, update the SeqViz map highlights
+  if (field === 'startPos' || field === 'endPos' || field === 'optimize') {
+    clearTimeout(window._pdKldTimer);
+    window._pdKldTimer = setTimeout(function() { 
+      _clRenderSeqViz(); 
+    }, 300);
+  }
+
+  // 4. Input Refresh: If the insert sequence changes, re-render the UI 
+  // (we keep focus on the textarea so typing isn't interrupted)
   if (field === 'insertSeq') {
     clearTimeout(window._pdKldInsTimer);
-    window._pdKldInsTimer = setTimeout(function() { _clRender(); var ta = document.getElementById('cl-kld-insert-ta'); if (ta) ta.focus(); }, 400);
+    window._pdKldInsTimer = setTimeout(function() { 
+      _clRender(); 
+      var ta = document.getElementById('cl-kld-insert-ta'); 
+      if (ta) {
+        ta.focus();
+        ta.selectionStart = ta.selectionEnd = ta.value.length; // Move cursor to end
+      }
+    }, 400);
   }
 }
 
