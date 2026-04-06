@@ -1263,24 +1263,49 @@ function _pdSeqDesign() {
     }, 400);
   }
 }
-
-function _pdKldDesign() {
+  function _pdKldDesign() {
   var k = _cl.pd.kld;
   if (!_cl.parsed) { toast('Load a plasmid first', true); return; }
-  var pos = parseInt(k.insertionPos, 10);
-  if (isNaN(pos) || pos < 0) { toast('Enter a valid insertion position', true); return; }
-  var insert = _clCleanSeq(k.insertSeq);
-  if (insert.length < 2) { toast('Enter an insert sequence (min 2bp)', true); return; }
-  k.designing = true; k.result = null; _clRender();
-  api('POST', '/api/cloning/design-kld-primers', {
-    template_seq: _cl.parsed.seq, insertion_pos: pos, insert_seq: insert,
-    annealing_tm_target: parseInt(k.tmTarget, 10) || 62, max_primer_length: parseInt(k.maxLen, 10) || 60
-  }).then(function(data) {
-    k.designing = false; k.result = data; _clRender();
-    setTimeout(function() { _clRenderSeqViz(); }, 50);
-  }).catch(function(err) { k.designing = false; toast('Error: ' + (err.message || err), true); _clRender(); });
-}
 
+  // 1. Get and Validate Start/End positions
+  var s = parseInt(k.startPos, 10);
+  var e = parseInt(k.endPos || k.startPos, 10); // Fallback to start if end is empty
+  
+  if (isNaN(s) || s < 0 || s >= _cl.parsed.length) { 
+    toast('Enter a valid Start Position', true); return; 
+  }
+  if (isNaN(e) || e < 0 || e >= _cl.parsed.length) { 
+    toast('Enter a valid End Position', true); return; 
+  }
+
+  // 2. Clean the insert (Allow empty for pure deletions)
+  var insert = _clCleanSeq(k.insertSeq || "");
+  
+  // 3. UI State
+  k.designing = true; 
+  k.result = null; 
+  _clRender();
+
+  // 4. API Call - Use the exact keys your Python KLDRequest model expects
+  api('POST', '/api/cloning/design-kld-primers', {
+    template_seq: _cl.parsed.sequence || _cl.parsed.seq, // Handle different property names
+    insert_seq: insert,
+    start_pos: s,
+    end_pos: e,
+    optimize: !!k.optimize,
+    annealing_tm_target: parseInt(k.tmTarget, 10) || 62,
+    max_primer_length: parseInt(k.maxLen, 10) || 60
+  }).then(function(data) {
+    k.designing = false; 
+    k.result = data; 
+    _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }).catch(function(err) { 
+    k.designing = false; 
+    toast('Error: ' + (err.message || err), true); 
+    _clRender(); 
+  });
+}
 // ── Copy
 function _pdCopy(key) {
   var seq = '';
