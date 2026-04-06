@@ -1044,6 +1044,14 @@ h += '<p style="font-size:.78rem;color:#8a7f72;margin:0 0 .7rem;">KLD (Kinase-Li
     h += '</div>';
   }
 
+  if (k._lastError) {
+    h += '<div style="margin-top:.6rem;padding:.5rem .7rem;background:#fde8e8;border:1px solid #e74c3c;border-radius:5px;">';
+    h += '<div style="font-size:.8rem;font-weight:600;color:#c0392b;margin-bottom:.2rem;">\u274c Design Failed</div>';
+    h += '<div style="font-size:.75rem;color:#922;word-break:break-all;">' + esc(k._lastError) + '</div>';
+    h += '<div style="font-size:.68rem;color:#8a7f72;margin-top:.3rem;">Check server terminal for full traceback</div>';
+    h += '</div>';
+  }
+
   if (k.result) { h += _clRenderKLDResult(k.result); }
   return h;
 }
@@ -1412,6 +1420,7 @@ function _pdSeqDesign() {
   // 3. UI State
   k.designing = true; 
   k.result = null;
+  k._lastError = null;
   k.selectedFwdIdx = 0;
   k.selectedRevIdx = 0;
   _clRender();
@@ -1470,9 +1479,13 @@ function _pdSeqDesign() {
     setTimeout(function() { _clRenderSeqViz(); }, 50);
   }).catch(function(err) { 
     clearInterval(window._kldProgressIv);
-    k.designing = false; 
-    toast('Error: ' + (err.message || err), true); 
-    _clRender(); 
+    k.designing = false;
+    var msg = err.message || err.detail || JSON.stringify(err) || 'Unknown error';
+    console.error('[KLD] Design failed:', msg, err);
+    k._lastError = msg;
+    _clRender();
+    // Toast after render so it doesn't get wiped
+    setTimeout(function() { toast('KLD Error: ' + msg, true); }, 100);
   });
 }
 
