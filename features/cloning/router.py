@@ -514,8 +514,8 @@ def design_kld_primers(template_seq, insertion_pos, insert_seq, tm_target=62.0, 
         # 4. Secondary Structure Penalties
         ss_penalty = 0
         if f.get('hairpin') or r.get('hairpin'): ss_penalty += 20
-        if f.get('homodimer_dg', 0) < -7.0: ss_penalty += 10
-        if r.get('homodimer_dg', 0) < -7.0: ss_penalty += 10
+        if f.get('homodimer_dg', 0) < -9.5.0: ss_penalty += 10
+        if r.get('homodimer_dg', 0) < 9.5.0: ss_penalty += 10
         
         # Total Score (Higher is better)
         # We prioritize secondary structure avoidance and Tm matching
