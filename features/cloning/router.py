@@ -2361,16 +2361,16 @@ def digest_ligate_endpoint(body: DigestLigateRequest):
 # ---------------------------------------------------------------------------
 @router.post("/cloning/design-kld-primers")
 def kld_endpoint(body: KLDRequest):
-    # We map the Pydantic model fields to the new design_kld_primers function.
-    # We use 'start_pos' and 'end_pos' for the range logic.
+    # If the user didn't provide start/end (old UI), fallback to insertion_pos
+    s_pos = body.start_pos if body.start_pos is not None else body.insertion_pos
+    e_pos = body.end_pos if body.end_pos is not None else body.insertion_pos
+    
     return design_kld_primers(
         template_seq=body.template_seq,
         insert_seq=body.insert_seq,
-        # Use start/end if provided, otherwise fallback to insertion_pos
-        start_pos=getattr(body, 'start_pos', body.insertion_pos),
-        end_pos=getattr(body, 'end_pos', body.insertion_pos),
-        # Use the optimize flag if your KLDRequest model has it, else False
-        optimize=getattr(body, 'optimize', False),
+        start_pos=s_pos,
+        end_pos=e_pos,
+        optimize=body.optimize,
         tm_target=body.annealing_tm_target or 62.0,
         max_len=body.max_primer_length or 60,
     )
