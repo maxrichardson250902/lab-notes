@@ -516,6 +516,12 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                 continue
 
             f, r = f_cands[0], r_cands[0]
+
+            # Check annealing overlap on circular template
+            amplicon_space = len(template_seq) - (end_pos - start_pos)
+            if amplicon_space < len(f['annealing']) + len(r['annealing']):
+                continue
+
             tm_err = abs(f['tm'] - tm_target) + abs(r['tm'] - tm_target)
             tm_delta = abs(f['tm'] - r['tm'])
             ss_penalty = 0
@@ -546,6 +552,9 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
         n_junction_pairs = n_pos * (n_pos + 1) // 2  # triangular: s ≤ e
         search_stats["junction_pairs"] = n_junction_pairs
         print(f"[KLD] optimize: {n_pos} positions, {n_junction_pairs} pairs, {len(split_points)} splits", flush=True)
+
+        TOP_N = 20  # Keep top 20 from lightweight scan for full refinement
+        shortlist = []  # [(score, start, end, split), ...]
 
         for si, sp in enumerate(split_points):
             t_sp = time.time()
@@ -583,16 +592,25 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
 
             # Score all valid (s, e) pairs from cached results (Tm-only scoring)
             pairs_this_split = 0
+            tpl_len = len(template_seq)
             for s in positions:
                 if s not in rev_cache:
                     continue
                 r_best = rev_cache[s][0]
+                r_ann_len = len(r_best['annealing'])
                 for e in positions:
                     if e < s:
                         continue
                     if e not in fwd_cache:
                         continue
                     f_best = fwd_cache[e][0]
+                    f_ann_len = len(f_best['annealing'])
+
+                    # Skip if annealing regions would overlap on the circular template
+                    # Amplicon space = everything OUTSIDE the deleted region
+                    amplicon_space = tpl_len - (e - s)
+                    if amplicon_space < f_ann_len + r_ann_len:
+                        continue
 
                     tm_err = abs(f_best['tm'] - tm_target) + abs(r_best['tm'] - tm_target)
                     tm_delta = abs(f_best['tm'] - r_best['tm'])
@@ -600,12 +618,12 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                     search_stats["pairs_scored"] += 1
                     pairs_this_split += 1
 
-                    if score > best_overall_score:
-                        best_overall_score = score
-                        best_result = {
-                            "actual_start": s, "actual_end": e,
-                            "split": sp,
-                        }
+                    # Keep top N shortlist for full refinement later
+                    if len(shortlist) < TOP_N or score > shortlist[-1][0]:
+                        shortlist.append((score, s, e, sp))
+                        shortlist.sort(key=lambda x: x[0], reverse=True)
+                        if len(shortlist) > TOP_N:
+                            shortlist.pop()
 
             t_score = time.time()
             print(f"[KLD]   split {si}/{len(split_points)}: "
@@ -614,23 +632,54 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                   f"total_elapsed={t_score-t0:.1f}s", flush=True)
 
         print(f"[KLD] scan done in {time.time()-t0:.2f}s  "
-              f"candidates={search_stats['candidates_generated']}  pairs_scored={search_stats['pairs_scored']}", flush=True)
+              f"candidates={search_stats['candidates_generated']}  pairs_scored={search_stats['pairs_scored']}  "
+              f"shortlist={len(shortlist)}", flush=True)
 
-        # ── Re-generate the winning combination with FULL thermodynamic analysis
-        if best_result:
+        # ── Refine: run FULL thermodynamic analysis on the top N candidates
+        #    and re-score with dimer/hairpin penalties to find the true best
+        if shortlist:
             t_full = time.time()
-            win_sp = best_result["split"]
-            win_fwd_tail = insert_seq[win_sp:]
-            win_rev_tail = _reverse_complement(insert_seq[:win_sp])
-            win_f_max = max_len - len(win_fwd_tail)
-            win_r_max = max_len - len(win_rev_tail)
-            best_result["fwd_all"] = _generate_primer_candidates(
-                template_seq, best_result["actual_end"], "forward", win_fwd_tail, tm_target,
-                min_len=12, max_len=win_f_max, max_total=max_len, lightweight=False)
-            best_result["rev_all"] = _generate_primer_candidates(
-                template_seq, best_result["actual_start"], "reverse", win_rev_tail, tm_target,
-                min_len=12, max_len=win_r_max, max_total=max_len, lightweight=False)
-            print(f"[KLD] full analysis for winner in {time.time()-t_full:.3f}s", flush=True)
+            for rank, (tm_score, cand_s, cand_e, cand_sp) in enumerate(shortlist):
+                fwd_tail = insert_seq[cand_sp:]
+                rev_tail = _reverse_complement(insert_seq[:cand_sp])
+                f_max_ann = max_len - len(fwd_tail)
+                r_max_ann = max_len - len(rev_tail)
+
+                f_cands = _generate_primer_candidates(
+                    template_seq, cand_e, "forward", fwd_tail, tm_target,
+                    min_len=12, max_len=f_max_ann, max_total=max_len, lightweight=False)
+                r_cands = _generate_primer_candidates(
+                    template_seq, cand_s, "reverse", rev_tail, tm_target,
+                    min_len=12, max_len=r_max_ann, max_total=max_len, lightweight=False)
+
+                if not f_cands or not r_cands:
+                    continue
+
+                f, r = f_cands[0], r_cands[0]
+
+                # Double-check annealing overlap with full-analysis annealing lengths
+                amplicon_space = len(template_seq) - (cand_e - cand_s)
+                if amplicon_space < len(f['annealing']) + len(r['annealing']):
+                    continue
+
+                tm_err = abs(f['tm'] - tm_target) + abs(r['tm'] - tm_target)
+                tm_delta = abs(f['tm'] - r['tm'])
+                ss_penalty = 0
+                if f.get('hairpin') or r.get('hairpin'): ss_penalty += 25
+                if f.get('homodimer_dg', 0) < -8.0: ss_penalty += 15
+                full_score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
+
+                if full_score > best_overall_score:
+                    best_overall_score = full_score
+                    best_result = {
+                        "fwd_all": f_cands, "rev_all": r_cands,
+                        "actual_start": cand_s, "actual_end": cand_e,
+                        "split": cand_sp,
+                    }
+
+            print(f"[KLD] refined top {len(shortlist)} in {time.time()-t_full:.3f}s  "
+                  f"best_score={best_overall_score:.1f}", flush=True)
+            search_stats["shortlist_refined"] = len(shortlist)
 
     if not best_result:
         raise HTTPException(400, "No viable primers found in this range.")
@@ -642,6 +691,19 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
     product = template_seq[:best_result["actual_start"]] + insert_seq + template_seq[best_result["actual_end"]:]
 
     split = best_result["split"]
+
+    # Build warnings
+    warnings = []
+    if abs(fwd_primer['tm'] - rev_primer['tm']) > 3:
+        warnings.append("Tm mismatch > 3°C")
+    # Check primer spacing on circular template
+    amplicon_space = len(template_seq) - (best_result["actual_end"] - best_result["actual_start"])
+    fwd_ann_len = len(fwd_primer.get('annealing', ''))
+    rev_ann_len = len(rev_primer.get('annealing', ''))
+    gap = amplicon_space - fwd_ann_len - rev_ann_len
+    if gap < 10:
+        warnings.append(f"Tight primer spacing — only {gap}bp gap between annealing regions")
+
     return {
         "forward": fwd_primer,
         "reverse": rev_primer,
@@ -653,7 +715,7 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
         "split_gc_score": round(_score_split(insert_seq, split), 2) if insert_seq else 0.0,
         "product_length": len(product),
         "search_stats": search_stats,
-        "warnings": ["Tm mismatch > 3°C"] if abs(fwd_primer['tm'] - rev_primer['tm']) > 3 else []
+        "warnings": warnings
     }
 
 
