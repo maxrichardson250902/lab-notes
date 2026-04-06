@@ -472,6 +472,8 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                        start_pos: int = 0, end_pos: int = None,
                        optimize: bool = False, tm_target: float = 62.0,
                        max_len: int = 60):
+    import time
+    t0 = time.time()
     template_seq = template_seq.upper().replace(" ", "").replace("\n", "")
     insert_seq = (insert_seq or "").upper().replace(" ", "").replace("\n", "")
     if end_pos is None:
@@ -482,6 +484,9 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
 
     ins_len = len(insert_seq)
     split_points = list(range(ins_len + 1)) if ins_len > 0 else [0]
+
+    print(f"[KLD] start={start_pos} end={end_pos} insert={ins_len}bp optimize={optimize} "
+          f"range={end_pos-start_pos+1} splits={len(split_points)} max_len={max_len}", flush=True)
 
     best_overall_score = -float('inf')
     best_result = None
@@ -527,6 +532,7 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                     "split": sp,
                 }
         search_stats["junction_pairs"] = 1
+        print(f"[KLD] non-opt done in {time.time()-t0:.2f}s  candidates={search_stats['candidates_generated']}", flush=True)
     else:
         # ── Optimised: test ALL (s, e) pairs where start_pos ≤ s ≤ e ≤ end_pos
         # Key optimisation: decouple fwd/rev candidate generation.
@@ -539,13 +545,16 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
         n_pos = len(positions)
         n_junction_pairs = n_pos * (n_pos + 1) // 2  # triangular: s ≤ e
         search_stats["junction_pairs"] = n_junction_pairs
+        print(f"[KLD] optimize: {n_pos} positions, {n_junction_pairs} pairs, {len(split_points)} splits", flush=True)
 
-        for sp in split_points:
+        for si, sp in enumerate(split_points):
+            t_sp = time.time()
             fwd_tail = insert_seq[sp:]
             rev_tail = _reverse_complement(insert_seq[:sp])
             f_max_ann = max_len - len(fwd_tail)
             r_max_ann = max_len - len(rev_tail)
             if f_max_ann < 12 or r_max_ann < 12:
+                print(f"[KLD]   split {si}/{len(split_points)} SKIP (tail too long: fwd_tail={len(fwd_tail)} rev_tail={len(rev_tail)})", flush=True)
                 continue
 
             # Pre-compute forward candidates for each possible end position
@@ -558,6 +567,8 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                 if cands:
                     fwd_cache[pos] = cands
 
+            t_fwd = time.time()
+
             # Pre-compute reverse candidates for each possible start position
             rev_cache = {}
             for pos in positions:
@@ -568,7 +579,10 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                 if cands:
                     rev_cache[pos] = cands
 
+            t_rev = time.time()
+
             # Score all valid (s, e) pairs from cached results
+            pairs_this_split = 0
             for s in positions:
                 if s not in rev_cache:
                     continue
@@ -591,6 +605,7 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                         ss_penalty += 15
                     score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
                     search_stats["pairs_scored"] += 1
+                    pairs_this_split += 1
 
                     if score > best_overall_score:
                         best_overall_score = score
@@ -599,6 +614,15 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                             "actual_start": s, "actual_end": e,
                             "split": sp,
                         }
+
+            t_score = time.time()
+            print(f"[KLD]   split {si}/{len(split_points)}: "
+                  f"fwd_cache={t_fwd-t_sp:.2f}s  rev_cache={t_rev-t_fwd:.2f}s  "
+                  f"scoring={t_score-t_rev:.2f}s  pairs={pairs_this_split}  "
+                  f"total_elapsed={t_score-t0:.1f}s", flush=True)
+
+        print(f"[KLD] optimize done in {time.time()-t0:.2f}s  "
+              f"candidates={search_stats['candidates_generated']}  pairs_scored={search_stats['pairs_scored']}", flush=True)
 
     if not best_result:
         raise HTTPException(400, "No viable primers found in this range.")
