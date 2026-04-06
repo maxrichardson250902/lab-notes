@@ -588,9 +588,6 @@ function _clRenderViewerTab() {
     h += '</div>';
     if (!_cl.pd._viewingProduct) {
       h += '<a href="/api/' + esc(_cl.selected.type) + 's/' + _cl.selected.id + '/gb" download style="padding:.25rem .5rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;text-decoration:none;">\u2b07 .gb</a>';
-      if ((_cl.parsed.topology || '').toLowerCase() === 'circular') {
-        h += '<button onclick="_clReindex()" style="padding:.25rem .5rem;font-size:.72rem;color:#e67e22;border:1px solid #e67e22;border-radius:4px;background:#fff;cursor:pointer;" title="Set a new origin (position 0) for this circular sequence">\ud83d\udd04 Reindex</button>';
-      var isCircular = (_cl.parsed.topology || '').toLowerCase().includes('circular');
 
       if (!_cl.pd._viewingProduct) {
         h += '<a href="/api/' + esc(_cl.selected.type) + 's/' + _cl.selected.id + '/gb" download style="padding:.25rem .5rem;font-size:.72rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;text-decoration:none;">\u2b07 .gb</a>';
