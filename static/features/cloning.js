@@ -1029,7 +1029,7 @@ function _clRenderTailedPrimer(label, p, accentColor, copyKey, featureData) {
   h += '<span style="font-size:.72rem;color:#8a7f72;margin-left:.5rem;">' + p.length + 'bp \u00b7 Tm ' + p.tm + '\u00b0C \u00b7 GC ' + p.gc_percent + '%</span>';
   // Show dimer/hairpin badges if data is present
   if (typeof p.homodimer_dg === 'number') {
-    var dimerColor = p.homodimer_dg < -7 ? '#c0392b' : p.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
+    var dimerColor = p.homodimer_dg < -9.5 ? '#c0392b' : p.homodimer_dg < -5 ? '#e67e22' : '#5b7a5e';
     h += '<span style="font-size:.66rem;margin-left:.4rem;padding:.1rem .35rem;border-radius:3px;background:' + (p.homodimer_dg < -7 ? '#fde8e8' : p.homodimer_dg < -5 ? '#fdf2e9' : '#eef4ee') + ';color:' + dimerColor + ';">dimer \u0394G ' + p.homodimer_dg + '</span>';
   }
   if (p.hairpin) {
