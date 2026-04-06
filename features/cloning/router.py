@@ -526,7 +526,7 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
         tm_delta = abs(f['tm'] - r['tm'])
         ss_penalty = 0
         if f.get('hairpin') or r.get('hairpin'): ss_penalty += 25
-        if f.get('homodimer_dg', 0) < -8.0: ss_penalty += 15
+        if f.get('homodimer_dg', 0) < -12.0: ss_penalty += 15
         score = -(tm_err * 2) - (tm_delta * 4) - ss_penalty
         search_stats["pairs_scored"] += 1
 
@@ -733,7 +733,7 @@ def evaluate_custom_primer(template_seq, start, end, direction):
         "length": len(primer_seq),
         "gc_percent": round(_gc_content(primer_seq) * 100, 1),
         "delta_g": _calc_delta_g(primer_seq, temp_c=tm if tm > 0 else 60.0),
-        "homodimer_dg": _calc_homodimer_dg(primer_seq, temp_c=60.0),
+        "homodimer_dg": _calc_homodimer_dg(primer_seq, temp_c=25.0),
         "hairpin": _has_hairpin(primer_seq),
         "self_dimer": _has_self_dimer(primer_seq),
         "quality": quality,
@@ -767,11 +767,11 @@ def design_pcr_primers(template_seq, target_start, target_end, tm_target=62.0):
         warnings.append(f"Tm difference between primers is {tm_diff:.1f}°C — ideally <5°C")
     if fwd.get("hairpin"):
         warnings.append("Forward primer may form hairpin")
-    if fwd.get("homodimer_dg", 0) < -7.0:
+    if fwd.get("homodimer_dg", 0) < -9.0:
         warnings.append(f"Forward primer has strong self-dimer (ΔG = {fwd['homodimer_dg']} kcal/mol)")
     if rev.get("hairpin"):
         warnings.append("Reverse primer may form hairpin")
-    if rev.get("homodimer_dg", 0) < -7.0:
+    if rev.get("homodimer_dg", 0) < -9.0:
         warnings.append(f"Reverse primer has strong self-dimer (ΔG = {rev['homodimer_dg']} kcal/mol)")
 
     # Add seq alias and position for frontend compatibility
@@ -1590,7 +1590,7 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
         for p, pname in [(fwd_primer, f"{down_name}_Fwd"), (rev_primer, f"{up_name}_Rev")]:
             if p and p.get("hairpin"):
                 warnings.append(f"{pname} may form hairpin")
-            if p and p.get("homodimer_dg", 0) < -7.0:
+            if p and p.get("homodimer_dg", 0) < -9.0:
                 warnings.append(f"{pname} has strong self-dimer (ΔG = {p['homodimer_dg']} kcal/mol)")
 
         junctions.append({
@@ -1659,11 +1659,10 @@ def _has_self_dimer(seq, min_match=4):
             return True
     return False
 
-def _calc_homodimer_dg(seq: str, temp_c: float = 60.0) -> float:
+def _calc_homodimer_dg(seq: str, temp_c: float = 25.0) -> float:
     """Calculate the most stable self-dimer ΔG by sliding the primer against its own RC.
-    In a self-dimer, two copies of the same primer align antiparallel. This is
-    equivalent to aligning seq against reverse_complement(seq) and finding positions
-    where bases are IDENTICAL (meaning the original bases are Watson-Crick pairs).
+    Uses SantaLucia 1998 nearest-neighbor parameters. Each contiguous stretch of
+    matched base pairs is scored independently with initiation penalties.
     Returns the most negative (most stable) ΔG found across all alignments."""
     seq = seq.upper()
     rc = _reverse_complement(seq)
@@ -1672,10 +1671,15 @@ def _calc_homodimer_dg(seq: str, temp_c: float = 60.0) -> float:
         return 0.0
 
     best_dg = 0.0  # 0 = no interaction; more negative = worse dimer
+    temp_k = temp_c + 273.15
+
+    # Initiation parameters (SantaLucia 1998)
+    # Each independent duplex stretch gets an initiation cost
+    INIT_DH = 0.2   # kcal/mol  (average of GC and AT init)
+    INIT_DS = -5.7   # cal/K/mol (average of GC and AT init)
 
     # Slide rc across seq in all possible alignments (at least 4bp overlap)
     for offset in range(-(n - 4), n - 3):
-        # Determine overlap region
         if offset < 0:
             s_start = 0
             r_start = -offset
@@ -1686,30 +1690,48 @@ def _calc_homodimer_dg(seq: str, temp_c: float = 60.0) -> float:
         if overlap_len < 4:
             continue
 
-        # Find contiguous matched stretches and compute ΔG
-        match_dh = 0.0
-        match_ds = 0.0
-        match_count = 0
+        # Find contiguous stretches of matched dinucleotides
+        # A "stretch" breaks whenever a position doesn't match
+        stretch_dh = 0.0
+        stretch_ds = 0.0
+        stretch_len = 0
+        alignment_best_dg = 0.0
 
         for i in range(overlap_len - 1):
             sb = seq[s_start + i]
             rb = rc[r_start + i]
             sb2 = seq[s_start + i + 1]
             rb2 = rc[r_start + i + 1]
-            # Self-dimer base pair: seq base equals RC base → original bases are complementary
+
             if sb == rb and sb2 == rb2:
                 pair = sb + sb2
                 if pair in NN_THERMO:
                     h, s = NN_THERMO[pair]
-                    match_dh += h
-                    match_ds += s
-                match_count += 1
+                    stretch_dh += h
+                    stretch_ds += s
+                stretch_len += 1
+            else:
+                # Mismatch — score the completed stretch (if any)
+                if stretch_len >= 2:
+                    total_dh = stretch_dh + INIT_DH
+                    total_ds = stretch_ds + INIT_DS
+                    dg = total_dh - (temp_k * total_ds / 1000.0)
+                    if dg < alignment_best_dg:
+                        alignment_best_dg = dg
+                stretch_dh = 0.0
+                stretch_ds = 0.0
+                stretch_len = 0
 
-        if match_count >= 2:
-            temp_k = temp_c + 273.15
-            dg = match_dh - (temp_k * match_ds / 1000.0)
-            if dg < best_dg:
-                best_dg = dg
+        # Score any remaining stretch at end of overlap
+        if stretch_len >= 2:
+            total_dh = stretch_dh + INIT_DH
+            total_ds = stretch_ds + INIT_DS
+            dg = total_dh - (temp_k * total_ds / 1000.0)
+            if dg < alignment_best_dg:
+                alignment_best_dg = dg
+
+        if alignment_best_dg < best_dg:
+            best_dg = alignment_best_dg
 
     return round(best_dg, 2)
 
@@ -1764,12 +1786,12 @@ def _generate_primer_candidates(template: str, pos: int, direction: str, tail: s
         else:
             # Full path: complete thermodynamic analysis
             dg = _calc_delta_g(anneal_seq, temp_c=tm if tm > 0 else 60.0)
-            homodimer_dg = _calc_homodimer_dg(full_seq, temp_c=60.0)
+            homodimer_dg = _calc_homodimer_dg(full_seq, temp_c=25.0)
             hairpin = _has_hairpin(full_seq)
             self_dimer = _has_self_dimer(full_seq)
             quality = _check_primer_quality(anneal_seq, tm)
 
-            dimer_penalty = max(0, -homodimer_dg - 5.0) * 3.0
+            dimer_penalty = max(0, -homodimer_dg - 9.0) * 3.0
             hairpin_penalty = 5.0 if hairpin else 0.0
             score = tm_penalty + dimer_penalty + hairpin_penalty + gc_penalty
 
@@ -1926,7 +1948,7 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
             for p, pname in [(fwd_primer, f"{f['name']}_Fwd"), (rev_primer, f"{f['name']}_Rev")]:
                 if p and p.get("hairpin"):
                     warnings.append(f"{pname} may form hairpin")
-                if p and p.get("homodimer_dg", 0) < -7.0:
+                if p and p.get("homodimer_dg", 0) < -9.0:
                     warnings.append(f"{pname} has strong self-dimer (ΔG = {p['homodimer_dg']} kcal/mol)")
 
             frag_results.append({
@@ -2114,7 +2136,7 @@ def design_digest_ligate(vector: dict, insert: dict, enzyme1: str, enzyme2: str 
             primers.append(fwd_primer)
             if fwd_primer.get("hairpin"):
                 warnings.append(f"{ins_name}_Fwd may form hairpin")
-            if fwd_primer.get("homodimer_dg", 0) < -7.0:
+            if fwd_primer.get("homodimer_dg", 0) < -9.0:
                 warnings.append(f"{ins_name}_Fwd has strong self-dimer (ΔG = {fwd_primer['homodimer_dg']} kcal/mol)")
 
         # Reverse primer: RE site + annealing to insert end
@@ -2128,7 +2150,7 @@ def design_digest_ligate(vector: dict, insert: dict, enzyme1: str, enzyme2: str 
             primers.append(rev_primer)
             if rev_primer.get("hairpin"):
                 warnings.append(f"{ins_name}_Rev may form hairpin")
-            if rev_primer.get("homodimer_dg", 0) < -7.0:
+            if rev_primer.get("homodimer_dg", 0) < -9.0:
                 warnings.append(f"{ins_name}_Rev has strong self-dimer (ΔG = {rev_primer['homodimer_dg']} kcal/mol)")
 
     # Build ligation product
