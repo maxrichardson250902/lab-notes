@@ -3,8 +3,9 @@ services:
     build: .
     container_name: lab-notes
     restart: unless-stopped
-    ports:
-      - "3003:3003"
+        network_mode: host
+    #ports:
+     # - "3003:3003"
     volumes:
       # Database persistence — this is the ONLY directory that needs to survive rebuilds
       - lab-data:/data
@@ -19,7 +20,7 @@ services:
       - TODO_API_URL=http://todo:3000
       - OPENCLONING_URL=https://cloning.maxemanuelrichardson.beer
     # If your 3090 or todo app are on the host network, uncomment:
-    # network_mode: host
+
 
   opencloning:
     image: manulera/opencloning:latest
