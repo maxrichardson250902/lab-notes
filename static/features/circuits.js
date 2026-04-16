@@ -38,9 +38,16 @@ var _cd = {
   savedDesigns: [],
   dragIdx: null,
   dragStartX: 0,
+  compositeOpen: false,
 };
 
+// ── Cross-feature inbox ────────────────────────────────────────────────
+window._circuitInbox = window._circuitInbox || [];
+
 // ── Helpers ────────────────────────────────────────────────────────────
+function _cdActiveParts() {
+  return _cd.parts.filter(function(p) { return p.seq && p.enabled !== false; });
+}
 function _cdGetSelSeq(seq, start, end) {
   if (start <= end) return seq.substring(start, end);
   return seq.substring(start) + seq.substring(0, end);
@@ -171,6 +178,8 @@ function _cdRenderCanvas() {
   for (var i = 0; i < parts.length; i++) {
     var p = parts[i];
     var px = 20 + i * partW;
+    var isDisabled = p.enabled === false;
+    var opacity = isDisabled ? '0.3' : '1';
 
     // Selection highlight
     if (_cd.selectedIdx === i) {
@@ -180,12 +189,14 @@ function _cdRenderCanvas() {
     // Hit target (invisible, for clicks)
     svg += '<rect x="' + px + '" y="' + (baseY - 35) + '" width="50" height="70" fill="transparent" data-idx="' + i + '" style="cursor:pointer"/>';
 
-    // Symbol
+    // Symbol + label with opacity for disabled
+    svg += '<g opacity="' + opacity + '">';
     svg += _cdDrawSymbol(p.type, px, baseY, p.color, p.direction, !!p.seq);
 
     // Label
     var lbl = esc(p.name.length > 8 ? p.name.substring(0, 7) + '\u2026' : p.name);
     svg += '<text x="' + (px + 25) + '" y="' + (baseY + 38) + '" text-anchor="middle" font-size="10" font-family="SF Mono,Monaco,Consolas,monospace" fill="#4a4139">' + lbl + '</text>';
+    svg += '</g>';
   }
 
   svg += '</svg>';
@@ -256,6 +267,7 @@ function _cdAddPart(key) {
     seq: '',
     seqSource: '',
     direction: 1,
+    enabled: true,
   });
   _cd.dirty = true;
   _cd.selectedIdx = _cd.parts.length - 1;
@@ -296,8 +308,23 @@ function _cdRenderInspector() {
     ? '<span style="color:#5b7a5e;font-weight:600">' + p.seq.length + ' bp</span>' + (p.seqSource ? ' <span style="color:#8a7f72">from ' + esc(p.seqSource) + '</span>' : '')
     : '<span style="color:#8a7f72">No sequence assigned</span>';
 
+  var seqPreview = '';
+  if (p.seq) {
+    var displaySeq = p.seq.length > 200 ? p.seq.substring(0, 100) + ' ... ' + p.seq.substring(p.seq.length - 100) : p.seq;
+    seqPreview = '<div style="margin-top:10px;border-top:1px solid #d5cec0;padding-top:8px">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">'
+      + '<span style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Sequence</span>'
+      + '<button onclick="cdCopyPartSeq()" style="padding:2px 8px;border:1px solid #d5cec0;border-radius:3px;background:#faf8f4;cursor:pointer;font-size:.75rem;color:#4a4139">Copy</button>'
+      + '</div>'
+      + '<div style="background:#f0ebe3;border:1px solid #d5cec0;border-radius:4px;padding:6px 8px;font-family:SF Mono,Monaco,Consolas,monospace;font-size:.75rem;color:#4a4139;max-height:80px;overflow-y:auto;word-break:break-all;line-height:1.4">' + esc(displaySeq) + '</div>'
+      + '</div>';
+  }
+
+  var enabledChecked = p.enabled !== false ? 'checked' : '';
+
   el.innerHTML = '<div style="padding:12px 16px">'
     + '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
+    + '<input id="cd-part-enabled" type="checkbox" ' + enabledChecked + ' onchange="cdToggleEnabled()" title="Include in composite" style="width:16px;height:16px;cursor:pointer" />'
     + '<label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Name</label>'
     + '<input id="cd-part-name" type="text" value="' + esc(p.name) + '" style="flex:1;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-family:SF Mono,Monaco,Consolas,monospace;font-size:.85rem;color:#4a4139" />'
     + '<label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Color</label>'
@@ -313,8 +340,10 @@ function _cdRenderInspector() {
     + '<button onclick="cdOpenSeqPanel()" style="padding:5px 12px;background:#5b7a5e;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.82rem">\uD83D\uDCC2 Assign Sequence</button>'
     + '<button onclick="cdPasteSeq()" style="padding:5px 12px;background:#faf8f4;border:1px solid #d5cec0;border-radius:4px;cursor:pointer;font-size:.82rem;color:#4a4139">\uD83D\uDCCB Paste</button>'
     + '<button onclick="cdClearSeq()" style="padding:5px 12px;background:#faf8f4;border:1px solid #d5cec0;border-radius:4px;cursor:pointer;font-size:.82rem;color:#4a4139">\u2715 Clear Seq</button>'
+    + (p.seq ? '<button onclick="cdSavePartToDB()" style="padding:5px 12px;background:#faf8f4;border:1px solid #5b7a5e;border-radius:4px;cursor:pointer;font-size:.82rem;color:#5b7a5e">\uD83D\uDCBE Save to DB</button>' : '')
     + '<button onclick="cdDeletePart()" style="padding:5px 12px;background:#faf8f4;border:1px solid #C0392B;border-radius:4px;cursor:pointer;font-size:.82rem;color:#C0392B;margin-left:auto">\uD83D\uDDD1 Delete</button>'
     + '</div>'
+    + seqPreview
     + '</div>';
 
   // Bind change events
@@ -342,6 +371,54 @@ function _cdSetDir(d) {
 }
 window.cdSetDir = _cdSetDir;
 
+function _cdToggleEnabled() {
+  if (_cd.selectedIdx !== null && _cd.parts[_cd.selectedIdx]) {
+    _cd.parts[_cd.selectedIdx].enabled = !(_cd.parts[_cd.selectedIdx].enabled !== false);
+    _cd.dirty = true;
+    _cdRenderCanvas();
+    _cdRenderInspector();
+    _cdRenderComposite();
+  }
+}
+window.cdToggleEnabled = _cdToggleEnabled;
+
+function _cdSaveComposite() {
+  var active = _cdActiveParts();
+  if (!active.length) { toast('No enabled parts with sequences'); return; }
+  var fullSeq = active.map(function(p) { return p.seq; }).join('');
+  // Build annotations at part boundaries
+  var anns = [];
+  var offset = 0;
+  active.forEach(function(p) {
+    anns.push({ name: p.name, start: offset, end: offset + p.seq.length, direction: p.direction, color: p.color, type: p.type });
+    offset += p.seq.length;
+  });
+  // Use the circuits save-to-db endpoint
+  api('POST', '/api/circuits/export-gb', {
+    name: _cd.name || 'Circuit',
+    parts: active.map(function(p) {
+      return { name: p.name, seq: p.seq, type: p.type, color: p.color, direction: p.direction };
+    }),
+  }).then(function(r) {
+    // Save as plasmid via cloning bulk-save
+    var saveName = prompt('Save composite as:', _cd.name || 'Circuit');
+    if (!saveName) return;
+    return api('POST', '/api/cloning/bulk-save', {
+      items: [{
+        name: saveName,
+        seq: fullSeq,
+        type: 'plasmid',
+        annotations: anns,
+        topology: 'linear',
+      }],
+      overwrite: true,
+    });
+  }).then(function(data) {
+    if (data) toast('Saved composite: ' + data.saved[0].name + ' (' + data.saved[0].type + ')');
+  }).catch(function(e) { toast('Save failed: ' + e.message); });
+}
+window.cdSaveComposite = _cdSaveComposite;
+
 function _cdClearSeq() {
   if (_cd.selectedIdx !== null && _cd.parts[_cd.selectedIdx]) {
     _cd.parts[_cd.selectedIdx].seq = '';
@@ -354,6 +431,171 @@ function _cdClearSeq() {
 }
 window.cdClearSeq = _cdClearSeq;
 
+function _cdCopyPartSeq() {
+  if (_cd.selectedIdx !== null && _cd.parts[_cd.selectedIdx] && _cd.parts[_cd.selectedIdx].seq) {
+    navigator.clipboard.writeText(_cd.parts[_cd.selectedIdx].seq).then(function() { toast('Sequence copied'); });
+  }
+}
+window.cdCopyPartSeq = _cdCopyPartSeq;
+
+// ── Save-to-DB modal ──────────────────────────────────────────────────
+var SAVE_TARGETS = [
+  { key: 'parts',     label: 'Parts',     fields: ['name','description','sequence','project','subcategory','part_type','notes'] },
+  { key: 'kit_parts', label: 'Kit Parts', fields: ['name','kit_name','part_type','description'] },
+  { key: 'plasmids',  label: 'Plasmids',  fields: ['name','use'] },
+  { key: 'primers',   label: 'Primers',   fields: ['name','sequence','use'] },
+];
+
+function _cdOpenSaveModal(mode) {
+  // mode: 'single' or 'all'
+  if (mode === 'single') {
+    if (_cd.selectedIdx === null || !_cd.parts[_cd.selectedIdx] || !_cd.parts[_cd.selectedIdx].seq) {
+      toast('No sequence to save'); return;
+    }
+  } else {
+    var withSeq = _cdActiveParts();
+    if (!withSeq.length) { toast('No parts have sequences'); return; }
+  }
+  _cd._saveMode = mode;
+  _cd._saveTarget = 'parts';
+  _cdRenderSaveModal();
+}
+window.cdSavePartToDB = function() { _cdOpenSaveModal('single'); };
+window.cdSaveAllPartsToDB = function() { _cdOpenSaveModal('all'); };
+
+function _cdCloseSaveModal() {
+  var el = document.getElementById('cd-save-modal');
+  if (el) el.remove();
+}
+window.cdCloseSaveModal = _cdCloseSaveModal;
+
+function _cdSetSaveTarget(key) {
+  _cd._saveTarget = key;
+  _cdRenderSaveModal();
+}
+window.cdSetSaveTarget = _cdSetSaveTarget;
+
+function _cdRenderSaveModal() {
+  _cdCloseSaveModal();
+  var mode = _cd._saveMode;
+  var targetKey = _cd._saveTarget;
+  var target = SAVE_TARGETS.find(function(t) { return t.key === targetKey; });
+
+  // Gather parts to save
+  var partsToSave = [];
+  if (mode === 'single') {
+    partsToSave = [_cd.parts[_cd.selectedIdx]];
+  } else {
+    partsToSave = _cdActiveParts();
+  }
+
+  var overlay = document.createElement('div');
+  overlay.id = 'cd-save-modal';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(60,52,42,.35);z-index:2000;display:flex;align-items:center;justify-content:center';
+
+  var partsList = partsToSave.map(function(p) {
+    return '<div style="padding:4px 0;font-size:.85rem"><span style="color:#5b7a5e;font-weight:600">' + esc(p.name) + '</span> <span style="color:#8a7f72">' + p.seq.length + ' bp</span></div>';
+  }).join('');
+
+  // Target selector tabs
+  var tabs = SAVE_TARGETS.map(function(t) {
+    var active = t.key === targetKey;
+    return '<button onclick="cdSetSaveTarget(\x27' + t.key + '\x27)" style="padding:5px 12px;border:1px solid ' + (active ? '#5b7a5e' : '#d5cec0') + ';border-radius:4px;background:' + (active ? '#5b7a5e' : '#faf8f4') + ';color:' + (active ? '#fff' : '#4a4139') + ';cursor:pointer;font-size:.82rem">' + t.label + '</button>';
+  }).join('');
+
+  // Extra fields based on target
+  var extraFields = '';
+  if (targetKey === 'parts') {
+    extraFields = '<div style="display:flex;gap:8px;margin-bottom:8px">'
+      + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Project</label>'
+      + '<input id="cd-save-project" type="text" value="' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
+      + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Subcategory</label>'
+      + '<input id="cd-save-subcategory" type="text" value="" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
+      + '</div>'
+      + '<div style="margin-bottom:8px"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Notes</label>'
+      + '<input id="cd-save-notes" type="text" value="" placeholder="Optional notes..." style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>';
+  } else if (targetKey === 'kit_parts') {
+    extraFields = '<div style="display:flex;gap:8px;margin-bottom:8px">'
+      + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Kit Name</label>'
+      + '<input id="cd-save-kit" type="text" value="Circuit Design" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
+      + '</div>';
+  } else if (targetKey === 'plasmids') {
+    extraFields = '<div style="margin-bottom:8px"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Use / Description</label>'
+      + '<input id="cd-save-use" type="text" value="Circuit design: ' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>';
+  } else if (targetKey === 'primers') {
+    extraFields = '<div style="margin-bottom:8px"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Use / Description</label>'
+      + '<input id="cd-save-use" type="text" value="Circuit design: ' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>';
+  }
+
+  overlay.innerHTML = '<div style="background:#faf8f4;border:1px solid #d5cec0;border-radius:8px;padding:20px;width:480px;max-width:90vw;max-height:80vh;overflow-y:auto;box-shadow:0 8px 40px rgba(0,0,0,.18)">'
+    + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
+    + '<span style="font-weight:700;font-size:1rem;color:#4a4139">Save ' + (mode === 'single' ? 'Part' : partsToSave.length + ' Parts') + ' to Database</span>'
+    + '<button onclick="cdCloseSaveModal()" style="background:none;border:none;font-size:1.2rem;cursor:pointer;color:#8a7f72">\u2715</button>'
+    + '</div>'
+    + '<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72;margin-bottom:6px">Save to</div>'
+    + '<div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">' + tabs + '</div>'
+    + '<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72;margin-bottom:6px">' + (mode === 'single' ? 'Part' : 'Parts') + ' to save</div>'
+    + '<div style="background:#f0ebe3;border:1px solid #d5cec0;border-radius:4px;padding:8px 10px;margin-bottom:14px;max-height:120px;overflow-y:auto">' + partsList + '</div>'
+    + extraFields
+    + '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">'
+    + '<button onclick="cdCloseSaveModal()" style="padding:6px 16px;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;cursor:pointer;font-size:.85rem;color:#4a4139">Cancel</button>'
+    + '<button onclick="cdConfirmSave()" style="padding:6px 16px;border:none;border-radius:4px;background:#5b7a5e;color:#fff;cursor:pointer;font-size:.85rem">\uD83D\uDCBE Save</button>'
+    + '</div>'
+    + '</div>';
+
+  document.body.appendChild(overlay);
+  // Close on overlay click
+  overlay.addEventListener('click', function(e) { if (e.target === overlay) _cdCloseSaveModal(); });
+}
+
+function _cdConfirmSave() {
+  var mode = _cd._saveMode;
+  var targetKey = _cd._saveTarget;
+  var partsToSave = [];
+  if (mode === 'single') {
+    partsToSave = [_cd.parts[_cd.selectedIdx]];
+  } else {
+    partsToSave = _cdActiveParts();
+  }
+
+  // Gather extra fields
+  var extra = {};
+  if (targetKey === 'parts') {
+    var projEl = document.getElementById('cd-save-project');
+    var subEl = document.getElementById('cd-save-subcategory');
+    var notesEl = document.getElementById('cd-save-notes');
+    extra.project = projEl ? projEl.value : _cd.name;
+    extra.subcategory = subEl ? subEl.value : '';
+    extra.notes = notesEl ? notesEl.value : '';
+  } else if (targetKey === 'kit_parts') {
+    var kitEl = document.getElementById('cd-save-kit');
+    extra.kit_name = kitEl ? kitEl.value : 'Circuit Design';
+  } else if (targetKey === 'plasmids' || targetKey === 'primers') {
+    var useEl = document.getElementById('cd-save-use');
+    extra.use = useEl ? useEl.value : '';
+  }
+
+  api('POST', '/api/circuits/save-to-db', {
+    target: targetKey,
+    circuit_name: _cd.name,
+    extra: extra,
+    parts: partsToSave.map(function(p) {
+      return {
+        name: p.name,
+        sequence: p.seq,
+        part_type: p.type,
+        source: p.seqSource || '',
+        direction: p.direction,
+      };
+    }),
+  }).then(function(r) {
+    _cdCloseSaveModal();
+    var targetLabel = (SAVE_TARGETS.find(function(t) { return t.key === targetKey; }) || {}).label || targetKey;
+    toast('Saved ' + r.count + ' to ' + targetLabel);
+  }).catch(function(e) { toast('Save failed: ' + e.message); });
+}
+window.cdConfirmSave = _cdConfirmSave;
+
 function _cdPasteSeq() {
   _cdOpenSeqPanel(_cd.selectedIdx, true);
 }
@@ -363,31 +605,138 @@ window.cdPasteSeq = _cdPasteSeq;
 function _cdRenderComposite() {
   var el = document.getElementById('cd-composite');
   if (!el) return;
-  var withSeq = _cd.parts.filter(function(p) { return p.seq; });
+  var withSeq = _cdActiveParts();
   var totalBp = 0;
   withSeq.forEach(function(p) { totalBp += p.seq.length; });
+
+  var vizBtnStyle = _cd.compositeOpen
+    ? 'padding:4px 10px;border:1px solid #4682B4;border-radius:4px;background:#4682B4;color:#fff;cursor:pointer;font-size:.82rem'
+    : 'padding:4px 10px;border:1px solid #4682B4;border-radius:4px;background:#faf8f4;color:#4682B4;cursor:pointer;font-size:.82rem';
 
   el.innerHTML = '<div style="padding:10px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">'
     + '<span style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Composite</span>'
     + '<span style="font-weight:600;color:#4a4139">' + totalBp.toLocaleString() + ' bp</span>'
     + '<span style="color:#8a7f72">(' + withSeq.length + '/' + _cd.parts.length + ' parts with sequence)</span>'
     + '<span style="margin-left:auto;display:flex;gap:6px">'
+    + (withSeq.length > 0 ? '<button onclick="cdToggleCompositeViz()" style="' + vizBtnStyle + '">\uD83E\uDDEC ' + (_cd.compositeOpen ? 'Hide' : 'View') + ' Map</button>' : '')
     + '<button onclick="cdCopyComposite()" style="padding:4px 10px;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;cursor:pointer;font-size:.82rem;color:#4a4139">Copy</button>'
     + '<button onclick="cdExportGB()" style="padding:4px 10px;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;cursor:pointer;font-size:.82rem;color:#4a4139">Export .gb</button>'
     + '<button onclick="cdExportSVG()" style="padding:4px 10px;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;cursor:pointer;font-size:.82rem;color:#4a4139">Export SVG</button>'
+    + (withSeq.length > 0 ? '<button onclick="cdSaveComposite()" style="padding:4px 10px;border:1px solid #4682B4;border-radius:4px;background:#4682B4;color:#fff;cursor:pointer;font-size:.82rem">\uD83D\uDCBE Save Circuit</button>' : '')
+    + '<button onclick="cdSaveAllPartsToDB()" style="padding:4px 10px;border:1px solid #5b7a5e;border-radius:4px;background:#5b7a5e;color:#fff;cursor:pointer;font-size:.82rem">\uD83D\uDCBE Save Parts</button>'
     + '</span>'
     + '</div>';
+
+  // Render or hide composite SeqViz
+  _cdRenderCompositeViz();
+}
+
+// ── Composite SeqViz viewer ────────────────────────────────────────────
+function _cdToggleCompositeViz() {
+  _cd.compositeOpen = !_cd.compositeOpen;
+  _cdRenderComposite();
+}
+window.cdToggleCompositeViz = _cdToggleCompositeViz;
+
+function _cdRenderCompositeViz() {
+  var el = document.getElementById('cd-composite-seqviz');
+  if (!el) return;
+
+  if (!_cd.compositeOpen) {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+
+  var withSeq = _cdActiveParts();
+  if (!withSeq.length) {
+    el.style.display = 'none';
+    return;
+  }
+
+  el.style.display = 'block';
+  el.innerHTML = '<div style="border-top:1px solid #d5cec0;padding:8px 16px 4px">'
+    + '<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72;margin-bottom:6px">\uD83E\uDDEC Composite Sequence Map</div>'
+    + '</div>'
+    + '<div id="cd-composite-mount" style="height:400px;border:1px solid #d5cec0;margin:0 16px 16px;border-radius:4px;overflow:hidden"></div>';
+
+  // Build concatenated sequence + annotations at part boundaries
+  var fullSeq = '';
+  var annotations = [];
+  withSeq.forEach(function(p) {
+    var start = fullSeq.length;
+    fullSeq += p.seq;
+    var end = fullSeq.length;
+    annotations.push({
+      name: p.name,
+      start: start,
+      end: end,
+      direction: p.direction || 1,
+      color: p.color || '#95A5A6',
+    });
+  });
+
+  // Load seqviz and render
+  _cdEnsureScripts().then(function() {
+    var mount = document.getElementById('cd-composite-mount');
+    if (!mount || !window.seqviz || typeof window.seqviz.Viewer !== 'function') return;
+    mount.innerHTML = '';
+    try {
+      var viewer = window.seqviz.Viewer('cd-composite-mount', {
+        name: _cd.name || 'Circuit',
+        seq: fullSeq,
+        annotations: annotations,
+        style: { height: '100%', width: '100%' },
+        viewer: 'both',
+        showComplement: true,
+        showIndex: true,
+      });
+      viewer.render();
+    } catch (err) {
+      console.error('[circuits] Composite SeqViz error:', err);
+      mount.innerHTML = '<div style="padding:20px;color:#C0392B">SeqViz error: ' + esc(err.message) + '</div>';
+    }
+  });
+}
+
+// ── Inbox draining (from cloning feature) ──────────────────────────────
+function _cdDrainInbox() {
+  var inbox = window._circuitInbox;
+  if (!inbox || !inbox.length) return;
+  var added = 0;
+  while (inbox.length > 0) {
+    var item = inbox.shift();
+    if (!item || !item.seq) continue;
+    var sbolType = item.type || 'misc';
+    var def = SBOL_PARTS.find(function(p) { return p.key === sbolType; }) || SBOL_PARTS[SBOL_PARTS.length - 1];
+    _cd.parts.push({
+      id: _cd.nextId++,
+      type: sbolType,
+      name: item.name || def.name,
+      color: def.color,
+      seq: item.seq,
+      seqSource: item.source || '',
+      direction: 1,
+      enabled: true,
+    });
+    added++;
+  }
+  if (added > 0) {
+    _cd.dirty = true;
+    _cd.selectedIdx = _cd.parts.length - 1;
+    toast(added === 1 ? 'Part added from Cloning' : added + ' parts added from Cloning');
+  }
 }
 
 function _cdCopyComposite() {
-  var seq = _cd.parts.filter(function(p) { return p.seq; }).map(function(p) { return p.seq; }).join('');
+  var seq = _cdActiveParts().map(function(p) { return p.seq; }).join('');
   if (!seq) { toast('No sequences to copy'); return; }
   navigator.clipboard.writeText(seq).then(function() { toast('Composite sequence copied'); });
 }
 window.cdCopyComposite = _cdCopyComposite;
 
 function _cdExportGB() {
-  var partsWithSeq = _cd.parts.filter(function(p) { return p.seq; });
+  var partsWithSeq = _cdActiveParts();
   if (!partsWithSeq.length) { toast('No parts have sequences'); return; }
   api('POST', '/api/circuits/export-gb', {
     name: _cd.name,
@@ -816,6 +1165,9 @@ function _cdRender() {
   var container = document.getElementById('circuits-view');
   if (!container) return;
 
+  // Drain inbox from cloning feature
+  _cdDrainInbox();
+
   container.innerHTML = '<div style="background:#faf8f4;min-height:100vh;color:#4a4139;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif">'
     // Top bar
     + '<div style="display:flex;align-items:center;padding:12px 20px;border-bottom:1px solid #d5cec0;gap:12px;flex-wrap:wrap">'
@@ -842,6 +1194,7 @@ function _cdRender() {
     + '<div id="cd-canvas" style="padding:16px;border-bottom:1px solid #d5cec0;overflow-x:auto;min-height:140px"></div>'
     + '<div id="cd-inspector" style="border-bottom:1px solid #d5cec0;min-height:60px"></div>'
     + '<div id="cd-composite" style="min-height:40px"></div>'
+    + '<div id="cd-composite-seqviz" style="display:none"></div>'
     + '</div>'
     + '</div>'
     // Seq panel overlay

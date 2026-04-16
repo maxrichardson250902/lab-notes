@@ -102,7 +102,7 @@ async function load() {
     // Don't re-render if user is typing
     const active = document.activeElement;
     const typing = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT');
-    if (!typing) await loadView();
+    if (!typing && !(window._cl && window._cl.pd && window._cl.pd.kld.designing)) await loadView();
   } catch (e) { console.error(e); }
 }
 

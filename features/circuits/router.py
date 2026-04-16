@@ -45,6 +45,19 @@ class ExportGBRequest(BaseModel):
     name: str
     parts: List[ExportPartInput]
 
+class SavePartInput(BaseModel):
+    name: str
+    sequence: str
+    part_type: Optional[str] = ""
+    source: Optional[str] = ""
+    direction: Optional[int] = 1
+
+class SaveToDBRequest(BaseModel):
+    target: str  # parts, kit_parts, plasmids, primers
+    circuit_name: str
+    extra: Optional[dict] = {}
+    parts: List[SavePartInput]
+
 # ---------------------------------------------------------------------------
 # GenBank parser (uses BioPython)
 # ---------------------------------------------------------------------------
@@ -411,3 +424,80 @@ def export_gb(body: ExportGBRequest):
         "length": len(full_seq),
         "num_parts": len(parts_with_seq),
     }
+
+
+# ---------------------------------------------------------------------------
+# Save circuit parts to any DB table
+# ---------------------------------------------------------------------------
+VALID_TARGETS = ("parts", "kit_parts", "plasmids", "primers")
+
+@router.post("/circuits/save-to-db")
+def save_to_db(body: SaveToDBRequest):
+    """Save one or more circuit parts to the chosen DB table."""
+    if body.target not in VALID_TARGETS:
+        raise HTTPException(400, f"Invalid target: {body.target}. Must be one of {VALID_TARGETS}")
+
+    now = datetime.utcnow().isoformat()
+    extra = body.extra or {}
+    saved = []
+
+    with get_db() as conn:
+        for p in body.parts:
+            seq = p.sequence.upper().replace(" ", "").replace("\n", "")
+            if not seq:
+                continue
+
+            direction_label = "forward" if p.direction == 1 else "reverse"
+            source_desc = f"From {p.source}" if p.source else f"Circuit: {body.circuit_name}"
+
+            if body.target == "parts":
+                cur = conn.execute(
+                    "INSERT INTO parts (name, description, sequence, length, project, "
+                    "subcategory, part_type, notes, created) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        p.name,
+                        source_desc,
+                        seq,
+                        len(seq),
+                        extra.get("project", body.circuit_name),
+                        extra.get("subcategory", ""),
+                        p.part_type or "",
+                        extra.get("notes", f"{p.part_type} ({direction_label})"),
+                        now,
+                    ),
+                )
+            elif body.target == "kit_parts":
+                cur = conn.execute(
+                    "INSERT INTO kit_parts (name, kit_name, part_type, description, created) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        p.name,
+                        extra.get("kit_name", "Circuit Design"),
+                        p.part_type or "",
+                        source_desc,
+                        now,
+                    ),
+                )
+            elif body.target == "plasmids":
+                cur = conn.execute(
+                    "INSERT INTO plasmids (name, use, created) VALUES (?,?,?)",
+                    (
+                        p.name,
+                        extra.get("use", source_desc),
+                        now,
+                    ),
+                )
+            elif body.target == "primers":
+                cur = conn.execute(
+                    "INSERT INTO primers (name, sequence, use, created) VALUES (?,?,?,?)",
+                    (
+                        p.name,
+                        seq,
+                        extra.get("use", source_desc),
+                        now,
+                    ),
+                )
+
+            saved.append({"id": cur.lastrowid, "name": p.name, "length": len(seq)})
+        conn.commit()
+    return {"saved": saved, "count": len(saved)}

@@ -9,7 +9,7 @@ if (!document.getElementById('pl-css')) {
   var _css = document.createElement('style');
   _css.id = 'pl-css';
   _css.textContent = `
-.pl-root { display: flex; height: 100%; overflow: hidden; }
+.pl-root { display: flex; height: calc(100% - 43px); overflow: hidden; }
 
 /* ── sidebar ── */
 .pl-sb {
@@ -160,6 +160,20 @@ if (!document.getElementById('pl-css')) {
 @keyframes pldash { to { stroke-dashoffset: -22; } }
 .pl-hdl { fill: #5b7a5e; stroke: #faf8f4; stroke-width: 2.5; cursor: crosshair; }
 .pl-hdl:hover { fill: #4a6a4d; }
+
+/* ── pipeline tabs ── */
+.pl-tabs {
+  display: flex; gap: 0; border-bottom: 1px solid #d5cec0;
+  background: #faf8f4; flex-shrink: 0; padding: 0 16px;
+}
+.pl-tab {
+  padding: 10px 18px; font-size: .81rem; font-weight: 600; color: #8a7f72;
+  cursor: pointer; border-bottom: 2px solid transparent;
+  transition: color .15s, border-color .15s; background: none; border-top: none;
+  border-left: none; border-right: none; font-family: inherit;
+}
+.pl-tab:hover { color: #4a4139; }
+.pl-tab-on { color: #5b7a5e; border-bottom-color: #5b7a5e; }
 `;
   document.head.appendChild(_css);
 }
@@ -247,7 +261,11 @@ function plNodeHtml(s) {
 /* ═══════════════ DRAW ═══════════════ */
 function plDraw() {
   if (!_plEl) return;
-  _plEl.innerHTML = '<div class="pl-root">' + plSidebar() + plCanvas() + '</div>';
+  var tabs = '<div class="pl-tabs">' +
+    '<button class="pl-tab pl-tab-on">Pipelines</button>' +
+    '<button class="pl-tab" onclick="setView(\x27plan_converter\x27)">Plan \u2192 Pipeline</button>' +
+    '</div>';
+  _plEl.innerHTML = tabs + '<div class="pl-root">' + plSidebar() + plCanvas() + '</div>';
   plBind();
 }
 

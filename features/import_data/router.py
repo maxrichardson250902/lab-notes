@@ -93,6 +93,24 @@ register_table("kit_parts", """CREATE TABLE IF NOT EXISTS kit_parts (
     notes             TEXT,
     created           TEXT NOT NULL)""")
 
+register_table("parts", """CREATE TABLE IF NOT EXISTS parts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_id         INTEGER,
+    name              TEXT NOT NULL,
+    description       TEXT,
+    sequence          TEXT,
+    length            INTEGER,
+    project           TEXT DEFAULT '',
+    subcategory       TEXT DEFAULT '',
+    source_feature    TEXT,
+    source_id         TEXT,
+    part_type         TEXT,
+    box_location      TEXT,
+    glycerol_location TEXT,
+    gb_file           TEXT,
+    notes             TEXT,
+    created           TEXT NOT NULL)""")
+
 register_table("storage_boxes", """CREATE TABLE IF NOT EXISTS storage_boxes (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     name     TEXT NOT NULL,
@@ -233,16 +251,43 @@ def _ensure_migrations():
         return
     _migration_checked = True
     with get_db() as conn:
-        # plasmids: antibiotic_resistance, project
+        # plasmids: antibiotic_resistance, project, subcategory
         pcols = [row[1] for row in conn.execute("PRAGMA table_info(plasmids)").fetchall()]
         if "antibiotic_resistance" not in pcols:
             conn.execute("ALTER TABLE plasmids ADD COLUMN antibiotic_resistance TEXT DEFAULT ''")
         if "project" not in pcols:
             conn.execute("ALTER TABLE plasmids ADD COLUMN project TEXT DEFAULT ''")
-        # primers: project
+        if "subcategory" not in pcols:
+            conn.execute("ALTER TABLE plasmids ADD COLUMN subcategory TEXT DEFAULT ''")
+        # primers: project, subcategory
         prcols = [row[1] for row in conn.execute("PRAGMA table_info(primers)").fetchall()]
         if "project" not in prcols:
             conn.execute("ALTER TABLE primers ADD COLUMN project TEXT DEFAULT ''")
+        if "subcategory" not in prcols:
+            conn.execute("ALTER TABLE primers ADD COLUMN subcategory TEXT DEFAULT ''")
+        # gblocks: subcategory
+        try:
+            gcols = [row[1] for row in conn.execute("PRAGMA table_info(gblocks)").fetchall()]
+            if "subcategory" not in gcols:
+                conn.execute("ALTER TABLE gblocks ADD COLUMN subcategory TEXT DEFAULT ''")
+        except Exception:
+            pass
+        # kit_parts: subcategory
+        try:
+            kcols = [row[1] for row in conn.execute("PRAGMA table_info(kit_parts)").fetchall()]
+            if "subcategory" not in kcols:
+                conn.execute("ALTER TABLE kit_parts ADD COLUMN subcategory TEXT DEFAULT ''")
+        except Exception:
+            pass
+        # Stock status columns on all DNA tables
+        for _tbl in ("primers", "plasmids", "gblocks", "kit_parts", "parts"):
+            try:
+                _cols = [row[1] for row in conn.execute(f"PRAGMA table_info({_tbl})").fetchall()]
+                for _sc in ("stock_dna", "stock_glycerol", "stock_verified"):
+                    if _sc not in _cols:
+                        conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_sc} TEXT DEFAULT ''")
+            except Exception:
+                pass
         conn.commit()
 
 
@@ -254,15 +299,122 @@ def _ensure_migrations():
 def list_projects():
     _ensure_migrations()
     projects = set()
+    subcategories = {}  # project -> set of subcategories
     with get_db() as conn:
-        for tbl in ("primers", "plasmids", "gblocks", "kit_parts"):
+        for tbl in ("primers", "plasmids", "gblocks", "kit_parts", "parts"):
             try:
-                rows = conn.execute(f"SELECT DISTINCT project FROM {tbl} WHERE project IS NOT NULL AND project != ''").fetchall()
+                rows = conn.execute(f"SELECT DISTINCT project, subcategory FROM {tbl} WHERE project IS NOT NULL AND project != ''").fetchall()
                 for r in rows:
-                    projects.add(r["project"])
+                    proj = r["project"]
+                    sub = r["subcategory"] or ""
+                    projects.add(proj)
+                    if sub:
+                        if proj not in subcategories:
+                            subcategories[proj] = set()
+                        subcategories[proj].add(sub)
             except Exception:
                 pass
-    return {"projects": sorted(projects)}
+    return {
+        "projects": sorted(projects),
+        "subcategories": {k: sorted(v) for k, v in subcategories.items()}
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MOVE DNA BETWEEN TYPES
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MoveDnaRequest(BaseModel):
+    from_type: str    # primer, plasmid, gblock, kit_part
+    from_id: int
+    to_type: str      # primer, plasmid, gblock, kit_part
+
+# Map type -> (table, file_prefix)
+_TYPE_MAP = {
+    "primer":   ("primers",   "primer"),
+    "plasmid":  ("plasmids",  "plasmid"),
+    "gblock":   ("gblocks",   "gblock"),
+    "kit_part": ("kit_parts", "kitpart"),
+    "part":     ("parts",     "part"),
+}
+
+@router.post("/dna/move")
+def move_dna(body: MoveDnaRequest):
+    _ensure_migrations()
+    if body.from_type not in _TYPE_MAP or body.to_type not in _TYPE_MAP:
+        raise HTTPException(400, f"Types must be one of {list(_TYPE_MAP.keys())}")
+    if body.from_type == body.to_type:
+        raise HTTPException(400, "Source and destination types are the same")
+
+    src_table, src_prefix = _TYPE_MAP[body.from_type]
+    dst_table, dst_prefix = _TYPE_MAP[body.to_type]
+
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        row = conn.execute(f"SELECT * FROM {src_table} WHERE id=?", (body.from_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Source item not found")
+        src = dict(row)
+
+        # Common fields
+        name = src.get("name", "")
+        project = src.get("project", "")
+        subcategory = src.get("subcategory", "")
+        use = src.get("use", "") or src.get("description", "")
+        sequence = src.get("sequence", "")
+        gb_file = src.get("gb_file", "")
+
+        # Insert into destination
+        if body.to_type == "primer":
+            cur = conn.execute(
+                "INSERT INTO primers (name, sequence, use, box_number, project, subcategory, created) VALUES (?,?,?,?,?,?,?)",
+                (name, sequence, use, src.get("box_number", "") or src.get("box_location", ""), project, subcategory, now))
+        elif body.to_type == "plasmid":
+            cur = conn.execute(
+                "INSERT INTO plasmids (name, use, box_location, glycerol_location, project, subcategory, created) VALUES (?,?,?,?,?,?,?)",
+                (name, use, src.get("box_location", "") or src.get("box_number", ""),
+                 src.get("glycerol_location", ""), project, subcategory, now))
+        elif body.to_type == "gblock":
+            length = len(re.sub(r'[^ACGTacgt]', '', sequence)) if sequence else 0
+            cur = conn.execute(
+                "INSERT INTO gblocks (name, sequence, length, project, subcategory, use, supplier, box_number, notes, created) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (name, sequence, length, project, subcategory, use, src.get("supplier", ""),
+                 src.get("box_number", "") or src.get("box_location", ""), src.get("notes", ""), now))
+        elif body.to_type == "kit_part":
+            cur = conn.execute(
+                "INSERT INTO kit_parts (name, description, project, subcategory, resistance, box_location, "
+                "glycerol_location, notes, created) VALUES (?,?,?,?,?,?,?,?,?)",
+                (name, use, project, subcategory, src.get("resistance", "") or src.get("antibiotic_resistance", ""),
+                 src.get("box_location", "") or src.get("box_number", ""),
+                 src.get("glycerol_location", ""), src.get("notes", ""), now))
+        elif body.to_type == "part":
+            length = len(re.sub(r'[^ACGTacgt]', '', sequence)) if sequence else 0
+            cur = conn.execute(
+                "INSERT INTO parts (name, description, sequence, length, project, subcategory, source_feature, "
+                "part_type, box_location, glycerol_location, notes, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (name, use, sequence, length, project, subcategory,
+                 src.get("source_feature", ""), src.get("part_type", ""),
+                 src.get("box_location", "") or src.get("box_number", ""),
+                 src.get("glycerol_location", ""), src.get("notes", ""), now))
+
+        new_id = cur.lastrowid
+
+        # Move .gb file if it exists
+        if gb_file:
+            old_path = os.path.join(GB_DIR, f"{src_prefix}_{body.from_id}.gb")
+            new_path = os.path.join(GB_DIR, f"{dst_prefix}_{new_id}.gb")
+            if os.path.exists(old_path):
+                import shutil
+                shutil.copy2(old_path, new_path)
+                os.remove(old_path)
+            conn.execute(f"UPDATE {dst_table} SET gb_file=? WHERE id=?", (gb_file, new_id))
+
+        # Delete source
+        conn.execute(f"DELETE FROM {src_table} WHERE id=?", (body.from_id,))
+        conn.commit()
+
+    return {"ok": True, "new_type": body.to_type, "new_id": new_id}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -275,6 +427,7 @@ class CreatePrimer(BaseModel):
     use: Optional[str] = ""
     box_number: Optional[str] = ""
     project: Optional[str] = ""
+    subcategory: Optional[str] = ""
 
 class UpdatePrimer(BaseModel):
     name: Optional[str] = None
@@ -282,6 +435,10 @@ class UpdatePrimer(BaseModel):
     use: Optional[str] = None
     box_number: Optional[str] = None
     project: Optional[str] = None
+    subcategory: Optional[str] = None
+    stock_dna: Optional[str] = None
+    stock_glycerol: Optional[str] = None
+    stock_verified: Optional[str] = None
 
 @router.get("/primers")
 def list_primers():
@@ -296,8 +453,8 @@ def create_primer(body: CreatePrimer):
     now = datetime.utcnow().isoformat()
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO primers (name, sequence, use, box_number, project, created) VALUES (?,?,?,?,?,?)",
-            (body.name, body.sequence, body.use, body.box_number, body.project, now))
+            "INSERT INTO primers (name, sequence, use, box_number, project, subcategory, created) VALUES (?,?,?,?,?,?,?)",
+            (body.name, body.sequence, body.use, body.box_number, body.project, body.subcategory, now))
         conn.commit()
         row = dict(conn.execute("SELECT * FROM primers WHERE id=?", (cur.lastrowid,)).fetchone())
     return row
@@ -379,6 +536,7 @@ class CreatePlasmid(BaseModel):
     box_location: Optional[str] = ""
     glycerol_location: Optional[str] = ""
     project: Optional[str] = ""
+    subcategory: Optional[str] = ""
 
 class UpdatePlasmid(BaseModel):
     name: Optional[str] = None
@@ -387,6 +545,10 @@ class UpdatePlasmid(BaseModel):
     glycerol_location: Optional[str] = None
     antibiotic_resistance: Optional[str] = None
     project: Optional[str] = None
+    subcategory: Optional[str] = None
+    stock_dna: Optional[str] = None
+    stock_glycerol: Optional[str] = None
+    stock_verified: Optional[str] = None
 
 @router.get("/plasmids")
 def list_plasmids():
@@ -401,8 +563,8 @@ def create_plasmid(body: CreatePlasmid):
     now = datetime.utcnow().isoformat()
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO plasmids (name, use, box_location, glycerol_location, project, created) VALUES (?,?,?,?,?,?)",
-            (body.name, body.use, body.box_location, body.glycerol_location, body.project, now))
+            "INSERT INTO plasmids (name, use, box_location, glycerol_location, project, subcategory, created) VALUES (?,?,?,?,?,?,?)",
+            (body.name, body.use, body.box_location, body.glycerol_location, body.project, body.subcategory, now))
         conn.commit()
         row = dict(conn.execute("SELECT * FROM plasmids WHERE id=?", (cur.lastrowid,)).fetchone())
     return row
@@ -507,6 +669,7 @@ class CreateGblock(BaseModel):
     name: str
     sequence: Optional[str] = ""
     project: Optional[str] = ""
+    subcategory: Optional[str] = ""
     use: Optional[str] = ""
     supplier: Optional[str] = "IDT"
     order_id: Optional[str] = ""
@@ -517,16 +680,80 @@ class UpdateGblock(BaseModel):
     name: Optional[str] = None
     sequence: Optional[str] = None
     project: Optional[str] = None
+    subcategory: Optional[str] = None
     use: Optional[str] = None
     supplier: Optional[str] = None
     order_id: Optional[str] = None
     box_number: Optional[str] = None
     notes: Optional[str] = None
+    stock_dna: Optional[str] = None
+    stock_glycerol: Optional[str] = None
+    stock_verified: Optional[str] = None
 
 def _calc_gblock_length(seq: str) -> int:
     if not seq:
         return 0
     return len(re.sub(r'[^ACGTacgt]', '', seq))
+
+
+def _extract_seq_from_gb(contents: bytes) -> str:
+    """Extract the DNA sequence from a GenBank file."""
+    if not HAS_BIOPYTHON:
+        return ""
+    try:
+        from Bio import SeqIO
+        records = list(SeqIO.parse(io.StringIO(contents.decode("utf-8", errors="replace")), "genbank"))
+        if records:
+            return str(records[0].seq)
+    except Exception:
+        pass
+    return ""
+
+
+def _generate_gb_for_gblock(item_id: int, name: str, sequence: str):
+    """Generate a minimal GenBank file from a name and sequence, save to disk,
+    and return the filename. Returns empty string if BioPython not available or no sequence."""
+    if not sequence or not HAS_BIOPYTHON:
+        return ""
+    clean_seq = re.sub(r'[^ACGTacgtNn]', '', sequence)
+    if not clean_seq:
+        return ""
+    try:
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio import SeqIO as _SeqIO
+
+        rec = SeqRecord(
+            Seq(clean_seq.upper()),
+            id=name[:10].replace(" ", "_"),
+            name=name[:10].replace(" ", "_"),
+            description=name,
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        # Add a source feature
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, len(clean_seq)),
+            type="source",
+            qualifiers={"mol_type": ["other DNA"], "organism": ["synthetic construct"],
+                        "label": [name]},
+        ))
+        # Add a misc_feature spanning the whole gBlock
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, len(clean_seq)),
+            type="misc_feature",
+            qualifiers={"label": [name], "note": ["gBlock synthetic fragment"]},
+        ))
+
+        gb_path = os.path.join(GB_DIR, f"gblock_{item_id}.gb")
+        with open(gb_path, "w") as f:
+            _SeqIO.write(rec, f, "genbank")
+
+        filename = f"{name}.gb".replace(" ", "_")
+        return filename
+    except Exception:
+        return ""
+
 
 @router.get("/gblocks")
 def list_gblocks():
@@ -540,12 +767,22 @@ def create_gblock(body: CreateGblock):
     length = _calc_gblock_length(body.sequence or "")
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO gblocks (name, sequence, length, project, use, supplier, order_id, box_number, notes, created) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (body.name, body.sequence, length, body.project, body.use,
+            "INSERT INTO gblocks (name, sequence, length, project, subcategory, use, supplier, order_id, box_number, notes, created) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (body.name, body.sequence, length, body.project, body.subcategory, body.use,
              body.supplier, body.order_id, body.box_number, body.notes, now))
         conn.commit()
-        row = dict(conn.execute("SELECT * FROM gblocks WHERE id=?", (cur.lastrowid,)).fetchone())
+        item_id = cur.lastrowid
+
+        # Auto-generate .gb from sequence if sequence provided and no .gb will be uploaded separately
+        gb_file = ""
+        if body.sequence and body.sequence.strip():
+            gb_file = _generate_gb_for_gblock(item_id, body.name, body.sequence)
+            if gb_file:
+                conn.execute("UPDATE gblocks SET gb_file=? WHERE id=?", (gb_file, item_id))
+                conn.commit()
+
+        row = dict(conn.execute("SELECT * FROM gblocks WHERE id=?", (item_id,)).fetchone())
     return row
 
 @router.put("/gblocks/{item_id}")
@@ -563,6 +800,15 @@ def update_gblock(item_id: int, body: UpdateGblock):
         sets = ", ".join(f"{k}=?" for k in fields)
         conn.execute(f"UPDATE gblocks SET {sets} WHERE id=?", (*fields.values(), item_id))
         conn.commit()
+
+        # Regenerate .gb if sequence was updated
+        if "sequence" in fields and fields["sequence"].strip():
+            name = fields.get("name") or dict(existing)["name"]
+            gb_file = _generate_gb_for_gblock(item_id, name, fields["sequence"])
+            if gb_file:
+                conn.execute("UPDATE gblocks SET gb_file=? WHERE id=?", (gb_file, item_id))
+                conn.commit()
+
         row = dict(conn.execute("SELECT * FROM gblocks WHERE id=?", (item_id,)).fetchone())
     return row
 
@@ -588,8 +834,18 @@ async def upload_gblock_gb(item_id: int, file: UploadFile = File(...)):
     stored = os.path.join(GB_DIR, f"gblock_{item_id}.gb")
     with open(stored, "wb") as f:
         f.write(contents)
+
+    # Extract sequence from the .gb file
+    extracted_seq = _extract_seq_from_gb(contents)
+    length = _calc_gblock_length(extracted_seq) if extracted_seq else (dict(row).get("length") or 0)
+
     with get_db() as conn:
-        conn.execute("UPDATE gblocks SET gb_file=? WHERE id=?", (file.filename, item_id))
+        if extracted_seq:
+            conn.execute(
+                "UPDATE gblocks SET gb_file=?, sequence=?, length=? WHERE id=?",
+                (file.filename, extracted_seq, length, item_id))
+        else:
+            conn.execute("UPDATE gblocks SET gb_file=? WHERE id=?", (file.filename, item_id))
         conn.commit()
         row = dict(conn.execute("SELECT * FROM gblocks WHERE id=?", (item_id,)).fetchone())
     return row
@@ -627,6 +883,7 @@ class CreateKitPart(BaseModel):
     part_type: Optional[str] = ""
     description: Optional[str] = ""
     project: Optional[str] = ""
+    subcategory: Optional[str] = ""
     resistance: Optional[str] = ""
     box_location: Optional[str] = ""
     glycerol_location: Optional[str] = ""
@@ -639,11 +896,15 @@ class UpdateKitPart(BaseModel):
     part_type: Optional[str] = None
     description: Optional[str] = None
     project: Optional[str] = None
+    subcategory: Optional[str] = None
     resistance: Optional[str] = None
     box_location: Optional[str] = None
     glycerol_location: Optional[str] = None
     source_url: Optional[str] = None
     notes: Optional[str] = None
+    stock_dna: Optional[str] = None
+    stock_glycerol: Optional[str] = None
+    stock_verified: Optional[str] = None
 
 @router.get("/kit-parts")
 def list_kit_parts():
@@ -656,9 +917,9 @@ def create_kit_part(body: CreateKitPart):
     now = datetime.utcnow().isoformat()
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO kit_parts (name, kit_name, part_type, description, project, resistance, "
-            "box_location, glycerol_location, source_url, notes, created) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (body.name, body.kit_name, body.part_type, body.description, body.project,
+            "INSERT INTO kit_parts (name, kit_name, part_type, description, project, subcategory, resistance, "
+            "box_location, glycerol_location, source_url, notes, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (body.name, body.kit_name, body.part_type, body.description, body.project, body.subcategory,
              body.resistance, body.box_location, body.glycerol_location, body.source_url, body.notes, now))
         conn.commit()
         row = dict(conn.execute("SELECT * FROM kit_parts WHERE id=?", (cur.lastrowid,)).fetchone())
@@ -728,6 +989,195 @@ def delete_kit_part_gb(item_id: int):
         conn.execute("UPDATE kit_parts SET gb_file=NULL WHERE id=?", (item_id,))
         conn.commit()
     return {"ok": True}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PARTS CRUD
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CreatePart(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    sequence: Optional[str] = ""
+    project: Optional[str] = ""
+    subcategory: Optional[str] = ""
+    source_feature: Optional[str] = ""
+    source_id: Optional[str] = ""
+    part_type: Optional[str] = ""
+    box_location: Optional[str] = ""
+    glycerol_location: Optional[str] = ""
+    notes: Optional[str] = ""
+
+class UpdatePart(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    sequence: Optional[str] = None
+    project: Optional[str] = None
+    subcategory: Optional[str] = None
+    source_feature: Optional[str] = None
+    source_id: Optional[str] = None
+    part_type: Optional[str] = None
+    box_location: Optional[str] = None
+    glycerol_location: Optional[str] = None
+    notes: Optional[str] = None
+    stock_dna: Optional[str] = None
+    stock_glycerol: Optional[str] = None
+    stock_verified: Optional[str] = None
+
+def _calc_part_length(seq: str) -> int:
+    if not seq:
+        return 0
+    return len(re.sub(r'[^ACGTacgt]', '', seq))
+
+@router.get("/parts")
+def list_parts():
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM parts ORDER BY name ASC").fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+@router.post("/parts")
+def create_part(body: CreatePart):
+    now = datetime.utcnow().isoformat()
+    length = _calc_part_length(body.sequence or "")
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO parts (name, description, sequence, length, project, subcategory, source_feature, "
+            "source_id, part_type, box_location, glycerol_location, notes, created) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (body.name, body.description, body.sequence, length, body.project, body.subcategory,
+             body.source_feature, body.source_id, body.part_type,
+             body.box_location, body.glycerol_location, body.notes, now))
+        conn.commit()
+        item_id = cur.lastrowid
+
+        # Auto-generate .gb from sequence
+        gb_file = ""
+        if body.sequence and body.sequence.strip():
+            gb_file = _generate_gb_for_part(item_id, body.name, body.sequence)
+            if gb_file:
+                conn.execute("UPDATE parts SET gb_file=? WHERE id=?", (gb_file, item_id))
+                conn.commit()
+
+        row = dict(conn.execute("SELECT * FROM parts WHERE id=?", (item_id,)).fetchone())
+    return row
+
+@router.put("/parts/{item_id}")
+def update_part(item_id: int, body: UpdatePart):
+    with get_db() as conn:
+        existing = conn.execute("SELECT * FROM parts WHERE id=?", (item_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Part not found")
+        fields = {k: v for k, v in body.dict().items() if v is not None}
+        if not fields:
+            return dict(existing)
+        if "sequence" in fields:
+            fields["length"] = _calc_part_length(fields["sequence"])
+        sets = ", ".join(f"{k}=?" for k in fields)
+        conn.execute(f"UPDATE parts SET {sets} WHERE id=?", (*fields.values(), item_id))
+        conn.commit()
+
+        # Regenerate .gb if sequence updated
+        if "sequence" in fields and fields["sequence"].strip():
+            name = fields.get("name") or dict(existing)["name"]
+            gb_file = _generate_gb_for_part(item_id, name, fields["sequence"])
+            if gb_file:
+                conn.execute("UPDATE parts SET gb_file=? WHERE id=?", (gb_file, item_id))
+                conn.commit()
+
+        row = dict(conn.execute("SELECT * FROM parts WHERE id=?", (item_id,)).fetchone())
+    return row
+
+@router.delete("/parts/{item_id}")
+def delete_part(item_id: int):
+    path = os.path.join(GB_DIR, f"part_{item_id}.gb")
+    if os.path.exists(path):
+        os.remove(path)
+    with get_db() as conn:
+        conn.execute("DELETE FROM parts WHERE id=?", (item_id,))
+        conn.commit()
+    return {"ok": True}
+
+# ── Part .gb file ────────────────────────────────────────────────────────────
+
+@router.post("/parts/{item_id}/gb")
+async def upload_part_gb(item_id: int, file: UploadFile = File(...)):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM parts WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Part not found")
+    contents = await file.read()
+    stored = os.path.join(GB_DIR, f"part_{item_id}.gb")
+    with open(stored, "wb") as f:
+        f.write(contents)
+    extracted_seq = _extract_seq_from_gb(contents)
+    length = _calc_part_length(extracted_seq) if extracted_seq else (dict(row).get("length") or 0)
+    with get_db() as conn:
+        if extracted_seq:
+            conn.execute("UPDATE parts SET gb_file=?, sequence=?, length=? WHERE id=?",
+                         (file.filename, extracted_seq, length, item_id))
+        else:
+            conn.execute("UPDATE parts SET gb_file=? WHERE id=?", (file.filename, item_id))
+        conn.commit()
+        row = dict(conn.execute("SELECT * FROM parts WHERE id=?", (item_id,)).fetchone())
+    return row
+
+@router.get("/parts/{item_id}/gb")
+def download_part_gb(item_id: int):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM parts WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Part not found")
+    stored = os.path.join(GB_DIR, f"part_{item_id}.gb")
+    if not os.path.exists(stored):
+        raise HTTPException(404, "No .gb file attached")
+    return FileResponse(stored, filename=row["gb_file"] or f"part_{item_id}.gb",
+                        media_type="application/octet-stream")
+
+@router.delete("/parts/{item_id}/gb")
+def delete_part_gb(item_id: int):
+    stored = os.path.join(GB_DIR, f"part_{item_id}.gb")
+    if os.path.exists(stored):
+        os.remove(stored)
+    with get_db() as conn:
+        conn.execute("UPDATE parts SET gb_file=NULL WHERE id=?", (item_id,))
+        conn.commit()
+    return {"ok": True}
+
+
+def _generate_gb_for_part(item_id: int, name: str, sequence: str):
+    """Generate a GenBank file for a part, same logic as gblocks."""
+    if not sequence or not HAS_BIOPYTHON:
+        return ""
+    clean_seq = re.sub(r'[^ACGTacgtNn]', '', sequence)
+    if not clean_seq:
+        return ""
+    try:
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio import SeqIO as _SeqIO
+
+        rec = SeqRecord(
+            Seq(clean_seq.upper()),
+            id=name[:10].replace(" ", "_"),
+            name=name[:10].replace(" ", "_"),
+            description=name,
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, len(clean_seq)), type="source",
+            qualifiers={"mol_type": ["other DNA"], "organism": ["synthetic construct"], "label": [name]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, len(clean_seq)), type="misc_feature",
+            qualifiers={"label": [name], "note": ["assembled part"]},
+        ))
+        gb_path = os.path.join(GB_DIR, f"part_{item_id}.gb")
+        with open(gb_path, "w") as f:
+            _SeqIO.write(rec, f, "genbank")
+        return f"{name}.gb".replace(" ", "_")
+    except Exception:
+        return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -858,6 +1308,129 @@ def clear_cell(box_id: int, body: CellClear):
     return {"ok": True, "layout": layout}
 
 
+class MultiCellAssign(BaseModel):
+    cells: list          # [{"row": "A", "col": 1}, {"row": "A", "col": 2}, ...]
+    item_type: str
+    item_id: int
+
+@router.put("/boxes/{box_id}/multi-cell")
+def assign_multi_cell(box_id: int, body: MultiCellAssign):
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        existing = conn.execute("SELECT * FROM storage_boxes WHERE id=?", (box_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Box not found")
+        try:
+            layout = json.loads(existing["layout"] or "{}")
+        except Exception:
+            layout = {}
+        for c in body.cells:
+            key = f"{c['row']}{c['col']}"
+            layout[key] = {"type": body.item_type, "id": body.item_id}
+        conn.execute("UPDATE storage_boxes SET layout=?, updated=? WHERE id=?",
+                     (json.dumps(layout), now, box_id))
+        conn.commit()
+    return {"ok": True, "layout": layout, "count": len(body.cells)}
+
+
+@router.get("/dna/box-positions/{item_type}/{item_id}")
+def get_box_positions(item_type: str, item_id: int):
+    """Reverse lookup: find all box cells containing a given item."""
+    positions = []
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, name, layout FROM storage_boxes").fetchall()
+    for r in rows:
+        try:
+            layout = json.loads(r["layout"] or "{}")
+        except Exception:
+            continue
+        for key, val in layout.items():
+            if val.get("type") == item_type and val.get("id") == item_id:
+                positions.append({"box_id": r["id"], "box_name": r["name"], "cell": key})
+    return {"positions": positions}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REINDEX (close gaps in naming)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ReindexRequest(BaseModel):
+    table: str           # primers, plasmids, gblocks, kit_parts, parts
+    prefix: str          # e.g. "MR", "pMR"
+    start_num: int = 1
+    execute: bool = False  # False = preview, True = apply
+
+_REINDEX_TABLES = {
+    "primers": "primers",
+    "plasmids": "plasmids",
+    "gblocks": "gblocks",
+    "kit_parts": "kit_parts",
+    "parts": "parts",
+}
+
+@router.post("/dna/reindex")
+def reindex_names(body: ReindexRequest):
+    table = _REINDEX_TABLES.get(body.table)
+    if not table:
+        raise HTTPException(400, f"table must be one of {list(_REINDEX_TABLES.keys())}")
+    prefix = body.prefix.strip()
+    if not prefix:
+        raise HTTPException(400, "prefix is required")
+
+    pattern = f"{prefix}%"
+    with get_db() as conn:
+        rows = conn.execute(
+            f"SELECT id, name FROM {table} WHERE name LIKE ? ORDER BY name ASC",
+            (pattern,)
+        ).fetchall()
+
+    if not rows:
+        return {"changes": [], "message": "No items match that prefix."}
+
+    # Parse numeric suffix, sort by number
+    items = []
+    for r in rows:
+        name = r["name"]
+        suffix = name[len(prefix):]
+        # Extract leading digits from suffix
+        digits = ""
+        for ch in suffix:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits and suffix == digits:  # only pure prefix+number names
+            items.append({"id": r["id"], "old_name": name, "old_num": int(digits)})
+
+    items.sort(key=lambda x: x["old_num"])
+
+    # Build rename plan
+    changes = []
+    next_num = body.start_num
+    for item in items:
+        new_name = f"{prefix}{next_num}"
+        if new_name != item["old_name"]:
+            changes.append({
+                "id": item["id"],
+                "old_name": item["old_name"],
+                "new_name": new_name
+            })
+        next_num += 1
+
+    if not body.execute:
+        return {"changes": changes, "total_items": len(items), "preview": True}
+
+    # Execute renames
+    renamed = 0
+    with get_db() as conn:
+        for c in changes:
+            conn.execute(f"UPDATE {table} SET name=? WHERE id=?", (c["new_name"], c["id"]))
+            renamed += 1
+        conn.commit()
+
+    return {"changes": changes, "renamed": renamed, "preview": False}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  DNA LINK SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -924,7 +1497,7 @@ class ImportRequest(BaseModel):
     temp_id: str
     ext: str
     filename: str = ""
-    record_type: str                       # primer, plasmid, gblock, kit_part
+    record_type: str                       # primer, plasmid, gblock, kit_part, part
     col_name: int
     col_sequence: Optional[int] = None
     col_use: Optional[int] = None
@@ -944,7 +1517,7 @@ class ImportRequest(BaseModel):
 
 @router.post("/import/execute")
 def execute_import(body: ImportRequest):
-    valid_types = ("primer", "plasmid", "gblock", "kit_part")
+    valid_types = ("primer", "plasmid", "gblock", "kit_part", "part")
     if body.record_type not in valid_types:
         raise HTTPException(400, f"record_type must be one of {valid_types}")
 
@@ -1006,6 +1579,16 @@ def execute_import(body: ImportRequest):
                      _cell(row, body.col_resistance), _cell(row, body.col_box_location),
                      _cell(row, body.col_glycerol_location), _cell(row, body.col_source_url),
                      _cell(row, body.col_notes), now))
+            elif body.record_type == "part":
+                seq = _cell(row, body.col_sequence)
+                length = _calc_part_length(seq)
+                conn.execute(
+                    "INSERT INTO parts (import_id, name, description, sequence, length, project, subcategory, "
+                    "part_type, box_location, glycerol_location, notes, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (import_id, name, _cell(row, body.col_description), seq, length,
+                     _cell(row, body.col_project), "",
+                     _cell(row, body.col_part_type), _cell(row, body.col_box_location),
+                     _cell(row, body.col_glycerol_location), _cell(row, body.col_notes), now))
             inserted += 1
 
         conn.execute("UPDATE imports SET record_count=? WHERE id=?", (inserted, import_id))
@@ -1026,7 +1609,7 @@ def delete_import(import_id: int):
         imp = conn.execute("SELECT * FROM imports WHERE id=?", (import_id,)).fetchone()
         if not imp:
             raise HTTPException(404, "Import not found")
-        table_map = {"primer": "primers", "plasmid": "plasmids", "gblock": "gblocks", "kit_part": "kit_parts"}
+        table_map = {"primer": "primers", "plasmid": "plasmids", "gblock": "gblocks", "kit_part": "kit_parts", "part": "parts"}
         table = table_map.get(imp["record_type"], "primers")
         conn.execute(f"DELETE FROM {table} WHERE import_id=?", (import_id,))
         conn.execute("DELETE FROM imports WHERE id=?", (import_id,))
