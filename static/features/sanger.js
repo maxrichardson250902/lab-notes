@@ -10,7 +10,7 @@ var SG = {
   refAnnos: [],
   refName: '',
   traces: {},           // {alignmentId: traceData}
-  plasmids: [],
+  refs: [],
   refMode: 'plasmid',
   zoom: 1.0,
   COL_W: 14,            // base px per column at 1x
@@ -94,9 +94,9 @@ async function renderList(el) {
 /* ── NEW ALIGNMENT VIEW ─────────────────────────────────── */
 async function renderNew(el) {
   try {
-    var seqData = await api('GET', '/api/cloning/sequences');
-    SG.plasmids = (seqData.items||[]).filter(function(s){return s.type==='plasmid';});
-  } catch(e) { SG.plasmids = []; }
+    var refData = await api('GET', '/api/sanger/references');
+    SG.refs = refData.items||[];
+  } catch(e) { SG.refs = []; }
 
   var h = '<div style="max-width:720px;margin:0 auto">';
   h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:24px">';
@@ -120,10 +120,22 @@ async function renderNew(el) {
   h += '</div>';
 
   if (SG.refMode === 'plasmid') {
-    h += '<select id="sg-ref-plasmid" class="sg-input"><option value="">Select a plasmid…</option>';
-    SG.plasmids.forEach(function(p) { h += '<option value="'+p.id+'">'+esc(p.name)+'</option>'; });
+    h += '<select id="sg-ref-plasmid" class="sg-input"><option value="">Select a reference…</option>';
+    // Group by type
+    var groups = {};
+    SG.refs.forEach(function(r) {
+      if (!groups[r.label]) groups[r.label] = [];
+      groups[r.label].push(r);
+    });
+    Object.keys(groups).forEach(function(label) {
+      h += '<optgroup label="'+esc(label)+'s">';
+      groups[label].forEach(function(r) {
+        h += '<option value="'+r.type+':'+r.id+'">'+esc(r.name)+'</option>';
+      });
+      h += '</optgroup>';
+    });
     h += '</select>';
-    if (!SG.plasmids.length) h += '<div style="color:#8a7f72;font-size:.85rem;margin-top:4px">No plasmids with .gb files found.</div>';
+    if (!SG.refs.length) h += '<div style="color:#8a7f72;font-size:.85rem;margin-top:4px">No items with .gb files found.</div>';
   } else if (SG.refMode === 'upload') {
     h += '<div class="sg-drop" onclick="document.getElementById(\'sg-ref-file\').click()" style="margin-top:8px">';
     h += '<div id="sg-ref-label">Drop FASTA or GenBank file here</div>';
@@ -190,8 +202,9 @@ async function sgRunAlign() {
 
   if(SG.refMode==='plasmid'){
     var sel=document.getElementById('sg-ref-plasmid');
-    if(!sel||!sel.value){toast('Select a plasmid',true);return;}
-    fd.append('ref_source','plasmid'); fd.append('ref_id',sel.value);
+    if(!sel||!sel.value){toast('Select a reference',true);return;}
+    var parts=sel.value.split(':');
+    fd.append('ref_source',parts[0]); fd.append('ref_id',parts[1]);
   } else if(SG.refMode==='upload'){
     var rf=document.getElementById('sg-ref-file');
     if(!rf||!rf.files[0]){toast('Select a reference file',true);return;}

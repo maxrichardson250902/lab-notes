@@ -166,13 +166,36 @@ def _get_feat_color(feat):
 def get_reference_sequence(ref_source, ref_id=None, ref_text=None):
     """Get reference sequence, name, and annotations."""
     annotations = []
-    if ref_source == "plasmid" and ref_id:
-        gb_path = pathlib.Path(f"/data/gb_files/plasmid_{ref_id}.gb")
-        if not gb_path.exists():
-            raise HTTPException(404, "Plasmid .gb file not found")
+    # Handle inventory items — ref_source is the table name, ref_id is the row id
+    INVENTORY_TABLES = {"plasmids", "gblocks", "kit_parts", "parts", "primers"}
+    # Map table name to singular prefix used in file naming
+    TABLE_TO_PREFIX = {
+        "plasmids": "plasmid", "gblocks": "gblock", "kit_parts": "kit_part",
+        "parts": "part", "primers": "primer",
+    }
+    if ref_source in INVENTORY_TABLES and ref_id:
+        with get_db() as conn:
+            row = conn.execute(
+                f"SELECT name, gb_file FROM {ref_source} WHERE id=?", (ref_id,)
+            ).fetchone()
+        if not row or not row["gb_file"]:
+            raise HTTPException(404, f"No .gb file for {ref_source} id {ref_id}")
+        # Try {prefix}_{id}.gb first (standard naming), then original gb_file value
+        prefix = TABLE_TO_PREFIX.get(ref_source, ref_source.rstrip("s"))
+        candidates = [
+            pathlib.Path(f"/data/gb_files/{prefix}_{ref_id}.gb"),
+            pathlib.Path(f"/data/gb_files/{row['gb_file']}"),
+        ]
+        gb_path = None
+        for c in candidates:
+            if c.exists():
+                gb_path = c
+                break
+        if not gb_path:
+            raise HTTPException(404, f".gb file not found for {ref_source} id {ref_id}")
         record = SeqIO.read(gb_path, "genbank")
         annotations = parse_gb_annotations(record)
-        return str(record.seq), record.name or f"plasmid_{ref_id}", annotations
+        return str(record.seq), row["name"] or record.name or f"{ref_source}_{ref_id}", annotations
     elif ref_source == "fasta" and ref_text:
         record = SeqIO.read(io.StringIO(ref_text), "fasta")
         return str(record.seq), record.id, annotations
@@ -184,6 +207,43 @@ def get_reference_sequence(ref_source, ref_id=None, ref_text=None):
         seq = ref_text.strip().upper().replace("\n", "").replace(" ", "")
         return seq, "manual_sequence", annotations
     raise HTTPException(400, "Invalid reference source")
+
+
+@router.get("/sanger/references")
+def list_references():
+    """Return all DNA items with .gb files across all inventory tables."""
+    items = []
+    tables = [
+        ("plasmids", "Plasmid", "plasmid"),
+        ("kit_parts", "Kit Part", "kit_part"),
+        ("parts", "Part", "part"),
+        ("gblocks", "gBlock", "gblock"),
+        ("primers", "Primer", "primer"),
+    ]
+    gb_dir = pathlib.Path("/data/gb_files")
+    with get_db() as conn:
+        for table, label, prefix in tables:
+            try:
+                rows = conn.execute(
+                    f"SELECT id, name, gb_file FROM {table} WHERE gb_file IS NOT NULL AND gb_file != ''"
+                ).fetchall()
+            except Exception:
+                continue
+            for r in rows:
+                # Check file exists via either naming convention
+                has_file = (
+                    (gb_dir / f"{prefix}_{r['id']}.gb").exists() or
+                    (gb_dir / r["gb_file"]).exists()
+                )
+                if not has_file:
+                    continue
+                items.append({
+                    "id": r["id"],
+                    "name": r["name"],
+                    "type": table,
+                    "label": label,
+                })
+    return {"items": items}
 
 
 # ── Alignment ────────────────────────────────────────────

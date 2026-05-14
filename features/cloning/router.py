@@ -191,6 +191,7 @@ class FragmentInput(BaseModel):
     no_overlap: Optional[bool] = False  # If true, primers for this fragment get no tails
     remove_stop: Optional[bool] = False   # Remove stop codon at 3' end of selected CDS
     remove_start: Optional[bool] = False  # Remove start codon at 5' end of selected CDS
+    is_vector: Optional[bool] = False     # Marks this fragment as the backbone vector
 
 class GibsonRequest(BaseModel):
     fragments: List[FragmentInput]
@@ -226,16 +227,32 @@ class DigestLigateRequest(BaseModel):
     criteria: Optional[PrimerCriteria] = None
 
 
+class PCRFragmentConfig(BaseModel):
+    template_seq: str
+    template_name: Optional[str] = "template"
+    template_annotations: Optional[List[dict]] = None
+    primer1_seq: str
+    primer1_name: Optional[str] = "Primer 1"
+    primer2_seq: str
+    primer2_name: Optional[str] = "Primer 2"
+    circular: Optional[bool] = True
+
+class RunFragmentInput(BaseModel):
+    name: str = "fragment"
+    seq: Optional[str] = None           # Direct DNA mode
+    annotations: Optional[List[dict]] = None
+    pcr: Optional[PCRFragmentConfig] = None  # PCR mode — if set, seq is ignored
+
 class RunGibsonAssemblyRequest(BaseModel):
-    fragments: List[FragmentInput]
+    fragments: List[RunFragmentInput]
     circular: Optional[bool] = True
     min_overlap: Optional[int] = 15
     max_overlap_scan: Optional[int] = 60
     min_identity: Optional[float] = 90.0  # percent
 
 class RunGoldenGateAssemblyRequest(BaseModel):
-    fragments: List[FragmentInput]
-    vector: Optional[FragmentInput] = None
+    fragments: List[RunFragmentInput]
+    vector: Optional[RunFragmentInput] = None
     enzyme: Optional[str] = "BsaI"
 
 
@@ -507,11 +524,9 @@ def _design_annealing_region(template: str, pos: int, direction: str, tm_target:
         if direction == "forward":
             candidate = _get_seq_region(template, pos, anneal_len)
         else:
-            # Reverse: go upstream from pos, then RC
-            bases = []
-            for i in range(anneal_len):
-                bases.append(template[(pos - 1 - i) % tpl_len])
-            candidate = _reverse_complement("".join(bases))
+            # Reverse: read forward from annealing start, then RC
+            anneal_start = (pos - anneal_len) % tpl_len
+            candidate = _reverse_complement(_get_seq_region(template, anneal_start, anneal_len))
 
         tm = _calc_tm(candidate)
         if tm > best_tm:
@@ -683,10 +698,8 @@ def design_kld_primers(template_seq: str, insert_seq: str = "",
                 fwd_at_pos.append((a_sc, pos, a_seq, anneal_len, a_tm, a_gc))
 
                 # Reverse at this position
-                bases = []
-                for i in range(anneal_len):
-                    bases.append(template_seq[(pos - 1 - i) % tpl_len])
-                r_seq = _reverse_complement("".join(bases))
+                r_anneal_start = (pos - anneal_len) % tpl_len
+                r_seq = _reverse_complement(_get_seq_region(template_seq, r_anneal_start, anneal_len))
                 r_tm = _calc_tm(r_seq)
                 r_gc = round(_gc_content(r_seq) * 100, 1)
                 r_sc = abs(r_tm - tm_target) * 2.0 + max(0, abs(r_gc - 50) - 10) * 0.5 + _self_comp_penalty(r_seq) + _gc_clamp_penalty(r_seq, _gc_w)
@@ -2157,6 +2170,37 @@ TYPE_IIS_ENZYMES = {
 # Validated high-fidelity overhang sets (NEB)
 GOLDEN_OVERHANGS = ["AATG", "AGGT", "GCTT", "TACA", "TTCG", "CAGT", "GATC", "ACGA", "TGAC", "CTGA"]
 
+# Known C/N-terminal purification/epitope tag sequences
+KNOWN_TAG_SEQS = {
+    "His6":    "CACCACCACCACCACCAC",
+    "His8":    "CACCACCACCACCACCACCACCACCAC",
+    "FLAG":    "GACTACAAGGACGACGACGACAAG",
+    "HA":      "TACCCATACGATGTTCCAGATTACGCT",
+    "Myc":     "GAACAAAAACTCATCTCAGAAGAGGATCTG",
+    "Strep":   "TGGAGCCACCCGCAGTTCGAAAAG",
+    "StrepII": "TGGAGCCACCCGCAGTTCGAAAAG",
+    "V5":      "GGTAAGCCTATCCCTAACCCTCTCCTCGGTCTCGATTCTACG",
+}
+_STOP_CODON_SET = {"TAA", "TAG", "TGA"}
+
+
+def _scan_region_for_tags(seq_region: str, scan_len: int = 150) -> dict:
+    """Scan a DNA region for known tags and in-frame stop codons.
+    Returns dict with detected_tags, stop_pos (first in-frame stop), and the scanned region."""
+    region = seq_region[:scan_len].upper()
+    detected = []
+    for tag_name, tag_seq in KNOWN_TAG_SEQS.items():
+        if tag_seq in region:
+            detected.append(tag_name)
+    # Check for in-frame stop codon (frame 0)
+    stop_pos = None
+    for ci in range(0, min(len(region) - 2, scan_len), 3):
+        codon = region[ci:ci + 3]
+        if codon in _STOP_CODON_SET:
+            stop_pos = ci
+            break
+    return {"tags": detected, "stop_pos": stop_pos}
+
 
 def _check_internal_sites(seq: str, site: str, rc_site: str) -> list:
     """Check for internal enzyme recognition sites in a fragment."""
@@ -2194,11 +2238,10 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
     warnings = []
 
     # ── Stop / start codon removal ──
-    STOP_CODONS_SET = {"TAA", "TAG", "TGA"}
     for i, f in enumerate(fragments):
         if f.get("remove_stop"):
             last3 = seqs[i][-3:]
-            if last3 in STOP_CODONS_SET:
+            if last3 in _STOP_CODON_SET:
                 seqs[i] = seqs[i][:-3]
                 warnings.append(f"'{f['name']}': removed 3ʹ stop codon ({last3}) for tag readthrough")
             else:
@@ -2219,6 +2262,76 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
     junctions = []
     all_primers = []
     ol_per_side = overlap_length  # full overlap per side (NEB: "15-25bp overlap with adjacent fragment")
+
+    # ── Vector tag detection (Gibson) ──
+    # In circular Gibson, fragment order is [vector, insert1, insert2, ...].
+    # Last insert 3' → vector 5' (start): scan for C-terminal tags
+    # Vector 3' (end) → first insert 5': scan for N-terminal tags
+    vec_idx = None
+    vec_tag_info = None
+    for i, f in enumerate(fragments):
+        if f.get("is_vector"):
+            vec_idx = i
+            break
+
+    if vec_idx is not None and circular and n_frags >= 2:
+        vec_seq_upper = seqs[vec_idx]
+        # C-terminal: what follows the last insert = start of vector sequence
+        ct_scan = _scan_region_for_tags(vec_seq_upper[:150])
+        # N-terminal: what precedes the first insert = end of vector sequence
+        nt_region = vec_seq_upper[-150:] if len(vec_seq_upper) >= 150 else vec_seq_upper
+        # Reverse the scan region since we're looking backwards — actually no,
+        # tags upstream would be in the reading frame going forward, so scan as-is
+        nt_scan = _scan_region_for_tags(nt_region)
+
+        ct_tags = ct_scan["tags"]
+        nt_tags = nt_scan["tags"]
+
+        vec_tag_info = {
+            "c_terminal_tags": ct_tags,
+            "n_terminal_tags": nt_tags,
+            "has_downstream_stop": ct_scan["stop_pos"] is not None,
+            "downstream_stop_pos": ct_scan["stop_pos"],
+            "frame_ok": overlap_length % 3 == 0,
+            "overlap_length": overlap_length,
+        }
+
+        if ct_tags:
+            tag_str = ", ".join(ct_tags)
+            warnings.append(f"Vector has C-terminal tag(s): {tag_str}")
+            if ct_scan["stop_pos"] is not None:
+                warnings.append(f"In-frame stop codon at +{ct_scan['stop_pos']}bp after insert site")
+            else:
+                warnings.append(f"⚠ No in-frame stop codon found downstream of insert site — check vector reading frame")
+            if overlap_length % 3 != 0:
+                warnings.append(
+                    f"⚠ Overlap length ({overlap_length}bp) is not divisible by 3 — "
+                    f"C-terminal tag may be out of frame (try {overlap_length - (overlap_length % 3)} or {overlap_length + 3 - (overlap_length % 3)}bp)"
+                )
+            # Auto-warn about insert fragments with stop codons
+            for i, f in enumerate(fragments):
+                if i == vec_idx:
+                    continue
+                s = seqs[i]
+                last3 = s[-3:] if len(s) >= 3 else ""
+                if last3 in _STOP_CODON_SET and not f.get("remove_stop"):
+                    warnings.append(
+                        f"'{f['name']}' ends with stop codon ({last3}) — "
+                        f"enable 'Remove stop' for C-terminal {tag_str} tag readthrough"
+                    )
+        if nt_tags:
+            tag_str = ", ".join(nt_tags)
+            warnings.append(f"Vector has N-terminal tag(s): {tag_str}")
+            for i, f in enumerate(fragments):
+                if i == vec_idx:
+                    continue
+                s = seqs[i]
+                first3 = s[:3] if len(s) >= 3 else ""
+                if first3 == "ATG" and not f.get("remove_start"):
+                    warnings.append(
+                        f"'{f['name']}' starts with ATG — "
+                        f"enable 'Remove start' for N-terminal {tag_str} tag fusion"
+                    )
 
     # Determine junctions
     n = len(seqs)
@@ -2252,21 +2365,17 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
 
         # Forward primer for downstream fragment: tail = end of upstream (unless downstream has no_overlap)
         fwd_tail = "" if down_no_ol else up_tail
-        fwd_extras = [s for si, s in enumerate(seqs) if si != down_idx]
         fwd_candidates = _generate_primer_candidates(
             template=down_seq, pos=0, direction="forward", tail=fwd_tail, 
-            tm_target=tm_target, min_len=12, max_len=60, max_total=60, criteria=_crit,
-            extra_templates=fwd_extras
+            tm_target=tm_target, min_len=12, max_len=60, max_total=60, criteria=_crit
         )
         fwd_primer = _pick_best_with_alternatives(fwd_candidates, f"{down_name}_Fwd", max_alternatives=None)
 
         # Reverse primer for upstream fragment: tail = RC of start of downstream (unless upstream has no_overlap)
         rev_tail = "" if up_no_ol else _reverse_complement(down_tail)
-        rev_extras = [s for si, s in enumerate(seqs) if si != up_idx]
         rev_candidates = _generate_primer_candidates(
             template=up_seq, pos=len(up_seq), direction="reverse", tail=rev_tail, 
-            tm_target=tm_target, min_len=12, max_len=60, max_total=60, criteria=_crit,
-            extra_templates=rev_extras
+            tm_target=tm_target, min_len=12, max_len=60, max_total=60, criteria=_crit
         )
         rev_primer = _pick_best_with_alternatives(rev_candidates, f"{up_name}_Rev", max_alternatives=None)
 
@@ -2277,14 +2386,8 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
         for p, pname in [(fwd_primer, f"{down_name}_Fwd"), (rev_primer, f"{up_name}_Rev")]:
             if p and p.get("hairpin"):
                 warnings.append(f"{pname} may form hairpin")
-            if p and p.get("off_target_count", 0) > 0:
-                warnings.append(f"{pname} has {p['off_target_count']} off-target binding site(s) — risk of mispriming")
             if p and p.get("homodimer_dg", 0) < _crit["dimer_dg_fail"]:
                 warnings.append(f"{pname} has strong self-dimer (ΔG = {p['homodimer_dg']} kcal/mol)")
-        # NOTE: cross-junction heterodimer (fwd vs rev at same junction) is NOT checked
-        # because these primers are in different PCR tubes. The designed overlap tails
-        # are complementary by design and produce misleading ΔG values (-30 to -40).
-        # Within-fragment PCR pair checks are done after the junction loop.
 
         junctions.append({
             "name": f"{up_name}→{down_name}",
@@ -2295,36 +2398,6 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
         })
         all_primers.append(fwd_primer)
         all_primers.append(rev_primer)
-
-    # ── Within-fragment heterodimer check (actual PCR pairs) ──
-    # Fragment i is amplified by: fwd from junction (i-1) + rev from junction i
-    # These are the primers that share a PCR tube, so heterodimer matters here.
-    for i in range(n):
-        # Find fwd primer for fragment i: it's the fwd_primer at junction (i-1)%n
-        # (where fragment i is the downstream fragment)
-        fwd_junc_idx = (i - 1 + junction_count) % junction_count if circular else i - 1
-        rev_junc_idx = i if i < junction_count else -1
-
-        if not circular:
-            # Linear: first fragment has no fwd junction, last has no rev junction
-            if i == 0:
-                fwd_junc_idx = -1
-            if i == n - 1:
-                rev_junc_idx = -1
-
-        frag_fwd = junctions[fwd_junc_idx]["fwd_primer"] if 0 <= fwd_junc_idx < len(junctions) else None
-        frag_rev = junctions[rev_junc_idx]["rev_primer"] if 0 <= rev_junc_idx < len(junctions) else None
-
-        if frag_fwd and frag_rev:
-            # Check using annealing regions only — tails are from different junctions
-            # and won't form problematic dimers (they're not complementary to each other)
-            het_dg = _calc_heterodimer_dg(frag_fwd.get("full_seq", ""), frag_rev.get("full_seq", ""))
-            if het_dg < _crit["dimer_dg_fail"]:
-                fname = fragments[i]["name"]
-                warnings.append(f"{fname} PCR pair: strong heterodimer (\u0394G = {het_dg} kcal/mol) — primers may form dimer during amplification")
-            elif het_dg < _crit["dimer_dg_warn"]:
-                fname = fragments[i]["name"]
-                warnings.append(f"{fname} PCR pair: moderate heterodimer (\u0394G = {het_dg} kcal/mol)")
 
     # ── Frame check for tag readthrough ──
     for i, f in enumerate(fragments):
@@ -2353,8 +2426,13 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
         for a in src_anns:
             a_start = a.get("start", 0)
             a_end = a.get("end", 0)
-            if a_end <= a_start or a_end > flen:
+            if a_end <= a_start:
                 continue  # skip invalid
+            # Clip to fragment bounds (important after remove_stop/remove_start trims)
+            a_start = max(0, a_start)
+            a_end = min(a_end, flen)
+            if a_end <= a_start:
+                continue
             product_annotations.append({
                 "name": a.get("name", "?"),
                 "start": offset + a_start,
@@ -2452,6 +2530,7 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
         "warnings": warnings,
         "gblock_indices": list(gb_set) if gb_set else [],
         "extended_fragments": extended_fragments if extended_fragments else [],
+        "vector_tag_info": vec_tag_info,
     }
 
 
@@ -2712,32 +2791,19 @@ def _gc_clamp_penalty(seq: str, weight: float = 6.0) -> float:
 def _generate_primer_candidates(template: str, pos: int, direction: str, tail: str,
                                  tm_target: float, min_len: int = 18, max_len: int = 40,
                                  max_total: int = 60, lightweight: bool = False,
-                                 mg_conc: float = 0.0, criteria: dict = None,
-                                 extra_templates: list = None) -> list:
+                                 mg_conc: float = 0.0, criteria: dict = None) -> list:
     """Generate multiple primer candidates with different annealing lengths.
     Returns a list of candidate dicts sorted by score (best first), each containing
     full primer properties including dimer/hairpin/ΔG analysis.
     
     lightweight=True skips expensive homodimer/hairpin/quality analysis — used for
-    fast scanning in the optimize loop.  Only Tm and GC are computed.
-    
-    extra_templates: optional list of additional sequences to check for off-target
-    binding (e.g. other fragments in an assembly)."""
+    fast scanning in the optimize loop.  Only Tm and GC are computed."""
     tpl_len = len(template)
     candidates = []
     _cr = criteria or {}
     _dg_warn = _cr.get("dimer_dg_warn", -6.0)
     _pen_hp = _cr.get("penalize_hairpin", True)
     _gc_w = _cr.get("gc_clamp_weight", 6.0)
-
-    # Build search pool for off-target checking (template + extras, both strands)
-    tpl_upper = template.upper()
-    tpl_rc = _reverse_complement(tpl_upper)
-    _search_seqs = [tpl_upper, tpl_rc]
-    for et in (extra_templates or []):
-        et_upper = et.upper()
-        _search_seqs.append(et_upper)
-        _search_seqs.append(_reverse_complement(et_upper))
 
     # Constrain annealing length so total primer doesn't exceed max_total
     tail_len = len(tail)
@@ -2749,10 +2815,11 @@ def _generate_primer_candidates(template: str, pos: int, direction: str, tail: s
         if direction == "forward":
             anneal_seq = _get_seq_region(template, pos, anneal_len)
         else:
-            bases = []
-            for i in range(anneal_len):
-                bases.append(template[(pos - 1 - i) % tpl_len])
-            anneal_seq = _reverse_complement("".join(bases))
+            # Reverse primer: read the sense strand forward at the annealing position,
+            # then RC to get the primer oligo (5'→3')
+            anneal_start = (pos - anneal_len) % tpl_len
+            anneal_region = _get_seq_region(template, anneal_start, anneal_len)
+            anneal_seq = _reverse_complement(anneal_region)
 
         full_seq = tail.lower() + anneal_seq.upper()
         tm = _calc_tm(anneal_seq)
@@ -2785,52 +2852,11 @@ def _generate_primer_candidates(template: str, pos: int, direction: str, tail: s
             self_dimer = _has_self_dimer(full_seq)
             quality = _check_primer_quality(anneal_seq, tm, criteria=criteria, tm_target=tm_target)
 
-            # Off-target check: search for annealing in all templates (both strands)
-            # Strategy: check full annealing first (definite off-target if found elsewhere),
-            # then progressively shorter 3' suffixes (partial off-target risk).
-            # Longer annealing is more specific → fewer off-targets → better score.
-            off_target_count = 0
-            ann_upper = anneal_seq.upper()
-            ann_len = len(ann_upper)
-
-            if ann_len >= 15:
-                # Level 1: full annealing exact match (strongest off-target signal)
-                full_hits = 0
-                for _ss in _search_seqs:
-                    _start = 0
-                    while True:
-                        _hit = _ss.find(ann_upper, _start)
-                        if _hit < 0:
-                            break
-                        full_hits += 1
-                        _start = _hit + 1
-                full_off = max(0, full_hits - 1)  # subtract intended site
-                off_target_count = full_off
-
-                # Level 2: if no full match off-target, check last 15bp (weaker signal)
-                if full_off == 0 and ann_len > 15:
-                    _3p = ann_upper[-15:]
-                    partial_hits = 0
-                    for _ss in _search_seqs:
-                        _start = 0
-                        while True:
-                            _hit = _ss.find(_3p, _start)
-                            if _hit < 0:
-                                break
-                            partial_hits += 1
-                            _start = _hit + 1
-                    partial_off = max(0, partial_hits - 1)
-                    # Partial off-targets get reduced penalty (longer annealing reduces risk)
-                    off_target_count = partial_off
-
-            # Penalty scales: full-length off-target is severe, partial is moderate
-            # Longer annealing that eliminates off-targets → lower penalty → preferred
-            off_target_penalty = off_target_count * 15.0
             dimer_penalty = max(0, -homodimer_dg + _dg_warn) * 3.0
             if homodimer_tm is not None and homodimer_tm < (tm_target - 10):
                 dimer_penalty *= 0.2  # dimer melts well below annealing — discount
             hairpin_penalty = (5.0 if hairpin else 0.0) if _pen_hp else 0.0
-            score = tm_penalty + dimer_penalty + hairpin_penalty + gc_penalty + clamp_penalty + off_target_penalty
+            score = tm_penalty + dimer_penalty + hairpin_penalty + gc_penalty + clamp_penalty
 
             candidates.append({
                 "full_seq": full_seq,
@@ -2845,7 +2871,6 @@ def _generate_primer_candidates(template: str, pos: int, direction: str, tail: s
                 "hairpin": hairpin,
                 "self_dimer": self_dimer,
                 "quality": quality,
-                "off_target_count": off_target_count,
                 "score": round(score, 2),
             })
 
@@ -2919,14 +2944,13 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
     internal_sites = []
 
     # ── Validate every fragment in every bin & check internal sites
-    STOP_CODONS_SET = {"TAA", "TAG", "TGA"}
     for b in bins:
         for f in b["fragments"]:
             s = f["seq"].upper().replace(" ", "").replace("\n", "")
             # Stop / start codon removal
             if f.get("remove_stop"):
                 last3 = s[-3:]
-                if last3 in STOP_CODONS_SET:
+                if last3 in _STOP_CODON_SET:
                     s = s[:-3]
                     warnings.append(f"'{f['name']}': removed 3ʹ stop codon ({last3}) for tag readthrough")
                 else:
@@ -2993,26 +3017,15 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
                 # Frame 0 = the reading frame that would be in-frame with the insert
                 # (overhang is part of the CDS, so frame starts at position 0 of downstream)
                 stop_pos_in_frame = None
-                STOP_SET = {"TAA", "TAG", "TGA"}
                 for ci in range(0, min(len(downstream) - 2, downstream_len), 3):
                     codon = downstream[ci:ci + 3]
-                    if codon in STOP_SET:
+                    if codon in _STOP_CODON_SET:
                         stop_pos_in_frame = ci
                         break
 
                 # Known C-terminal tag patterns
-                KNOWN_TAGS = {
-                    "His6":    "CACCACCACCACCACCAC",
-                    "His8":    "CACCACCACCACCACCACCACCACCAC",
-                    "FLAG":    "GACTACAAGGACGACGACGACAAG",
-                    "HA":      "TACCCATACGATGTTCCAGATTACGCT",
-                    "Myc":     "GAACAAAAACTCATCTCAGAAGAGGATCTG",
-                    "Strep":   "TGGAGCCACCCGCAGTTCGAAAAG",
-                    "StrepII": "TGGAGCCACCCGCAGTTCGAAAAG",
-                    "V5":      "GGTAAGCCTATCCCTAACCCTCTCCTCGGTCTCGATTCTACG",
-                }
                 detected_tags = []
-                for tag_name, tag_seq in KNOWN_TAGS.items():
+                for tag_name, tag_seq in KNOWN_TAG_SEQS.items():
                     if tag_seq in downstream[:100]:
                         detected_tags.append(tag_name)
 
@@ -3024,7 +3037,7 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
                 else:
                     upstream = vec_seq[:cut5_start]
                 detected_ntags = []
-                for tag_name, tag_seq in KNOWN_TAGS.items():
+                for tag_name, tag_seq in KNOWN_TAG_SEQS.items():
                     if tag_seq in upstream:
                         detected_ntags.append(tag_name)
 
@@ -3068,7 +3081,7 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
                                 f["_remove_stop_warned"] = True
                                 s_upper = f.get("_seq", f["seq"].upper())
                                 last3 = s_upper[-3:] if len(s_upper) >= 3 else ""
-                                if last3 in STOP_SET:
+                                if last3 in _STOP_CODON_SET:
                                     warnings.append(
                                         f"'{f['name']}' ends with stop codon ({last3}) — "
                                         f"enable 'Remove stop' for C-terminal {', '.join(detected_tags)} tag readthrough"
@@ -3259,9 +3272,10 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
             "name": vector.get("name", "Vector"), "start": 0, "end": len(vec_seq),
             "direction": 1, "color": "#4682B4", "type": "fragment",
         })
+        vec_name = vector.get("name", "Vector")
         for a in (vector.get("annotations") or []):
-            a_s, a_e = a.get("start", 0), a.get("end", 0)
-            if a_e > a_s and a_e <= len(vec_seq):
+            a_s, a_e = max(0, a.get("start", 0)), min(a.get("end", 0), len(vec_seq))
+            if a_e > a_s:
                 product_annotations.append({
                     "name": a.get("name", "?"), "start": a_s, "end": a_e,
                     "direction": a.get("direction", 1), "color": a.get("color", "#95A5A6"),
@@ -3276,8 +3290,8 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
             "direction": 1, "color": frag_colors[(bi + 1) % len(frag_colors)], "type": "fragment",
         })
         for a in (f.get("annotations") or []):
-            a_s, a_e = a.get("start", 0), a.get("end", 0)
-            if a_e > a_s and a_e <= flen:
+            a_s, a_e = max(0, a.get("start", 0)), min(a.get("end", 0), flen)
+            if a_e > a_s:
                 product_annotations.append({
                     "name": a.get("name", "?"), "start": p_offset + a_s, "end": p_offset + a_e,
                     "direction": a.get("direction", 1), "color": a.get("color", "#95A5A6"),
@@ -3499,7 +3513,7 @@ def list_sequences():
             "SELECT id, name, sequence, use, box_number, gb_file, created "
             "FROM primers WHERE (gb_file IS NOT NULL AND gb_file != '') "
             "OR (sequence IS NOT NULL AND sequence != '') "
-            "ORDER BY name"
+            "ORDER BY id"
         ).fetchall()
         plasmids = conn.execute(
             "SELECT id, name, use, box_location, glycerol_location, gb_file, created "
@@ -3582,6 +3596,23 @@ def parse_sequence(seq_type: str, seq_id: int):
     if os.path.isfile(fpath):
         return parse_genbank(fpath)
     # Fallback for gblocks (and others) without .gb — read sequence from DB
+    if seq_type == "primer":
+        with get_db() as conn:
+            row = conn.execute("SELECT name, sequence, use FROM primers WHERE id=?", (seq_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Primer not found")
+        d = dict(row)
+        seq = (d.get("sequence") or "").replace(" ", "").replace("\n", "")
+        if not seq:
+            raise HTTPException(400, "Primer has no sequence")
+        return {
+            "name": d.get("name", f"primer_{seq_id}"),
+            "description": d.get("use") or "",
+            "seq": seq,
+            "annotations": [],
+            "length": len(seq),
+            "topology": "linear",
+        }
     if seq_type == "gblock":
         with get_db() as conn:
             row = conn.execute("SELECT name, sequence, use, project FROM gblocks WHERE id=?", (seq_id,)).fetchone()
@@ -3795,15 +3826,25 @@ def reindex_sequence(seq_type: str, seq_id: int, body: ReindexRequest):
             )
             new_features.append(new_feat)
         else:
-            # Feature now wraps origin — BioPython can't represent this in a simple
-            # FeatureLocation, so store as-is (start < end by using the larger span)
-            # This is a known GenBank limitation for wrapped features
-            new_feat = SeqFeature(
-                FeatureLocation(new_start, slen, strand=feat.location.strand),
-                type=feat.type,
-                qualifiers=dict(feat.qualifiers),
-            )
-            new_features.append(new_feat)
+            # Feature now wraps origin — use CompoundLocation to represent both halves
+            from Bio.SeqFeature import CompoundLocation
+            try:
+                loc = CompoundLocation([
+                    FeatureLocation(new_start, slen, strand=feat.location.strand),
+                    FeatureLocation(0, new_end, strand=feat.location.strand),
+                ])
+                new_feat = SeqFeature(loc, type=feat.type, qualifiers=dict(feat.qualifiers))
+                new_features.append(new_feat)
+            except Exception:
+                # Fallback: split into two separate features if CompoundLocation fails
+                new_features.append(SeqFeature(
+                    FeatureLocation(new_start, slen, strand=feat.location.strand),
+                    type=feat.type, qualifiers=dict(feat.qualifiers),
+                ))
+                new_features.append(SeqFeature(
+                    FeatureLocation(0, new_end, strand=feat.location.strand),
+                    type=feat.type, qualifiers=dict(feat.qualifiers),
+                ))
 
     # Rebuild feature list with source
     rec.features = [SeqFeature(
@@ -3910,7 +3951,7 @@ def scan_features_endpoint(body: ScanFeaturesRequest):
 @router.post("/cloning/design-gibson")
 def gibson_endpoint(body: GibsonRequest):
     """Design a Gibson assembly with overlapping primers."""
-    frags = [{"name": f.name, "seq": f.seq, "start": f.start, "end": f.end, "annotations": f.annotations or [], "no_overlap": f.no_overlap or False, "remove_stop": f.remove_stop or False, "remove_start": f.remove_start or False} for f in body.fragments]
+    frags = [{"name": f.name, "seq": f.seq, "start": f.start, "end": f.end, "annotations": f.annotations or [], "no_overlap": f.no_overlap or False, "remove_stop": f.remove_stop or False, "remove_start": f.remove_start or False, "is_vector": f.is_vector or False} for f in body.fragments]
     return design_gibson(
         fragments=frags,
         circular=body.circular if body.circular is not None else True,
@@ -4250,6 +4291,7 @@ def gibson_combinatorial_endpoint(body: GibsonCombinatorialRequest):
                             "seq": ef["extended_seq"],
                             "type": "gblock",
                             "combos": [],
+                            "annotations": ef.get("annotations", []),
                         }
                     unique_parts[key]["combos"].append(ci)
 
@@ -4344,46 +4386,6 @@ def bulk_save(body: BulkSaveRequest):
                     conn.execute("UPDATE primers SET gb_file=? WHERE id=?", (gb_fname, item_id))
                 gb_path = os.path.join(GB_DIR, gb_fname)
 
-            elif item_type == "part":
-                existing = None
-                if body.overwrite:
-                    existing = conn.execute("SELECT id FROM parts WHERE name=?", (name,)).fetchone()
-                if existing:
-                    item_id = dict(existing)["id"]
-                    conn.execute(
-                        "UPDATE parts SET sequence=?, length=?, created=? WHERE id=?",
-                        (seq, len(seq), now, item_id))
-                else:
-                    cur = conn.execute(
-                        "INSERT INTO parts (name, sequence, length, description, project, created) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (name, seq, len(seq),
-                         item.get("description", "Gibson assembly fragment"),
-                         item.get("project", ""), now))
-                    item_id = cur.lastrowid
-                gb_path = None  # parts table doesn't use .gb files by default
-
-            elif item_type == "kitpart":
-                existing = None
-                if body.overwrite:
-                    existing = conn.execute("SELECT id FROM kit_parts WHERE name=?", (name,)).fetchone()
-                if existing:
-                    item_id = dict(existing)["id"]
-                    gb_fname = f"kitpart_{item_id}.gb"
-                    conn.execute(
-                        "UPDATE kit_parts SET gb_file=?, created=? WHERE id=?",
-                        (gb_fname, now, item_id))
-                else:
-                    cur = conn.execute(
-                        "INSERT INTO kit_parts (name, kit_name, part_type, description, gb_file, created) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (name, item.get("kit_name", "Gibson Assembly"), "",
-                         item.get("description", "Assembly fragment"), "pending", now))
-                    item_id = cur.lastrowid
-                    gb_fname = f"kitpart_{item_id}.gb"
-                    conn.execute("UPDATE kit_parts SET gb_file=? WHERE id=?", (gb_fname, item_id))
-                gb_path = os.path.join(GB_DIR, gb_fname)
-
             else:  # plasmid
                 cur = conn.execute(
                     "INSERT INTO plasmids (name, gb_file, created) VALUES (?, ?, ?)",
@@ -4393,9 +4395,8 @@ def bulk_save(body: BulkSaveRequest):
                 conn.execute("UPDATE plasmids SET gb_file=? WHERE id=?", (gb_fname, item_id))
                 gb_path = os.path.join(GB_DIR, gb_fname)
 
-            if gb_path:
-                with open(gb_path, "w") as f:
-                    f.write(gb_content)
+            with open(gb_path, "w") as f:
+                f.write(gb_content)
 
             saved.append({"id": item_id, "name": name, "type": item_type})
 
@@ -4522,7 +4523,7 @@ def save_product(body: SaveProductRequest):
     gb_content = _write_genbank(product)
 
     now = datetime.utcnow().isoformat()
-    method = {"kld": "KLD", "pcr": "PCR", "gibson": "Gibson", "goldengate": "Golden Gate", "digestligate": "Digest-Ligate"}.get(body.mode, body.mode)
+    method = {"kld": "KLD", "pcr": "PCR", "gibson": "Gibson", "goldengate": "Golden Gate", "digestligate": "Digest-Ligate", "gibson-run": "Gibson Assembly", "gg-run": "Golden Gate Assembly"}.get(body.mode, body.mode)
     use_desc = f"{method} product" + (f" from {body.template_name}" if body.template_name else "")
 
     save_as = (body.save_as or "plasmid").lower()
@@ -4827,12 +4828,14 @@ def _find_best_overlap(seq_a: str, seq_b: str, min_overlap: int = 15,
 
 
 def _remap_annotations(annotations: list, offset: int, source_len: int,
-                       trim_start: int = 0, trim_end: int = None) -> list:
+                       trim_start: int = 0, trim_end: int = None,
+                       source_name: str = None) -> list:
     """Remap annotations from a source fragment onto the product.
 
     - offset: bp position in product where this fragment starts
     - trim_start: bp trimmed from the start of the fragment
     - trim_end: bp position in fragment to stop (exclusive); None = full length
+    - source_name: reserved for future use (not appended to names to avoid linkification)
     """
     if trim_end is None:
         trim_end = source_len
@@ -4943,6 +4946,7 @@ def run_gibson_assembly(fragments: list, circular: bool = True,
 
     product_seq = ""
     product_annotations = []
+    fragment_details = []
     cursor = 0  # current position in product
 
     for i in range(n):
@@ -4962,18 +4966,27 @@ def run_gibson_assembly(fragments: list, circular: bool = True,
             hit = overlap_info[incoming_key]
             trim_5 = hit["b_end"]  # skip the overlap portion at fragment's 5' end
 
-        # Determine trim at 3' (end) — we keep full 3' (next fragment trims its 5')
-        # BUT for circular: last fragment's 3' overlaps with first fragment's 5'
-        # We keep up to the end of the fragment
-
         # Extract the portion we keep
         kept_start = trim_5
         kept_end = frag_len
         kept_seq = frag_seq[kept_start:kept_end]
 
+        # Track trimming details
+        trimmed_5_seq = frag_seq[:trim_5] if trim_5 > 0 else ""
+        fragment_details.append({
+            "name": frag["name"],
+            "original_length": frag_len,
+            "trim_5": trim_5,
+            "trimmed_5_seq": trimmed_5_seq[:40],  # truncate for display
+            "kept_start": kept_start,
+            "kept_end": kept_end,
+            "kept_length": len(kept_seq),
+            "product_start": cursor,
+        })
+
         if len(kept_seq) > 0:
             # Remap annotations
-            remapped = _remap_annotations(frag_anns, cursor, frag_len, trim_start=kept_start, trim_end=kept_end)
+            remapped = _remap_annotations(frag_anns, cursor, frag_len, trim_start=kept_start, trim_end=kept_end, source_name=frag["name"])
             product_annotations.extend(remapped)
 
             product_seq += kept_seq
@@ -5013,6 +5026,7 @@ def run_gibson_assembly(fragments: list, circular: bool = True,
         "product_length": len(product_seq),
         "product_name": product_name,
         "junctions": junctions,
+        "fragment_details": fragment_details,
         "warnings": warnings,
         "topology": topology,
         "num_fragments": n,
@@ -5021,19 +5035,63 @@ def run_gibson_assembly(fragments: list, circular: bool = True,
 
 @router.post("/cloning/run-gibson-assembly")
 def run_gibson_assembly_endpoint(body: RunGibsonAssemblyRequest):
-    """Simulate Gibson assembly on pre-made fragments with overlaps."""
-    frags = [{
-        "name": f.name,
-        "seq": f.seq,
-        "annotations": f.annotations or [],
-    } for f in body.fragments]
-    return run_gibson_assembly(
+    """Simulate Gibson assembly on pre-made fragments with overlaps.
+    Fragments can be direct DNA or PCR products (template + primers)."""
+    frags = []
+    pcr_details = []  # track which fragments came from PCR
+    for i, f in enumerate(body.fragments):
+        if f.pcr:
+            # Resolve via in silico PCR
+            try:
+                pcr_result = in_silico_pcr(
+                    template_seq=f.pcr.template_seq,
+                    primer1=f.pcr.primer1_seq,
+                    primer2=f.pcr.primer2_seq,
+                    circular=f.pcr.circular if f.pcr.circular is not None else True,
+                    max_mismatches=2,
+                    annotations=f.pcr.template_annotations or [],
+                    template_name=f.pcr.template_name or "template",
+                    primer1_name=f.pcr.primer1_name or "Primer 1",
+                    primer2_name=f.pcr.primer2_name or "Primer 2",
+                )
+                primary = pcr_result["primary"]
+                frags.append({
+                    "name": f.name or primary.get("template_name", f"PCR_{i+1}"),
+                    "seq": primary["product_seq"],
+                    "annotations": primary.get("product_annotations", []),
+                })
+                pcr_details.append({
+                    "fragment_idx": i,
+                    "name": f.name,
+                    "template": f.pcr.template_name,
+                    "product_length": primary["product_length"],
+                    "amplicon_length": primary["amplicon_length"],
+                    "fwd_primer": primary.get("fwd_primer", ""),
+                    "rev_primer": primary.get("rev_primer", ""),
+                    "fwd_tail": primary.get("fwd_tail", ""),
+                    "rev_tail": primary.get("rev_tail", ""),
+                    "warnings": pcr_result.get("warnings", []),
+                })
+            except HTTPException as e:
+                raise HTTPException(400, f"PCR failed for '{f.name}': {e.detail}")
+        elif f.seq:
+            frags.append({
+                "name": f.name,
+                "seq": f.seq,
+                "annotations": f.annotations or [],
+            })
+        else:
+            raise HTTPException(400, f"Fragment '{f.name}' has no sequence and no PCR config")
+
+    result = run_gibson_assembly(
         fragments=frags,
         circular=body.circular if body.circular is not None else True,
         min_overlap=body.min_overlap or 15,
         max_scan=body.max_overlap_scan or 60,
         min_identity=body.min_identity or 90.0,
     )
+    result["pcr_details"] = pcr_details
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -5187,6 +5245,7 @@ def run_golden_gate_assembly(fragments: list, vector: dict = None,
             len(seq),
             trim_start=left_pos + oh_len,
             trim_end=right_pos - oh_len,
+            source_name=piece["name"],
         )
 
         piece_cuts.append({
