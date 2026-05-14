@@ -29,6 +29,16 @@ def register_seed(fn):
     _seed_callbacks.append(fn)
 
 
+def ensure_column(conn, table: str, column: str, decl: str):
+    """Idempotently add a column to an existing table. `decl` is the SQL type
+    plus any constraints, e.g. "TEXT NOT NULL DEFAULT 'plain'". SQLite doesn't
+    support IF NOT EXISTS on ADD COLUMN, so we introspect PRAGMA table_info."""
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column in cols:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_all_tables():
     """Create /data dir and run every registered CREATE TABLE statement,
     then run every registered seed callback."""
