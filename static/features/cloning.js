@@ -5975,6 +5975,15 @@ async function renderCloning(el) {
   _clEl = el;
   el.innerHTML = '<div style="text-align:center;padding:3rem;color:#8a7f72;"><div style="font-size:1.4rem;margin-bottom:.5rem;">\u23f3</div>Loading Cloning Workbench\u2026</div>';
   await Promise.all([_clLoadSequences(), _clLoadConfig(), _loadSeqVizDeps()]);
+  // Honour a pending selection set by another view (e.g. DNA importer's \uD83E\uDDEC button).
+  // Consume the flag unconditionally so it can't fire on a later visit; _clSelectSequence
+  // will toast on its own if the parse endpoint 404s.
+  if (typeof S !== 'undefined' && S._pendingSelect) {
+    var pending = S._pendingSelect;
+    S._pendingSelect = null;
+    _clSelectSequence(pending.type, pending.id);
+    return;
+  }
   _clRender();
 }
 
