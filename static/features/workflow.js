@@ -121,7 +121,10 @@ async function renderWorkflow(el) {
         '<div class="timeline-body">' +
           '<div class="timeline-card ' + (isTask ? 'task-card' : isProto ? 'protocol-card-tl' : 'note-card') + '">' +
             (e.group_name ? '<div class="timeline-card-group">' + esc(e.group_name) + '</div>' : '') +
-            '<div class="timeline-card-text" id="wt-' + e.id + '">' + esc(e.content) + '</div>' +
+            /* HTML entries render through wfRenderRich (server already sanitized); plain through esc(). */
+            '<div class="timeline-card-text" id="wt-' + e.id + '"' + (e.format === 'html' ? ' data-format="html"' : '') + '>' +
+              (e.format === 'html' ? wfRenderRich(e.content) : esc(e.content)) +
+            '</div>' +
             protoActions +
             '<div class="timeline-actions">' +
               '<button class="btn" onclick="editWorkflowEntry(' + e.id + ')">Edit</button>' +
@@ -150,9 +153,21 @@ async function renderWorkflow(el) {
 
   html += '<div style="margin-top:8px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 14px">' +
     '<div style="display:flex;gap:8px;margin-bottom:8px">' + groupControl + '</div>' +
-    '<div class="add-inline" style="padding:0">' +
-      '<input type="text" id="wf-input" placeholder="Jot down what you\x27re doing..." spellcheck="false"/>' +
-      '<button onclick="addWorkflowNote()">Add</button>' +
+    /* Rich-text input. The contenteditable div is wired by wfEditorAttach() in the setTimeout below. */
+    '<div id="wf-input-wrap">' +
+      '<div id="wf-input" data-placeholder="Jot down what you\x27re doing… (Tab inserts table, paste/drop images)"></div>' +
+      '<div class="wf-tool-row">' +
+        '<button class="wf-tool-btn" onclick="_wfInputApi.cmd(\'bold\')" title="Bold (Ctrl+B)"><strong>B</strong></button>' +
+        '<button class="wf-tool-btn" onclick="_wfInputApi.cmd(\'italic\')" title="Italic (Ctrl+I)"><em>I</em></button>' +
+        '<button class="wf-tool-btn" onclick="_wfInputApi.cmd(\'underline\')" title="Underline"><u>U</u></button>' +
+        '<div class="wf-tool-sep"></div>' +
+        '<button class="wf-tool-btn" onclick="_wfInputApi.cmd(\'insertUnorderedList\')" title="Bulleted list">&bull; List</button>' +
+        '<button class="wf-tool-btn" onclick="_wfInputApi.insertTable()" title="Insert table (or press Tab on empty line)">&#9783; Table</button>' +
+        '<button class="wf-tool-btn" onclick="_wfInputApi.insertImage()" title="Insert image (or paste/drop)">&#128247; Image</button>' +
+        '<button class="wf-tool-btn" onclick="_wfInputApi.insertGel()" title="Insert link to a gel">&#129516; Gel</button>' +
+        '<div style="flex:1"></div>' +
+        '<button class="wf-tool-btn" style="background:#5b7a5e;color:#fff;border-color:#5b7a5e" onclick="addWorkflowNote()" title="Add entry (or press Enter)">Add</button>' +
+      '</div>' +
     '</div>' +
     '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">' +
       '<div id="wf-proto-picker-wrap">' +
@@ -161,14 +176,89 @@ async function renderWorkflow(el) {
     '</div>' +
   '</div>';
 
+  /* Scratchpad section — rendered below the protocol picker so it doesn't
+     dominate the page. Auto-loads + saves on blur. */
+  html += '<div style="margin-top:14px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 14px">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">' +
+      '<div style="font-variant:small-caps;font-size:12px;letter-spacing:.08em;color:#8a7f72;font-weight:600">Scratchpad \u00b7 ' + _workflowDate + '</div>' +
+      '<div id="wf-scratch-saved" style="font-size:11px;color:#8a7f72">\u00a0</div>' +
+    '</div>' +
+    '<div id="wf-scratch" data-placeholder="Free-form notes for this day. Not sent to LLM. Tab inserts table; paste/drop images."></div>' +
+    '<div class="wf-tool-row">' +
+      '<button class="wf-tool-btn" onclick="_wfScratchApi.cmd(\'bold\')"><strong>B</strong></button>' +
+      '<button class="wf-tool-btn" onclick="_wfScratchApi.cmd(\'italic\')"><em>I</em></button>' +
+      '<button class="wf-tool-btn" onclick="_wfScratchApi.cmd(\'underline\')"><u>U</u></button>' +
+      '<div class="wf-tool-sep"></div>' +
+      '<button class="wf-tool-btn" onclick="_wfScratchApi.cmd(\'insertUnorderedList\')">&bull; List</button>' +
+      '<button class="wf-tool-btn" onclick="_wfScratchApi.insertTable()">&#9783; Table</button>' +
+      '<button class="wf-tool-btn" onclick="_wfScratchApi.insertImage()">&#128247; Image</button>' +
+      '<button class="wf-tool-btn" onclick="_wfScratchApi.insertGel()">&#129516; Gel</button>' +
+    '</div>' +
+  '</div>';
+
   el.innerHTML = html;
   setTimeout(function() {
-    var wfInp = document.getElementById('wf-input');
-    if (wfInp) {
-      wfInp.addEventListener('keydown', function(e) { if (e.key === 'Enter') addWorkflowNote(); });
-      wfInp.focus();
+    /* Attach the rich editor to the inline input. Enter = submit; Shift+Enter = newline. */
+    var inputEl = document.getElementById('wf-input');
+    if (inputEl) {
+      window._wfInputApi = wfEditorAttach(inputEl, {
+        placeholder: inputEl.getAttribute('data-placeholder'),
+        minHeight: '32px',
+        onSubmit: function() { addWorkflowNote(); },
+      });
+      window._wfInputApi.focus();
+    }
+    /* Attach the scratchpad editor with auto-save on blur. */
+    var scratchEl = document.getElementById('wf-scratch');
+    if (scratchEl) {
+      window._wfScratchApi = wfEditorAttach(scratchEl, {
+        placeholder: scratchEl.getAttribute('data-placeholder'),
+        minHeight: '120px',
+        onBlur: function(html) { _wfSaveScratch(html); },
+        /* Auto-save while typing — debounced. Keeps work safe without spamming the server. */
+        onChange: _wfScratchDebouncedSave,
+      });
+      /* Load scratch content for this date */
+      _wfLoadScratch();
     }
   }, 50);
+}
+
+/* ── Scratchpad load/save ─────────────────────────────────────────────────── */
+
+var _wfScratchSaveTimer = null;
+async function _wfLoadScratch() {
+  try {
+    var data = await api('GET', '/api/workflow/' + _workflowDate + '/scratch');
+    if (window._wfScratchApi) window._wfScratchApi.setHtml(data.content || '');
+  } catch(e) {
+    /* Non-fatal — empty scratchpad on error */
+  }
+}
+function _wfScratchDebouncedSave() {
+  if (_wfScratchSaveTimer) clearTimeout(_wfScratchSaveTimer);
+  /* 1.5s after the last keystroke. Gives the user breathing room without
+     racing the server on every character. */
+  _wfScratchSaveTimer = setTimeout(function() {
+    if (window._wfScratchApi) _wfSaveScratch(window._wfScratchApi.getHtml());
+  }, 1500);
+}
+async function _wfSaveScratch(html) {
+  if (!window._wfScratchApi) return;
+  var saveEl = document.getElementById('wf-scratch-saved');
+  if (saveEl) saveEl.textContent = 'Saving…';
+  try {
+    var resp = await fetch('/api/workflow/' + _workflowDate + '/scratch', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: html }),
+    });
+    if (!resp.ok) throw new Error(resp.statusText);
+    if (window._wfScratchApi) window._wfScratchApi.markClean();
+    if (saveEl) saveEl.textContent = 'Saved \u00b7 ' + new Date().toLocaleTimeString();
+  } catch(e) {
+    if (saveEl) saveEl.textContent = 'Save failed';
+  }
 }
 
 // ── protocol picker ───────────────────────────────────────────────────────────
@@ -274,12 +364,27 @@ function shiftDay(d) {
 }
 
 async function addWorkflowNote() {
-  var inp    = document.getElementById('wf-input');
   var grpInp = document.getElementById('wf-group');
-  var text   = inp?.value.trim(); if (!text) return;
   var group  = grpInp?.value.trim() || null;
-  await api('POST', '/api/workflow', { content: text, type: 'note', group_name: group });
-  inp.value = '';
+  if (!window._wfInputApi) {
+    /* Defensive fallback — should never hit in practice */
+    return;
+  }
+  var html = window._wfInputApi.getHtml().trim();
+  if (!html) return;
+  /* If the content is just plain text (no HTML tags other than perhaps a stray <br>),
+     send it as plain so old-style entries stay simple. Otherwise send as html
+     so the server keeps the formatting and the LLM-strip helper kicks in later. */
+  var textOnly = html.replace(/<br\s*\/?>/gi, '').replace(/<[^>]+>/g, '').trim();
+  var hasRichContent = /<(img|table|ul|ol|strong|em|u|b|i|a)\b/i.test(html);
+  if (hasRichContent) {
+    await api('POST', '/api/workflow', { content: html, format: 'html', type: 'note', group_name: group });
+  } else {
+    /* Plain text with at most line breaks. Strip the wrapping <div>/<p>
+       contenteditable adds, send as plain. */
+    await api('POST', '/api/workflow', { content: textOnly, type: 'note', group_name: group });
+  }
+  window._wfInputApi.clear();
   await loadView();
 }
 
@@ -588,17 +693,44 @@ async function wfResetProcessDay() {
 
 function editWorkflowEntry(id) {
   var el = document.getElementById('wt-' + id); if (!el) return;
-  var current = el.textContent;
-  el.innerHTML = '<textarea id="we-ta-' + id + '" style="min-height:60px;width:100%;background:transparent;border:none;border-bottom:1px solid var(--accent);color:var(--text);font-family:var(--sans);font-size:14px;outline:none;resize:none;padding:2px 0">' + esc(current) + '</textarea>';
-  var ta = el.querySelector('textarea'); ta.focus();
-  ta.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveWorkflowEntry(id, this.value); }
-    if (e.key === 'Escape') loadView();
-  });
+  var isHtml = el.getAttribute('data-format') === 'html';
+  if (isHtml) {
+    /* Rich edit — replace the rendered HTML with a contenteditable rich editor. */
+    var current = el.innerHTML;
+    /* Strip the wrapping .wf-rich-render div we added at render time so the editor
+       starts with just the inner content. */
+    var inner = current.replace(/^<div class="wf-rich-render">/, '').replace(/<\/div>$/, '');
+    el.innerHTML = '<div id="we-rich-' + id + '"></div>' +
+                   '<div style="margin-top:6px;font-size:11px;color:#8a7f72">Press Esc to cancel, Ctrl+Enter to save</div>';
+    var area = document.getElementById('we-rich-' + id);
+    var api = wfEditorAttach(area, {
+      initialHtml: inner,
+      minHeight: '40px',
+    });
+    api.focus();
+    area.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { e.preventDefault(); loadView(); }
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        saveWorkflowEntry(id, api.getHtml(), 'html');
+      }
+    });
+  } else {
+    /* Plain edit — original behaviour */
+    var current = el.textContent;
+    el.innerHTML = '<textarea id="we-ta-' + id + '" style="min-height:60px;width:100%;background:transparent;border:none;border-bottom:1px solid var(--accent);color:var(--text);font-family:var(--sans);font-size:14px;outline:none;resize:none;padding:2px 0">' + esc(current) + '</textarea>';
+    var ta = el.querySelector('textarea'); ta.focus();
+    ta.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveWorkflowEntry(id, this.value, 'plain'); }
+      if (e.key === 'Escape') loadView();
+    });
+  }
 }
 
-async function saveWorkflowEntry(id, content) {
-  await api('PUT', '/api/workflow/' + id, { content: content });
+async function saveWorkflowEntry(id, content, format) {
+  var body = { content: content };
+  if (format) body.format = format;
+  await api('PUT', '/api/workflow/' + id, body);
   await loadView(); toast('Saved');
 }
 
