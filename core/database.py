@@ -11,6 +11,10 @@ DB_PATH = "/data/lab.db"
 # ── Table registry ────────────────────────────────────────────────────────────
 # Features append (table_name, create_sql) tuples here at import time.
 _table_registry: list[tuple[str, str]] = []
+# Seed callbacks: each is a callable that takes a sqlite3.Connection and may
+# insert default rows. Run AFTER all tables are created. Idempotent by contract
+# (every callback is responsible for not duplicating its own rows).
+_seed_callbacks: list = []
 
 
 def register_table(name: str, create_sql: str):
@@ -18,8 +22,16 @@ def register_table(name: str, create_sql: str):
     _table_registry.append((name, create_sql))
 
 
+def register_seed(fn):
+    """Register a function to populate default rows after table creation.
+    Callback signature: fn(conn) -> None. Called inside the init transaction;
+    must be idempotent (re-run safely on every startup)."""
+    _seed_callbacks.append(fn)
+
+
 def init_all_tables():
-    """Create /data dir and run every registered CREATE TABLE statement."""
+    """Create /data dir and run every registered CREATE TABLE statement,
+    then run every registered seed callback."""
     os.makedirs("/data", exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         # WAL mode lets readers and writers coexist instead of locking the whole DB,
@@ -30,6 +42,11 @@ def init_all_tables():
         conn.execute("PRAGMA busy_timeout=5000")
         for _name, sql in _table_registry:
             conn.execute(sql)
+        conn.commit()
+        # Seeds need Row factory so callbacks can use named columns if they want.
+        conn.row_factory = sqlite3.Row
+        for fn in _seed_callbacks:
+            fn(conn)
         conn.commit()
 
 
