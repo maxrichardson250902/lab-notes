@@ -1240,6 +1240,19 @@ async function renderGelAnnotation(el) {
   gelInitPaste();
   el.innerHTML = '<div id="gelRoot"><div class="gel-empty" style="padding:40px"><span class="gel-sc">Loading…</span></div></div>';
   await Promise.all([gelLoadList(), gelLoadRef(), gelLoadLadders()]);
+
+  /* Honour a pending gel selection (e.g. from a workflow gel-link click).
+     Two compatible sources: navigateWith('gel_annotation', {gelId}) or legacy
+     S._pendingGel = {gelId}. */
+  var pending = null;
+  if (typeof S !== 'undefined' && S._pendingGel) {
+    pending = S._pendingGel; S._pendingGel = null;
+  } else if (typeof consumeNavParams === 'function') {
+    pending = consumeNavParams('gel_annotation');
+  }
+  if (pending && pending.gelId) {
+    try { await gelLoadGel(pending.gelId); } catch(e) { /* fall through to default view */ }
+  }
   gelRenderFull();
 }
 
