@@ -1,14 +1,18 @@
 """Daily workflow feature — timeline of daily notes and task completions."""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
-import json, re, uuid, threading
+import json, re, uuid, threading, os, html as html_lib
 
-from core.database import register_table, get_db
+from core.database import register_table, register_seed, ensure_column, get_db
 from core.ssh import (elog, ensure_pc_online, start_llm,
                       call_llm_3090, ssh_run)
 import core.ssh as _ssh
+
+WF_IMG_DIR = "/data/wf_images"
+os.makedirs(WF_IMG_DIR, exist_ok=True)
 
 register_table("workflow_entries", """CREATE TABLE IF NOT EXISTS workflow_entries (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,10 +25,174 @@ register_table("workflow_entries", """CREATE TABLE IF NOT EXISTS workflow_entrie
     created   TEXT NOT NULL,
     updated   TEXT NOT NULL)""")
 
+# Idempotent column add: existing rows get 'plain', new ones can store 'html'.
+# Run as a seed callback so it executes after the CREATE TABLE above.
+register_seed(lambda conn: ensure_column(conn, "workflow_entries",
+                                         "format", "TEXT NOT NULL DEFAULT 'plain'"))
+
 register_table("day_summaries", """CREATE TABLE IF NOT EXISTS day_summaries (
     date      TEXT PRIMARY KEY,
     summary   TEXT NOT NULL DEFAULT '',
     updated   TEXT NOT NULL)""")
+
+# Per-day free-form scratchpad. Single HTML blob (sanitized on save). Separate
+# from workflow_entries so it doesn't get pulled into the end-of-day LLM
+# processing — different lifecycle, different mental model.
+register_table("day_scratch", """CREATE TABLE IF NOT EXISTS day_scratch (
+    date      TEXT PRIMARY KEY,
+    content   TEXT NOT NULL DEFAULT '',
+    updated   TEXT NOT NULL)""")
+
+
+# ── HTML sanitizer ───────────────────────────────────────────────────────────
+# Single-user app on a private network, but clipboard HTML from any website is
+# untrusted. Whitelist tags + attributes; everything else is dropped (not
+# escaped — pasted Word documents are full of cruft we don't want preserved).
+
+_ALLOWED_TAGS = {
+    "p", "br", "div", "span",
+    "strong", "b", "em", "i", "u",
+    "ul", "ol", "li",
+    "h3", "h4",
+    "code", "pre",
+    "table", "thead", "tbody", "tr", "td", "th",
+    "img", "a",
+    "blockquote",
+}
+# Attributes allowed per tag. Anything else is stripped silently.
+_ALLOWED_ATTRS = {
+    "img": {"src", "alt"},
+    "a":   {"href", "class", "data-gel-id", "data-entry-id", "title"},
+    "td":  {"colspan", "rowspan"},
+    "th":  {"colspan", "rowspan"},
+    # generic class allowlist for our own styling hooks
+    "*":   {"class"},
+}
+# Permitted img/href URL prefixes. Same-origin only. Blocks javascript:, data:,
+# external scripts, etc. The wf_images endpoint serves uploads; gel_images for
+# embedded gels; relative anchors are fine.
+_SAFE_URL_PREFIXES = ("/api/wf_images/", "/api/gel_images/", "/api/ladder_images/",
+                      "#", "/static/")
+_SAFE_CLASS_PREFIXES = ("wf-",)  # only our own classes survive
+
+# Block-level tags that should always start fresh after sanitization
+_VOID_TAGS = {"br", "img"}
+
+
+def _attr_allowed(tag: str, attr: str) -> bool:
+    if attr in _ALLOWED_ATTRS.get(tag, set()):
+        return True
+    if attr in _ALLOWED_ATTRS.get("*", set()):
+        return True
+    return False
+
+
+def _safe_url(val: str) -> bool:
+    if not val:
+        return False
+    v = val.strip().lower()
+    if v.startswith("javascript:") or v.startswith("data:") or v.startswith("vbscript:"):
+        return False
+    return any(v.startswith(p) for p in _SAFE_URL_PREFIXES) or v.startswith("/")
+
+
+def _safe_class(val: str) -> str:
+    """Keep only classes with allowed prefixes."""
+    parts = [c for c in (val or "").split() if any(c.startswith(p) for p in _SAFE_CLASS_PREFIXES)]
+    return " ".join(parts)
+
+
+def sanitize_html(raw: str) -> str:
+    """Allowlist-based HTML sanitizer. Strips disallowed tags entirely (drops
+    content too, for <script> etc.), keeps text content of unknown inline tags,
+    and filters attributes per tag. Not bulletproof against every novel attack
+    but adequate for single-user pasting from random websites."""
+    if not raw:
+        return ""
+
+    # Strip block-with-content tags entirely so their content vanishes too
+    DROP_WHOLE = ("script", "style", "iframe", "object", "embed", "form",
+                  "input", "button", "select", "textarea", "link", "meta")
+    for tag in DROP_WHOLE:
+        raw = re.sub(rf"<{tag}\b[^>]*>.*?</{tag}\s*>", "", raw,
+                     flags=re.IGNORECASE | re.DOTALL)
+        # Self-closing variants too
+        raw = re.sub(rf"<{tag}\b[^>]*/?>", "", raw, flags=re.IGNORECASE)
+
+    out = []
+    pos = 0
+    tag_re = re.compile(r"<\s*(/?)([a-zA-Z0-9]+)((?:\s+[^>]*)?)\s*(/?)>", re.DOTALL)
+
+    for m in tag_re.finditer(raw):
+        # Text before this tag — keep but trust HTML escaping is already done by the source
+        out.append(raw[pos:m.start()])
+        pos = m.end()
+
+        closing, tag, attrs_raw, self_close = m.groups()
+        tag = tag.lower()
+
+        if tag not in _ALLOWED_TAGS:
+            # Drop the tag wrapper but keep any text content (handled by the loop)
+            continue
+
+        if closing:
+            out.append(f"</{tag}>")
+            continue
+
+        # Parse attributes
+        safe_attrs = []
+        attr_re = re.compile(r'([a-zA-Z][a-zA-Z0-9:_-]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))')
+        for am in attr_re.finditer(attrs_raw or ""):
+            name = am.group(1).lower()
+            val = am.group(2) if am.group(2) is not None else (am.group(3) if am.group(3) is not None else am.group(4) or "")
+            if name.startswith("on"):  # drop all event handlers
+                continue
+            if not _attr_allowed(tag, name):
+                continue
+            if name in ("src", "href"):
+                if not _safe_url(val):
+                    continue
+            if name == "class":
+                val = _safe_class(val)
+                if not val:
+                    continue
+            # Escape attribute value's quotes
+            safe_val = val.replace('"', "&quot;")
+            safe_attrs.append(f'{name}="{safe_val}"')
+
+        attrs_str = (" " + " ".join(safe_attrs)) if safe_attrs else ""
+        if tag in _VOID_TAGS or self_close:
+            out.append(f"<{tag}{attrs_str}/>")
+        else:
+            out.append(f"<{tag}{attrs_str}>")
+
+    out.append(raw[pos:])
+    return "".join(out)
+
+
+def html_to_plain_text(html: str) -> str:
+    """Convert sanitized workflow HTML to plain text for the LLM. Tables
+    become tab-separated lines; images become [image] tokens; everything else
+    becomes its text content with line breaks at block boundaries."""
+    if not html:
+        return ""
+    # Convert structural tags to text equivalents BEFORE stripping
+    s = html
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"</(p|div|li|tr|h3|h4|blockquote)\s*>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"</(td|th)\s*>", "\t", s, flags=re.IGNORECASE)
+    s = re.sub(r"<li\b[^>]*>", "- ", s, flags=re.IGNORECASE)
+    s = re.sub(r"<img\b[^>]*>", "[image]", s, flags=re.IGNORECASE)
+    s = re.sub(r"<a\b[^>]*data-gel-id=\"(\d+)\"[^>]*>(.*?)</a>", r"[gel: \2]", s,
+               flags=re.IGNORECASE | re.DOTALL)
+    # Strip remaining tags
+    s = re.sub(r"<[^>]+>", "", s)
+    # Decode entities
+    s = html_lib.unescape(s)
+    # Collapse whitespace
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
 # ── Job tracking in SQLite (works across --workers 4) ────────────────────────
 register_table("process_day_jobs", """CREATE TABLE IF NOT EXISTS process_day_jobs (
@@ -91,11 +259,13 @@ class AddWorkflowEntry(BaseModel):
     time:       Optional[str] = None
     type:       str = "note"
     content:    str
+    format:     str = "plain"            # 'plain' | 'html'
     group_name: Optional[str] = None
     task_id:    Optional[int] = None
 
 class UpdateWorkflowEntry(BaseModel):
     content:    Optional[str] = None
+    format:     Optional[str] = None     # if updating from plain to html, pass 'html'
     group_name: Optional[str] = None
 
 router = APIRouter(prefix="/api", tags=["workflow"])
@@ -127,10 +297,14 @@ def add_workflow_entry(body: AddWorkflowEntry):
     now = datetime.utcnow().isoformat()
     date = body.date or datetime.utcnow().strftime("%Y-%m-%d")
     time_ = body.time or datetime.utcnow().strftime("%H:%M")
+    fmt = body.format if body.format in ("plain", "html") else "plain"
+    # Sanitize on the way in, not on the way out. Storage is the trust boundary;
+    # display can render directly.
+    content = sanitize_html(body.content) if fmt == "html" else body.content
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO workflow_entries (date,time,type,content,group_name,task_id,created,updated) VALUES (?,?,?,?,?,?,?,?)",
-            (date, time_, body.type, body.content, body.group_name, body.task_id, now, now))
+            "INSERT INTO workflow_entries (date,time,type,content,format,group_name,task_id,created,updated) VALUES (?,?,?,?,?,?,?,?,?)",
+            (date, time_, body.type, content, fmt, body.group_name, body.task_id, now, now))
         conn.commit()
         entry = dict(conn.execute("SELECT * FROM workflow_entries WHERE id=?", (cur.lastrowid,)).fetchone())
     return entry
@@ -142,10 +316,15 @@ def update_workflow_entry(entry_id: int, body: UpdateWorkflowEntry):
         row = conn.execute("SELECT * FROM workflow_entries WHERE id=?", (entry_id,)).fetchone()
         if not row: raise HTTPException(404, "Not found")
         e = dict(row)
-        if body.content    is not None: e["content"]    = body.content
-        if body.group_name is not None: e["group_name"] = body.group_name
-        conn.execute("UPDATE workflow_entries SET content=?,group_name=?,updated=? WHERE id=?",
-                     (e["content"], e["group_name"], now, entry_id))
+        # Format can be changed independently (e.g. promoting a plain entry to html).
+        if body.format is not None and body.format in ("plain", "html"):
+            e["format"] = body.format
+        if body.content is not None:
+            e["content"] = sanitize_html(body.content) if e.get("format") == "html" else body.content
+        if body.group_name is not None:
+            e["group_name"] = body.group_name
+        conn.execute("UPDATE workflow_entries SET content=?,format=?,group_name=?,updated=? WHERE id=?",
+                     (e["content"], e.get("format", "plain"), e["group_name"], now, entry_id))
         conn.commit()
     return e
 
@@ -155,6 +334,64 @@ def delete_workflow_entry(entry_id: int):
         conn.execute("DELETE FROM workflow_entries WHERE id=?", (entry_id,))
         conn.commit()
     return {"deleted": entry_id}
+
+
+# ── Scratchpad ──────────────────────────────────────────────────────────────
+
+@router.get("/workflow/{date}/scratch")
+def get_scratch(date: str):
+    with get_db() as conn:
+        row = conn.execute("SELECT content, updated FROM day_scratch WHERE date=?", (date,)).fetchone()
+    if not row:
+        return {"date": date, "content": "", "updated": None}
+    return {"date": date, "content": row["content"], "updated": row["updated"]}
+
+
+class ScratchUpdate(BaseModel):
+    content: str
+
+
+@router.put("/workflow/{date}/scratch")
+def update_scratch(date: str, body: ScratchUpdate):
+    now = datetime.utcnow().isoformat()
+    clean = sanitize_html(body.content)
+    with get_db() as conn:
+        existing = conn.execute("SELECT 1 FROM day_scratch WHERE date=?", (date,)).fetchone()
+        if existing:
+            conn.execute("UPDATE day_scratch SET content=?, updated=? WHERE date=?",
+                         (clean, now, date))
+        else:
+            conn.execute("INSERT INTO day_scratch (date, content, updated) VALUES (?,?,?)",
+                         (date, clean, now))
+        conn.commit()
+    return {"date": date, "content": clean, "updated": now}
+
+
+# ── Image upload + serve ─────────────────────────────────────────────────────
+
+@router.post("/workflow/image")
+async def upload_wf_image(image: UploadFile = File(...)):
+    """Receive an image (from paste, drag, or file picker) and return the URL.
+    Images are content-addressable by random uuid — no dedup, but disk is cheap."""
+    ext = os.path.splitext(image.filename or "img.png")[1].lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        # Most clipboard pastes come as PNG, so this is rarely hit. Default to png
+        # rather than rejecting — the browser usually labels these correctly.
+        ext = ".png"
+    fname = f"{uuid.uuid4().hex}{ext}"
+    with open(os.path.join(WF_IMG_DIR, fname), "wb") as f:
+        f.write(await image.read())
+    return {"filename": fname, "url": f"/api/wf_images/{fname}"}
+
+
+@router.get("/wf_images/{filename}")
+def serve_wf_image(filename: str):
+    # Strip any path traversal attempts (defense-in-depth — FastAPI normalises but be paranoid)
+    filename = os.path.basename(filename)
+    fpath = os.path.join(WF_IMG_DIR, filename)
+    if not os.path.exists(fpath):
+        raise HTTPException(404, "Image not found")
+    return FileResponse(fpath)
 
 
 # ── Process Day — background worker ─────────────────────────────────────────
@@ -193,8 +430,14 @@ def _process_day_worker(job_id: str, date: str, entries: list[dict]):
             _set_job(job_id, phase="processing", stage=f"Processing {group}...", progress=idx, total=total)
 
             notes = by_group[group]
+            def _entry_text(n):
+                """HTML entries → plain text; plain entries pass through."""
+                c = n.get("content", "")
+                if n.get("format") == "html":
+                    return html_to_plain_text(c)
+                return c
             notes_text = "\n".join(
-                f"[{n['time']}] {'[TASK DONE] ' if n['type']=='task_done' else ''}{n['content']}"
+                f"[{n['time']}] {'[TASK DONE] ' if n['type']=='task_done' else ''}{_entry_text(n)}"
                 for n in notes
             )
 
