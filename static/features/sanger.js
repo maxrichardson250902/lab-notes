@@ -36,6 +36,26 @@ function sgNav(v) { SG.view = v || 'list'; S.view = ''; setView('sanger'); }
 
 /* ── main render ─────────────────────────────────────────── */
 async function renderSanger(el) {
+  // Honour cross-view navigation from importer's \uD83D\uDCCA button (and any
+  // future caller). Two compatible sources:
+  //   - legacy: S._pendingSanger = { type, id } (importer still sets this)
+  //   - new:    consumeNavParams('sanger') returns { type, id }
+  // Either way we force the 'new alignment' screen with the From-inventory tab
+  // and stash the target so renderNew can preselect the dropdown.
+  var pendingSg = null;
+  if (typeof S !== 'undefined' && S._pendingSanger) {
+    pendingSg = S._pendingSanger;
+    S._pendingSanger = null;
+  }
+  if (!pendingSg && typeof consumeNavParams === 'function') {
+    pendingSg = consumeNavParams('sanger');
+  }
+  if (pendingSg) {
+    SG.view = 'new';
+    SG.refMode = 'plasmid';
+    SG._preselectRef = pendingSg;  // { type: 'plasmid'|'kitpart'|..., id: N }
+  }
+
   if (SG.view === 'new')    return renderNew(el);
   if (SG.view === 'viewer') return renderViewer(el);
   return renderList(el);
@@ -167,6 +187,31 @@ async function renderNew(el) {
     }
     var rf = document.getElementById('sg-ref-file');
     if (rf) rf.onchange = function() { if(rf.files[0]) document.getElementById('sg-ref-label').textContent=rf.files[0].name; };
+
+    // Preselect the From-inventory dropdown when navigated here via the DNA
+    // importer's \uD83D\uDCCA button. The dropdown encodes options as "<table>:<id>"
+    // (table-plural), whereas the rest of the app uses cloning-style singular
+    // type strings — translate before matching.
+    if (SG._preselectRef) {
+      var TYPE_TO_TABLE = {
+        plasmid: 'plasmids', kitpart: 'kit_parts', part: 'parts',
+        gblock: 'gblocks', primer: 'primers',
+      };
+      var table = TYPE_TO_TABLE[SG._preselectRef.type];
+      var sel = document.getElementById('sg-ref-plasmid');
+      if (sel && table) {
+        var wantedVal = table + ':' + SG._preselectRef.id;
+        for (var i = 0; i < sel.options.length; i++) {
+          if (sel.options[i].value === wantedVal) { sel.selectedIndex = i; break; }
+        }
+        if (sel.selectedIndex <= 0) {
+          // Reference exists in the cloning view but not in /api/sanger/references
+          // (no .gb file on disk for that item) — surface that rather than silently failing.
+          toast('That item has no .gb file available as a reference yet.', true);
+        }
+      }
+      SG._preselectRef = null;
+    }
   }, 50);
 }
 
