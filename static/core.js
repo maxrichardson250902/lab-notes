@@ -17,6 +17,27 @@ function registerNav(name, opts) {
   _navItems.push({ name, ...opts });
 }
 
+// ── Cross-view navigation params ─────────────────────────────────────────────
+// Single mechanism for "open view X with these params". Replaces ad-hoc flags
+// like S._pendingSelect / S._pendingSanger. Consumer calls consumeNavParams(view)
+// at the end of its renderer; the value is returned once then cleared.
+//
+// Example producer:    navigateWith('cloning', { type: 'plasmid', id: 42 });
+// Example consumer:    var p = consumeNavParams('cloning'); if (p) _clSelectSequence(p.type, p.id);
+function navigateWith(view, params) {
+  S._navParams = { view: view, params: params };
+  setView(view);
+}
+
+function consumeNavParams(view) {
+  if (S._navParams && S._navParams.view === view) {
+    var p = S._navParams.params;
+    S._navParams = null;
+    return p;
+  }
+  return null;
+}
+
 // ── Global state ─────────────────────────────────────────────────────────────
 let S = {
   view: 'notebook',
@@ -99,10 +120,10 @@ async function load() {
       } catch {}
     } catch {}
 
-    // Don't re-render if user is typing
-    const active = document.activeElement;
-    const typing = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.tagName === 'SELECT');
-    if (!typing && !(window._cl && window._cl.pd && window._cl.pd.kld.designing)) await loadView();
+    // The counts and group-nav above already refreshed in place. We deliberately
+    // do NOT call loadView() here: a periodic full re-render wipes any in-progress
+    // form / dialog / mid-edit state in the active view. Manual navigation is
+    // what triggers re-renders; this loop is just for the sidebar numbers.
   } catch (e) { console.error(e); }
 }
 
