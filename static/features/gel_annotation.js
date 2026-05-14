@@ -1,14 +1,5 @@
 /* Gel Annotation Station */
 
-var LADDER_PRESETS = {
-  '1kb_plus': { name: '1 kb Plus DNA Ladder', sizes: [15000, 10000, 8000, 6000, 5000, 4000, 3000, 2000, 1500, 1000, 850, 650, 500, 400, 300, 200, 100] },
-  '1kb': { name: '1 kb DNA Ladder', sizes: [10000, 8000, 6000, 5000, 4000, 3000, 2000, 1500, 1000, 500, 250] },
-  '100bp': { name: '100 bp DNA Ladder', sizes: [1500, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100] },
-  'pageruler': { name: 'PageRuler Prestained (Protein)', sizes: [250, 130, 100, 70, 55, 35, 25, 15, 10] },
-  'pageruler_plus': { name: 'PageRuler Plus Prestained (Protein)', sizes: [250, 130, 100, 70, 55, 35, 25, 15, 10] },
-  'hyperladder_1kb': { name: 'HyperLadder 1kb', sizes: [10000, 8000, 6000, 5000, 4000, 3000, 2500, 2000, 1500, 1000, 800, 600, 400, 200] }
-};
-
 var G = {
   gels: [],
   gel: null,
@@ -28,8 +19,34 @@ var G = {
   dirty: false,
   showUpload: false,
   pastedFile: null,
-  _dropdowns: {}
+  _dropdowns: {},
+  /* Ladder catalogue — loaded from /api/ladders on render. Each entry:
+     { id, slug, name, kind, sizes:[int], image_file, is_preset } */
+  ladders: [],
+  /* Index of a placed mark the user wants to re-place (strict-top-down workflow):
+     null = next click places next-in-list, integer = next click replaces that mark's y. */
+  markReplaceIdx: null,
+  /* Ladder manager modal state */
+  showLadderMgr: false,
+  ladderEdit: null,           // null | { id?, slug?, name, kind, sizes:[int], image_file?, _imgFile?:File, _clearImage?:bool }
+  ladderRefImageOpen: false,  // toggle for inline reference-image popover
 };
+
+/* ── helpers ── */
+function gelLadderBySlug(slug) {
+  if (!slug) return null;
+  for (var i = 0; i < G.ladders.length; i++) {
+    if (G.ladders[i].slug === slug) return G.ladders[i];
+  }
+  return null;
+}
+function gelActiveLadder() {
+  return G.gel ? gelLadderBySlug(G.gel.ladder_type) : null;
+}
+function gelSizeUnit(ladder) {
+  /* Unit label for a size — bp for DNA, kDa for protein. */
+  return ladder && ladder.kind === 'protein' ? 'kDa' : 'bp';
+}
 
 /* ── helpers ── */
 function gelNormX(clientX, canvas) {
@@ -40,10 +57,14 @@ function gelNormY(clientY, canvas) {
   var rect = canvas.getBoundingClientRect();
   return Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
 }
-function gelSizeLabel(val) {
+function gelSizeLabel(val, unit) {
   if (!val) return '';
   var n = parseInt(val, 10);
   if (isNaN(n)) return val;
+  /* Default unit is 'bp' (DNA) for backward compatibility with callers that
+     don't pass one. Protein ladders pass 'kDa' and display as e.g. '70 kDa'. */
+  var u = unit || 'bp';
+  if (u === 'kDa') return n + ' kDa';
   return n >= 1000 ? (n / 1000) + ' kb' : n + ' bp';
 }
 
@@ -214,21 +235,24 @@ function gelDrawOnCtx(ctx, w, h) {
   });
   /* draw ladder marks */
   if (G.annotations.ladderMarks) {
-    G.annotations.ladderMarks.forEach(function(m) {
+    var ladder = gelActiveLadder();
+    var unit = gelSizeUnit(ladder);
+    G.annotations.ladderMarks.forEach(function(m, i) {
       var y = m.y * h;
+      var isSelected = G.markReplaceIdx === i;
       ctx.save();
-      ctx.strokeStyle = 'rgba(232,167,53,0.7)';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = isSelected ? '#5b7a5e' : 'rgba(232,167,53,0.7)';
+      ctx.lineWidth = isSelected ? 2 : 1;
+      ctx.setLineDash(isSelected ? [] : [3, 3]);
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(w, y);
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.font = smallFont + 'px "SF Mono", Monaco, Consolas, monospace';
-      ctx.fillStyle = '#e8a735';
+      ctx.fillStyle = isSelected ? '#5b7a5e' : '#e8a735';
       ctx.textAlign = 'left';
-      ctx.fillText(gelSizeLabel(String(m.size)), 4, y - 3);
+      ctx.fillText(gelSizeLabel(String(m.size), unit), 4, y - 3);
       ctx.restore();
     });
   }
@@ -285,24 +309,41 @@ function gelInitCanvas() {
       gelDrawOverlay();
       gelRenderLaneEditor();
     } else if (G.mode === 'ladder') {
-      /* add ladder mark — pick next unplaced size */
-      var preset = LADDER_PRESETS[G.gel.ladder_type];
-      if (preset) {
-        var placed = (G.annotations.ladderMarks || []).map(function(m) { return m.size; });
-        var next = preset.sizes.find(function(s) { return placed.indexOf(s) === -1; });
-        if (next !== undefined) {
-          if (!G.annotations.ladderMarks) G.annotations.ladderMarks = [];
-          G.annotations.ladderMarks.push({ y: ny, size: next });
-          G.annotations.ladderMarks.sort(function(a, b) { return a.y - b.y; });
-          G.dirty = true;
-          gelDrawOverlay();
-          gelRenderLadderPanel();
-        } else {
-          toast('All ladder bands placed');
-        }
-      } else {
+      /* Ladder click. Two paths:
+         1. Re-place mode: if a placed mark was selected (markReplaceIdx set),
+            this click moves that mark's y instead of adding a new one.
+         2. Strict top-down: add the NEXT size in the ladder's sizes array,
+            regardless of which sizes were already placed. This means a single
+            misclick on the top band doesn't cascade — every band after it still
+            gets the right size in sequence. To skip a band, click-to-replace it. */
+      var ladder = gelActiveLadder();
+      if (!ladder) {
         toast('Select a ladder type first', true);
+        return;
       }
+      if (!G.annotations.ladderMarks) G.annotations.ladderMarks = [];
+
+      if (G.markReplaceIdx !== null && G.annotations.ladderMarks[G.markReplaceIdx]) {
+        /* Re-place existing mark */
+        G.annotations.ladderMarks[G.markReplaceIdx].y = ny;
+        G.annotations.ladderMarks.sort(function(a, b) { return a.y - b.y; });
+        G.markReplaceIdx = null;
+      } else {
+        var placedCount = G.annotations.ladderMarks.length;
+        if (placedCount >= ladder.sizes.length) {
+          toast('All ladder bands placed');
+          return;
+        }
+        var nextSize = ladder.sizes[placedCount];
+        G.annotations.ladderMarks.push({ y: ny, size: nextSize });
+        /* Keep marks sorted by y for clean display, but the "next size" logic
+           above uses array length, not anything order-dependent, so this is
+           cosmetic. */
+        G.annotations.ladderMarks.sort(function(a, b) { return a.y - b.y; });
+      }
+      G.dirty = true;
+      gelDrawOverlay();
+      gelRenderLadderPanel();
     }
   };
 
@@ -578,43 +619,122 @@ function gelClearAllLanes() {
 function gelRenderLadderPanel() {
   var el = document.getElementById('gelLadderPanel');
   if (!el) return;
+  var active = gelActiveLadder();
+  var unit = gelSizeUnit(active);
+
   var html = '<div class="gel-ladder-wrap">';
-  html += '<div class="gel-sc" style="margin-bottom:8px">Ladder Configuration</div>';
+  html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">';
+  html += '<div class="gel-sc">Ladder Configuration</div>';
+  html += '<button class="gel-btn-sm" onclick="gelOpenLadderMgr()" title="Manage ladders" style="font-size:.7rem">\u2699 Manage</button>';
+  html += '</div>';
+
+  /* Ladder picker + mode buttons */
   html += '<div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">';
-  html += '<select class="gel-input" style="flex:1;min-width:160px" onchange="gelSetLadderType(this.value)" value="' + esc(G.gel ? G.gel.ladder_type || '' : '') + '">';
-  html += '<option value="">— Select ladder —</option>';
-  Object.keys(LADDER_PRESETS).forEach(function(k) {
-    var sel = (G.gel && G.gel.ladder_type === k) ? ' selected' : '';
-    html += '<option value="' + k + '"' + sel + '>' + esc(LADDER_PRESETS[k].name) + '</option>';
+  html += '<select class="gel-input" style="flex:1;min-width:160px" onchange="gelSetLadderType(this.value)">';
+  html += '<option value="">\u2014 Select ladder \u2014</option>';
+  /* Group by kind so DNA / Protein ladders are visually separated */
+  var byKind = { dna: [], protein: [] };
+  G.ladders.forEach(function(l) {
+    (byKind[l.kind] || byKind.dna).push(l);
+  });
+  ['dna', 'protein'].forEach(function(kind) {
+    if (!byKind[kind].length) return;
+    html += '<optgroup label="' + (kind === 'dna' ? 'DNA' : 'Protein') + '">';
+    byKind[kind].forEach(function(l) {
+      var sel = (G.gel && G.gel.ladder_type === l.slug) ? ' selected' : '';
+      html += '<option value="' + esc(l.slug) + '"' + sel + '>' + esc(l.name) + '</option>';
+    });
+    html += '</optgroup>';
   });
   html += '</select>';
   html += '<button class="gel-btn-sm" onclick="gelSetMode(\x27ladder\x27)" style="' + (G.mode === 'ladder' ? 'background:#5b7a5e;color:#fff' : '') + '">Place bands</button>';
   html += '<button class="gel-btn-sm" onclick="gelSetMode(\x27lane\x27)" style="' + (G.mode === 'lane' ? 'background:#5b7a5e;color:#fff' : '') + '">Place lanes</button>';
   html += '</div>';
 
+  /* Reference image toggle — only if the active ladder has one */
+  if (active && active.image_file) {
+    html += '<div style="margin-bottom:8px">';
+    html += '<button class="gel-btn-sm" onclick="gelToggleLadderRefImage()" style="font-size:.75rem">' +
+            (G.ladderRefImageOpen ? 'Hide' : 'Show') + ' reference image</button>';
+    if (G.ladderRefImageOpen) {
+      html += '<div style="margin-top:6px;padding:6px;background:#f5f0e5;border:1px solid #d5cec0;border-radius:4px;text-align:center">' +
+              '<img src="/api/ladder_images/' + esc(active.image_file) + '" alt="ladder reference" ' +
+              'style="max-width:100%;max-height:280px;border-radius:3px">' +
+              '</div>';
+    }
+    html += '</div>';
+  }
+
+  /* Placed marks and pending next size */
   if (G.annotations.ladderMarks && G.annotations.ladderMarks.length) {
-    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;align-items:center">';
     G.annotations.ladderMarks.forEach(function(m, i) {
-      html += '<span class="gel-tag">' + gelSizeLabel(String(m.size));
-      html += ' <span onclick="gelRemoveLadderMark(' + i + ')" style="cursor:pointer;margin-left:2px">&times;</span></span>';
+      var isReplacing = G.markReplaceIdx === i;
+      var bg = isReplacing ? '#5b7a5e' : '#f5f0e5';
+      var fg = isReplacing ? '#fff' : '#4a4139';
+      html += '<span class="gel-tag" style="background:' + bg + ';color:' + fg + ';cursor:pointer" ' +
+              'onclick="gelSelectMarkForReplace(' + i + ')" ' +
+              'title="Click then click on the gel to re-place this band">' +
+              esc(gelSizeLabel(String(m.size), unit));
+      html += ' <span onclick="event.stopPropagation();gelRemoveLadderMark(' + i + ')" ' +
+              'style="cursor:pointer;margin-left:2px">&times;</span></span>';
     });
     html += '</div>';
+
+    /* What gets placed on next click (strict top-down) */
+    if (active && G.annotations.ladderMarks.length < active.sizes.length && G.markReplaceIdx === null) {
+      var nextSize = active.sizes[G.annotations.ladderMarks.length];
+      html += '<div style="font-size:.75rem;color:#8a7f72;margin-bottom:6px">Next click places: <strong>' +
+              esc(gelSizeLabel(String(nextSize), unit)) + '</strong> (' +
+              (G.annotations.ladderMarks.length + 1) + '/' + active.sizes.length + ')</div>';
+    }
+    if (G.markReplaceIdx !== null) {
+      html += '<div style="font-size:.75rem;color:#5b7a5e;margin-bottom:6px">' +
+              'Click on the gel to re-place the selected band. ' +
+              '<a onclick="gelCancelReplace()" style="cursor:pointer;text-decoration:underline">Cancel</a></div>';
+    }
     html += '<button class="gel-btn-sm gel-btn-danger" onclick="gelClearLadderMarks()" style="font-size:.75rem">Clear all marks</button>';
-  } else if (G.gel && G.gel.ladder_type) {
-    html += '<div style="color:#8a7f72;font-size:.8rem">Switch to "Place bands" mode, then click on the gel at each band position (top to bottom).</div>';
+  } else if (active) {
+    var firstSize = active.sizes[0];
+    html += '<div style="color:#8a7f72;font-size:.8rem">Switch to "Place bands", then click on the gel at the top band. ' +
+            'First click places <strong>' + esc(gelSizeLabel(String(firstSize), unit)) + '</strong>.</div>';
   }
   html += '</div>';
+
+  /* Modal markup (rendered into the same panel so visibility flips with state) */
+  if (G.showLadderMgr) html += gelRenderLadderMgrModal();
+
   el.innerHTML = html;
 }
 
+function gelSelectMarkForReplace(i) {
+  G.markReplaceIdx = (G.markReplaceIdx === i) ? null : i;
+  /* Force ladder mode so the next click goes to the right handler. */
+  if (G.markReplaceIdx !== null) G.mode = 'ladder';
+  gelRenderLadderPanel();
+  gelDrawOverlay();
+}
+function gelCancelReplace() {
+  G.markReplaceIdx = null;
+  gelRenderLadderPanel();
+}
+function gelToggleLadderRefImage() {
+  G.ladderRefImageOpen = !G.ladderRefImageOpen;
+  gelRenderLadderPanel();
+}
+
 function gelSetLadderType(val) {
-  if (G.gel) {
-    G.gel.ladder_type = val;
-    G.annotations.ladderMarks = [];
-    G.dirty = true;
-    gelDrawOverlay();
-    gelRenderLadderPanel();
-  }
+  if (!G.gel) return;
+  if (G.gel.ladder_type === val) return;  // no change — don't wipe marks
+  G.gel.ladder_type = val;
+  /* Switching ladder invalidates previously-placed marks (different sizes,
+     possibly different unit). Clear so the user starts fresh on the new one. */
+  G.annotations.ladderMarks = [];
+  G.markReplaceIdx = null;
+  G.ladderRefImageOpen = false;
+  G.dirty = true;
+  gelDrawOverlay();
+  gelRenderLadderPanel();
 }
 
 function gelSetMode(mode) {
@@ -631,9 +751,228 @@ function gelRemoveLadderMark(idx) {
 
 function gelClearLadderMarks() {
   G.annotations.ladderMarks = [];
+  G.markReplaceIdx = null;
   G.dirty = true;
   gelDrawOverlay();
   gelRenderLadderPanel();
+}
+
+/* ── ladder manager ───────────────────────────────────────────
+   Modal CRUD for the ladder catalogue. Renders as an overlay over the
+   ladder panel area when G.showLadderMgr is true. */
+
+async function gelOpenLadderMgr() {
+  /* Refresh the catalogue every time the modal opens so concurrent edits
+     by another tab show up. */
+  try { await gelLoadLadders(); } catch(e) { toast('Failed to load ladders: ' + e.message, true); return; }
+  G.showLadderMgr = true;
+  G.ladderEdit = null;
+  gelRenderLadderPanel();
+}
+function gelCloseLadderMgr() {
+  G.showLadderMgr = false;
+  G.ladderEdit = null;
+  gelRenderLadderPanel();
+}
+
+async function gelLoadLadders() {
+  var data = await api('GET', '/api/ladders');
+  G.ladders = data.items || [];
+}
+
+function gelLadderMgrNew() {
+  G.ladderEdit = { name: '', kind: 'dna', sizes: [], image_file: null };
+  gelRenderLadderPanel();
+}
+function gelLadderMgrEdit(id) {
+  var l = G.ladders.find(function(x) { return x.id === id; });
+  if (!l) return;
+  /* Deep-copy so cancel discards changes cleanly. */
+  G.ladderEdit = {
+    id: l.id, slug: l.slug, name: l.name, kind: l.kind,
+    sizes: l.sizes.slice(),
+    image_file: l.image_file,
+    is_preset: l.is_preset,
+  };
+  gelRenderLadderPanel();
+}
+function gelLadderMgrCancel() {
+  G.ladderEdit = null;
+  gelRenderLadderPanel();
+}
+
+function gelLadderMgrSetField(field, val) {
+  if (!G.ladderEdit) return;
+  G.ladderEdit[field] = val;
+}
+function gelLadderMgrSetSizes(rawText) {
+  if (!G.ladderEdit) return;
+  /* Accept newline, comma, or whitespace separated. Drop blanks and non-numerics. */
+  var parts = (rawText || '').split(/[\s,]+/).filter(Boolean);
+  var nums = [];
+  for (var i = 0; i < parts.length; i++) {
+    var n = parseInt(parts[i], 10);
+    if (!isNaN(n) && n > 0) nums.push(n);
+  }
+  G.ladderEdit.sizes = nums;
+}
+function gelLadderMgrSetImage(input) {
+  if (!G.ladderEdit) return;
+  if (input.files && input.files[0]) {
+    G.ladderEdit._imgFile = input.files[0];
+    G.ladderEdit._clearImage = false;
+    var lbl = document.getElementById('gelLadderImgLabel');
+    if (lbl) lbl.textContent = input.files[0].name;
+  }
+}
+function gelLadderMgrClearImage() {
+  if (!G.ladderEdit) return;
+  G.ladderEdit._clearImage = true;
+  G.ladderEdit._imgFile = null;
+  G.ladderEdit.image_file = null;
+  gelRenderLadderPanel();
+}
+
+async function gelLadderMgrSave() {
+  var e = G.ladderEdit;
+  if (!e) return;
+  if (!e.name || !e.name.trim()) { toast('Name required', true); return; }
+  if (!e.sizes || !e.sizes.length) { toast('At least one size required', true); return; }
+
+  var fd = new FormData();
+  fd.append('name', e.name.trim());
+  fd.append('kind', e.kind);
+  fd.append('sizes', JSON.stringify(e.sizes));
+  if (e._imgFile) fd.append('image', e._imgFile);
+  if (e._clearImage && !e._imgFile) fd.append('clear_image', '1');
+
+  var url = e.id ? '/api/ladders/' + e.id : '/api/ladders';
+  var method = e.id ? 'PUT' : 'POST';
+  try {
+    var resp = await fetch(url, { method: method, body: fd });
+    if (!resp.ok) {
+      var err = await resp.json().catch(function() { return { detail: 'Save failed' }; });
+      throw new Error(err.detail || resp.statusText);
+    }
+    await gelLoadLadders();
+    G.ladderEdit = null;
+    /* If we just edited the active ladder, make sure the panel reflects any size changes. */
+    gelRenderLadderPanel();
+    gelDrawOverlay();
+    toast('Ladder saved');
+  } catch(err) {
+    toast('Save failed: ' + err.message, true);
+  }
+}
+
+async function gelLadderMgrDelete(id) {
+  var l = G.ladders.find(function(x) { return x.id === id; });
+  if (!l) return;
+  if (l.is_preset) { toast('Cannot delete preset ladders', true); return; }
+  if (!confirm('Delete ladder "' + l.name + '"?')) return;
+  try {
+    var resp = await fetch('/api/ladders/' + id, { method: 'DELETE' });
+    if (!resp.ok) {
+      var err = await resp.json().catch(function() { return { detail: 'Delete failed' }; });
+      throw new Error(err.detail || resp.statusText);
+    }
+    await gelLoadLadders();
+    gelRenderLadderPanel();
+    toast('Ladder deleted');
+  } catch(err) {
+    toast('Delete failed: ' + err.message, true);
+  }
+}
+
+function gelRenderLadderMgrModal() {
+  /* Inline HTML chunk appended to the ladder panel when G.showLadderMgr=true */
+  var h = '<div class="gel-modal-overlay" onclick="if(event.target===this)gelCloseLadderMgr()">';
+  h += '<div class="gel-modal" style="width:520px;max-width:96vw">';
+  h += '<div class="gel-modal-hdr">';
+  h += '<span class="gel-sc">Ladder Manager</span>';
+  h += '<span onclick="gelCloseLadderMgr()" style="cursor:pointer;font-size:1.2rem;color:#8a7f72">&times;</span>';
+  h += '</div>';
+
+  if (G.ladderEdit) {
+    /* Editor view */
+    var e = G.ladderEdit;
+    var isNew = !e.id;
+    var isPreset = !!e.is_preset;
+    h += '<div class="gel-modal-body">';
+    h += '<div style="font-weight:600;margin-bottom:4px">' + (isNew ? 'New ladder' : 'Edit: ' + esc(e.name)) +
+         (isPreset ? ' <span style="font-size:.7rem;color:#8a7f72;font-weight:400">(preset \u2014 cannot delete, but you can edit)</span>' : '') +
+         '</div>';
+
+    h += '<label class="gel-sc" style="font-size:.7rem">Name</label>';
+    h += '<input type="text" class="gel-input" value="' + esc(e.name) + '" ' +
+         'oninput="gelLadderMgrSetField(\x27name\x27,this.value)" placeholder="e.g. 1 kb Plus DNA Ladder">';
+
+    h += '<label class="gel-sc" style="font-size:.7rem;margin-top:8px">Kind</label>';
+    h += '<select class="gel-input" onchange="gelLadderMgrSetField(\x27kind\x27,this.value)">';
+    h += '<option value="dna"' + (e.kind === 'dna' ? ' selected' : '') + '>DNA (bp)</option>';
+    h += '<option value="protein"' + (e.kind === 'protein' ? ' selected' : '') + '>Protein (kDa)</option>';
+    h += '</select>';
+
+    h += '<label class="gel-sc" style="font-size:.7rem;margin-top:8px">Sizes (top of gel first)</label>';
+    h += '<textarea class="gel-input" rows="5" placeholder="One per line, or comma-separated. e.g. 10000, 8000, 6000..." ' +
+         'oninput="gelLadderMgrSetSizes(this.value)" ' +
+         'style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.82rem">' +
+         esc(e.sizes.join('\n')) + '</textarea>';
+    h += '<div style="font-size:.72rem;color:#8a7f72;margin-top:2px">' +
+         e.sizes.length + ' bands. Order matters \u2014 first entry = top band on the gel.</div>';
+
+    h += '<label class="gel-sc" style="font-size:.7rem;margin-top:8px">Reference image (optional)</label>';
+    h += '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">';
+    h += '<label class="gel-btn-sm" style="cursor:pointer">';
+    h += '<input type="file" id="gelLadderImgInput" accept="image/*" style="display:none" ' +
+         'onchange="gelLadderMgrSetImage(this)"> Choose image';
+    h += '</label>';
+    var imgLabel = e._imgFile ? e._imgFile.name : (e.image_file && !e._clearImage ? 'Current image attached' : 'No image');
+    h += '<span id="gelLadderImgLabel" style="font-size:.78rem;color:#8a7f72">' + esc(imgLabel) + '</span>';
+    if (e.image_file && !e._clearImage) {
+      h += '<button class="gel-btn-sm gel-btn-danger" onclick="gelLadderMgrClearImage()" style="font-size:.7rem">Remove</button>';
+    }
+    h += '</div>';
+    if (e.image_file && !e._clearImage && !e._imgFile) {
+      h += '<div style="margin-top:6px;text-align:center"><img src="/api/ladder_images/' + esc(e.image_file) +
+           '" style="max-height:120px;border:1px solid #d5cec0;border-radius:3px"></div>';
+    }
+    h += '</div>';
+    h += '<div class="gel-modal-footer">';
+    h += '<button class="gel-btn-sm" onclick="gelLadderMgrCancel()">Cancel</button>';
+    h += '<button class="gel-btn-sm" style="background:#5b7a5e;color:#fff" onclick="gelLadderMgrSave()">Save</button>';
+    h += '</div>';
+  } else {
+    /* List view */
+    h += '<div class="gel-modal-body" style="max-height:60vh;overflow-y:auto">';
+    if (!G.ladders.length) {
+      h += '<div style="color:#8a7f72">No ladders yet.</div>';
+    } else {
+      G.ladders.forEach(function(l) {
+        h += '<div style="display:flex;align-items:center;gap:8px;padding:6px 4px;border-bottom:1px solid #ece7dd">';
+        h += '<div style="flex:1;min-width:0">';
+        h += '<div style="font-weight:500">' + esc(l.name) +
+             (l.is_preset ? ' <span style="font-size:.65rem;background:#ece7dd;padding:1px 5px;border-radius:3px;color:#8a7f72;font-weight:400">PRESET</span>' : '') +
+             '</div>';
+        h += '<div style="font-size:.72rem;color:#8a7f72">' +
+             (l.kind === 'protein' ? 'Protein' : 'DNA') + ' \u00b7 ' + l.sizes.length + ' bands' +
+             (l.image_file ? ' \u00b7 has reference image' : '') + '</div>';
+        h += '</div>';
+        h += '<button class="gel-btn-sm" onclick="gelLadderMgrEdit(' + l.id + ')" style="font-size:.72rem">Edit</button>';
+        if (!l.is_preset) {
+          h += '<button class="gel-btn-sm gel-btn-danger" onclick="gelLadderMgrDelete(' + l.id + ')" style="font-size:.72rem">Delete</button>';
+        }
+        h += '</div>';
+      });
+    }
+    h += '</div>';
+    h += '<div class="gel-modal-footer">';
+    h += '<button class="gel-btn-sm" onclick="gelCloseLadderMgr()">Close</button>';
+    h += '<button class="gel-btn-sm" style="background:#5b7a5e;color:#fff" onclick="gelLadderMgrNew()">+ New ladder</button>';
+    h += '</div>';
+  }
+  h += '</div></div>';
+  return h;
 }
 
 /* ── entry linking ── */
@@ -900,7 +1239,7 @@ async function renderGelAnnotation(el) {
   gelInjectStyles();
   gelInitPaste();
   el.innerHTML = '<div id="gelRoot"><div class="gel-empty" style="padding:40px"><span class="gel-sc">Loading…</span></div></div>';
-  await Promise.all([gelLoadList(), gelLoadRef()]);
+  await Promise.all([gelLoadList(), gelLoadRef(), gelLoadLadders()]);
   gelRenderFull();
 }
 
