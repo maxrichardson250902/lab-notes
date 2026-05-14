@@ -22,6 +22,12 @@ def init_all_tables():
     """Create /data dir and run every registered CREATE TABLE statement."""
     os.makedirs("/data", exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
+        # WAL mode lets readers and writers coexist instead of locking the whole DB,
+        # which matters when uvicorn runs multiple workers against the same SQLite file.
+        # busy_timeout makes brief lock contention wait instead of erroring out.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         for _name, sql in _table_registry:
             conn.execute(sql)
         conn.commit()
@@ -30,8 +36,10 @@ def init_all_tables():
 @contextmanager
 def get_db():
     """Yields a sqlite3 connection with Row factory. Auto-closes."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    # Per-connection busy_timeout (PRAGMAs in WAL mode are per-DB but busy_timeout is per-connection).
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
     finally:
