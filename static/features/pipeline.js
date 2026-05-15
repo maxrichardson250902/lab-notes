@@ -763,7 +763,7 @@ async function renderPipeline(el) {
   plDraw();
 }
 
-registerView('pipeline', renderPipeline);
+registerView('pipeline', renderPipeline, {wide:true});
 
 window.plShowNew    = plShowNew;
 window.plHideNew    = plHideNew;
