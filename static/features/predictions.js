@@ -106,4 +106,4 @@ async function predSaveEdit(id){
     toast('Saved');
   }catch(e){toast('Failed: '+e.message,true);}
 }
-registerView('predictions', renderPredictions);
+registerView('predictions', renderPredictions, {wide:true});
