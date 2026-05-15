@@ -7,10 +7,12 @@
 
 // ── View registry ────────────────────────────────────────────────────────────
 const _views = {};        // name -> async function(el)
+const _viewMeta = {};     // name -> { wide?: bool, ... }
 const _navItems = [];     // {name, label, icon, section, countId}
 
-function registerView(name, renderFn) {
+function registerView(name, renderFn, opts) {
   _views[name] = renderFn;
+  if (opts) _viewMeta[name] = opts;
 }
 
 function registerNav(name, opts) {
@@ -168,11 +170,15 @@ function setGroup(g) {
 
 async function loadView() {
   const el = document.getElementById('content');
-  if ((S.view === 'notebook' && S.nbBook) || S.view ==='circuits' || S.view === 'cloning' || S.view === 'pipeline' || S.view === 'sanger' || S.view === 'gel_annotation' || S.view === 'import_data') {
-    el.style.maxWidth = 'none'; el.style.padding = '0 12px';
-  } else {
-    el.style.maxWidth = ''; el.style.padding = '';
-  }
+
+  // Apply view-width class. Sources, in priority order:
+  //   1. View metadata via registerView(name, fn, {wide:true})
+  //   2. Special case: notebook in book-page mode (nbBook set) goes wide so
+  //      the entry list + reader pane can sit side-by-side
+  // Default = narrow (CSS .content { max-width: 1100px }).
+  const meta = _viewMeta[S.view] || {};
+  const wideByNotebookCase = (S.view === 'notebook' && S.nbBook);
+  el.classList.toggle('wide', !!(meta.wide || wideByNotebookCase));
 
   const renderer = _views[S.view];
   if (renderer) {
