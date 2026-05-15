@@ -109,6 +109,12 @@ async function renderWorkflow(el) {
     '<div class="wf-doc-side">' +
       '<div class="wf-doc-side-h">Groups in this day</div>' +
       '<div id="wf-doc-side-groups" style="min-height:60px"></div>' +
+      /* Active protocol runs land here. Refreshed on render, on storage events,
+         and when a run is started/completed elsewhere. Stays hidden if no runs. */
+      '<div id="wf-doc-side-runs-wrap" style="display:none">' +
+        '<div class="wf-doc-side-h" style="margin-top:14px">Active protocol runs</div>' +
+        '<div id="wf-doc-side-runs"></div>' +
+      '</div>' +
       '<div class="wf-doc-side-h" style="margin-top:14px">Untagged blocks</div>' +
       '<div id="wf-doc-side-untagged" style="font-size:12px;color:#8a7f72"></div>' +
       '<div class="wf-doc-side-help">' +
@@ -136,6 +142,13 @@ async function renderWorkflow(el) {
     docEl.addEventListener('click', _wfRefreshCurrentBlock);
     docEl.addEventListener('keyup', _wfRefreshCurrentBlock);
     _wfLoadDoc();
+    _wfRefreshActiveRuns();
+    /* Listen for cross-tab run state changes (localStorage events fire only in
+       OTHER tabs, but spLaunchRunDirect inside this tab updates DOM directly
+       and we re-render on every doc save anyway). */
+    window.addEventListener('storage', function(e) {
+      if (e.key === 'lab_proto_runs') _wfRefreshActiveRuns();
+    });
   }, 50);
 }
 
@@ -148,9 +161,29 @@ function _wfInjectDocStyles() {
   s.textContent = [
     '.wf-doc-layout { display:flex; gap:14px; margin-top:8px; align-items:flex-start; }',
     '.wf-doc-main { flex:1; min-width:0; background:var(--surface,#faf8f4); border:1px solid var(--border,#d5cec0); border-radius:6px; padding:12px 14px; }',
-    '.wf-doc-side { width:240px; background:var(--surface,#faf8f4); border:1px solid var(--border,#d5cec0); border-radius:6px; padding:12px; font-size:12.5px; }',
+    /* Sidebar widens automatically when there are active runs (data-has-runs attr toggled below) */
+    '.wf-doc-side { width:240px; flex-shrink:0; background:var(--surface,#faf8f4); border:1px solid var(--border,#d5cec0); border-radius:6px; padding:12px; font-size:12.5px; max-height:calc(100vh - 140px); overflow-y:auto; position:sticky; top:8px; }',
+    '.wf-doc-side[data-has-runs="1"] { width:380px; }',
+    '.wf-doc-side[data-has-runs="2"] { width:440px; }',
+    '.wf-doc-side[data-has-runs="3"] { width:500px; }',
     '.wf-doc-side-h { font-variant:small-caps; font-size:11px; letter-spacing:.08em; color:#8a7f72; font-weight:600; margin-bottom:6px; }',
     '.wf-doc-side-help { margin-top:14px; padding-top:10px; border-top:1px solid #ece7dd; font-size:11px; color:#8a7f72; line-height:1.5; }',
+    /* Active-run card in sidebar */
+    '.wf-run-card { background:#fff; border:1px solid #d5cec0; border-radius:5px; padding:8px 10px; margin-bottom:8px; }',
+    '.wf-run-card-head { display:flex; justify-content:space-between; align-items:flex-start; gap:6px; margin-bottom:4px; }',
+    '.wf-run-card-title { font-size:12.5px; font-weight:600; color:#4a4139; line-height:1.25; flex:1; min-width:0; }',
+    '.wf-run-card-group { font-size:10px; color:#8a7f72; font-family:"SF Mono",Monaco,Consolas,monospace; margin-top:2px; }',
+    '.wf-run-progress-bar { height:3px; background:#ece7dd; border-radius:2px; overflow:hidden; margin:6px 0 4px 0; }',
+    '.wf-run-progress-fill { height:100%; background:#5b7a5e; transition:width .2s; }',
+    '.wf-run-progress-text { font-size:10.5px; color:#8a7f72; }',
+    /* Compact recipe table — read-only summary, no inputs */
+    '.wf-run-recipe { margin-top:6px; max-height:200px; overflow:auto; border:1px solid #ece7dd; border-radius:3px; }',
+    '.wf-run-recipe table { width:100%; border-collapse:collapse; font-size:11px; }',
+    '.wf-run-recipe th { background:#f0ebe3; padding:3px 6px; text-align:left; font-weight:600; color:#8a7f72; border-bottom:1px solid #e0d9cd; position:sticky; top:0; }',
+    '.wf-run-recipe td { padding:3px 6px; border-bottom:1px solid #f0ebe3; color:#4a4139; white-space:nowrap; }',
+    '.wf-run-recipe tr:last-child td { border-bottom:none; }',
+    '.wf-run-resume { margin-top:6px; width:100%; background:#5b7a5e; color:#fff; border:none; padding:5px; border-radius:3px; cursor:pointer; font-size:11px; }',
+    '.wf-run-resume:hover { background:#4a6b4d; }',
     '.wf-doc-toolbar { display:flex; gap:4px; align-items:center; flex-wrap:wrap; padding:6px 0 4px 0; margin-top:4px; border-top:1px solid #ece7dd; }',
     '.wf-tool-btn-primary { background:#5b7a5e !important; color:#fff !important; border-color:#5b7a5e !important; }',
     '#wf-doc .wf-block, #wf-doc p[data-groups], #wf-doc table[data-groups], #wf-doc ul[data-groups], #wf-doc ol[data-groups] { padding-left:8px; border-left:3px solid transparent; transition:border-color .15s; }',
@@ -306,6 +339,73 @@ function _wfRefreshSidebar() {
       ? 'None \u2014 everything tagged.'
       : untagged + ' untagged block' + (untagged > 1 ? 's' : '') + ' (will be context for all groups).';
   }
+}
+
+/* ── Active-runs panel ──────────────────────────────────────────────────
+   Reads lab_proto_runs from localStorage, renders one card per active run
+   with a compact read-only recipe table. Resume button hands off to the
+   protocol scratch view. Sidebar width auto-expands with run count. */
+function _wfRefreshActiveRuns() {
+  var wrap = document.getElementById('wf-doc-side-runs-wrap');
+  var list = document.getElementById('wf-doc-side-runs');
+  var side = document.querySelector('.wf-doc-side');
+  if (!wrap || !list || !side) return;
+
+  var runs = [];
+  try { runs = JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(_) {}
+  if (!runs.length) {
+    wrap.style.display = 'none';
+    side.removeAttribute('data-has-runs');
+    return;
+  }
+  wrap.style.display = '';
+  /* Cap data attribute at 3 so CSS doesn't need every integer — 3+ runs all use the 500px width */
+  side.setAttribute('data-has-runs', String(Math.min(runs.length, 3)));
+
+  list.innerHTML = runs.map(_wfRenderRunCard).join('');
+}
+
+function _wfRenderRunCard(run) {
+  /* Defensive — older run objects may not have all fields. */
+  if (!run || !run.protocol) return '';
+  var steps = run.steps || [];
+  var done = steps.filter(function(s) { return s.done; }).length;
+  var pct = steps.length ? Math.round((done / steps.length) * 100) : 0;
+
+  var html = '<div class="wf-run-card">';
+  html += '<div class="wf-run-card-head">';
+  html += '<div><div class="wf-run-card-title">' + esc(run.protocol.title || 'Protocol') + '</div>';
+  if (run.group_name) {
+    html += '<div class="wf-run-card-group">' + esc(run.group_name) +
+            (run.subgroup ? ' / ' + esc(run.subgroup) : '') + '</div>';
+  }
+  html += '</div></div>';
+  html += '<div class="wf-run-progress-bar"><div class="wf-run-progress-fill" style="width:' + pct + '%"></div></div>';
+  html += '<div class="wf-run-progress-text">' + done + ' / ' + steps.length + ' steps \u00b7 ' + pct + '%</div>';
+
+  /* Recipe — render only if there's actual data. Don't show empty tables. */
+  if (run.recipe && run.recipe.rows && run.recipe.rows.length && run.recipe.cols && run.recipe.cols.length) {
+    html += '<div class="wf-run-recipe"><table><thead><tr>';
+    run.recipe.cols.forEach(function(c) {
+      html += '<th>' + esc(c.label || c.name || '') + '</th>';
+    });
+    html += '</tr></thead><tbody>';
+    run.recipe.rows.forEach(function(row) {
+      html += '<tr>';
+      run.recipe.cols.forEach(function(c) {
+        var key = c.key || c.name || c.label || '';
+        var val = row[key];
+        if (val === undefined || val === null || val === '') val = '\u2014';
+        html += '<td>' + esc(String(val)) + '</td>';
+      });
+      html += '</tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+
+  html += '<button class="wf-run-resume" onclick="wfResumeRun(\'' + esc(run.runId).replace(/\'/g, '&#39;') + '\')">Resume</button>';
+  html += '</div>';
+  return html;
 }
 
 /* Tag picker modal */
@@ -502,6 +602,9 @@ function wfLaunchProtoRun() {
 
   if (typeof spLaunchRunDirect === 'function') {
     spLaunchRunDirect(p, group, subgroup);
+    /* spLaunchRunDirect writes to localStorage. Refresh the sidebar so the
+       new run appears without needing a page reload. */
+    setTimeout(function() { _wfRefreshActiveRuns(); }, 100);
   } else {
     toast('scratch.js not loaded', true);
   }
@@ -924,6 +1027,6 @@ function _wfJumpToProtocol(title) {
   }
 }
 
-registerView('workflow', renderWorkflow);
+registerView('workflow', renderWorkflow, {wide:true});
 window.processWorkflowDay = processWorkflowDay;
 window.wfResetProcessDay  = wfResetProcessDay;
