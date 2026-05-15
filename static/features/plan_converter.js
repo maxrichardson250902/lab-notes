@@ -1133,6 +1133,6 @@ async function renderPlanConverter(el) {
   pcDraw();
 }
 
-registerView('plan_converter', renderPlanConverter);
+registerView('plan_converter', renderPlanConverter, {wide:true});
 
 })(); /* end IIFE */
