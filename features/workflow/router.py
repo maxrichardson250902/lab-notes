@@ -35,13 +35,129 @@ register_table("day_summaries", """CREATE TABLE IF NOT EXISTS day_summaries (
     summary   TEXT NOT NULL DEFAULT '',
     updated   TEXT NOT NULL)""")
 
-# Per-day free-form scratchpad. Single HTML blob (sanitized on save). Separate
-# from workflow_entries so it doesn't get pulled into the end-of-day LLM
-# processing — different lifecycle, different mental model.
+# Per-day scratchpad (legacy; kept for backward-compat data, no longer the UI).
+# In the unified-document model the scratchpad merges into day_documents.
 register_table("day_scratch", """CREATE TABLE IF NOT EXISTS day_scratch (
     date      TEXT PRIMARY KEY,
     content   TEXT NOT NULL DEFAULT '',
     updated   TEXT NOT NULL)""")
+
+# ── Unified day document ────────────────────────────────────────────────────
+# One HTML blob per date. Blocks within may carry data-groups="g1,g2" attrs
+# to assign them to project groups. The "Process Day" pipeline groups blocks
+# by tag and feeds them to the LLM.
+register_table("day_documents", """CREATE TABLE IF NOT EXISTS day_documents (
+    date      TEXT PRIMARY KEY,
+    content   TEXT NOT NULL DEFAULT '',
+    updated   TEXT NOT NULL)""")
+
+# Tracks which dates have been migrated from workflow_entries → day_documents
+# so the migration runs at most once per date.
+register_table("workflow_migration_log", """CREATE TABLE IF NOT EXISTS workflow_migration_log (
+    date      TEXT PRIMARY KEY,
+    migrated_at TEXT NOT NULL)""")
+
+
+def _migrate_entries_to_documents(conn):
+    """For each date with workflow_entries but no entry in workflow_migration_log,
+    concat its entries into a day_documents row. Idempotent — re-runs are no-ops.
+    Preserves the original workflow_entries rows so a rollback is possible."""
+    # Find candidate dates: have entries, not yet migrated, and not already in day_documents
+    # (the day_documents check covers the case where someone hand-created one).
+    candidates = conn.execute("""
+        SELECT DISTINCT we.date
+        FROM workflow_entries we
+        WHERE we.date NOT IN (SELECT date FROM workflow_migration_log)
+          AND we.date NOT IN (SELECT date FROM day_documents)
+        ORDER BY we.date
+    """).fetchall()
+
+    migrated_count = 0
+    for row in candidates:
+        date = row[0] if not hasattr(row, 'keys') else row['date']
+        entries = conn.execute(
+            "SELECT time, type, content, group_name, format "
+            "FROM workflow_entries WHERE date=? ORDER BY time ASC, created ASC",
+            (date,)
+        ).fetchall()
+
+        blocks = []
+        for e in entries:
+            time_ = (e['time'] or '').strip() if hasattr(e, 'keys') else (e[0] or '').strip()
+            etype = e['type'] if hasattr(e, 'keys') else e[1]
+            content = e['content'] if hasattr(e, 'keys') else e[2]
+            group = e['group_name'] if hasattr(e, 'keys') else e[3]
+            fmt = (e['format'] if hasattr(e, 'keys') else e[4]) or 'plain'
+
+            # Build the block. Wrap plain content in <p>, html content as-is in a <div>.
+            tag_attr = f' data-groups="{html_lib.escape(group)}"' if group else ''
+            time_chip = f'<span class="wf-time" contenteditable="false">{html_lib.escape(time_)}</span> ' if time_ else ''
+
+            if fmt == 'html':
+                # Strip any wrapping div the renderer added (defensive)
+                body = re.sub(r'^<div class="wf-rich-render">', '', content or '')
+                body = re.sub(r'</div>\s*$', '', body)
+                # If task/protocol type, mark them so the new UI can colour-code
+                cls = 'wf-block'
+                if etype == 'task_done':
+                    cls += ' wf-task-done'
+                elif etype == 'protocol_run':
+                    cls += ' wf-protocol'
+                blocks.append(f'<div class="{cls}"{tag_attr}>{time_chip}{body}</div>')
+            else:
+                # Plain — escape and wrap in <p>
+                safe = html_lib.escape(content or '')
+                # preserve newlines as <br>
+                safe = safe.replace('\n', '<br>')
+                cls = 'wf-block'
+                if etype == 'task_done':
+                    cls += ' wf-task-done'
+                elif etype == 'protocol_run':
+                    cls += ' wf-protocol'
+                blocks.append(f'<p class="{cls}"{tag_attr}>{time_chip}{safe}</p>')
+
+        # Also append any existing day_scratch content (preserving the previous round's work).
+        scratch = conn.execute("SELECT content FROM day_scratch WHERE date=?", (date,)).fetchone()
+        if scratch and (scratch[0] if not hasattr(scratch, 'keys') else scratch['content']):
+            sc_content = scratch[0] if not hasattr(scratch, 'keys') else scratch['content']
+            blocks.append(f'<div class="wf-block wf-block-scratch">{sc_content}</div>')
+
+        doc_html = '\n'.join(blocks) if blocks else ''
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO day_documents (date, content, updated) VALUES (?,?,?)",
+            (date, doc_html, now)
+        )
+        conn.execute(
+            "INSERT INTO workflow_migration_log (date, migrated_at) VALUES (?,?)",
+            (date, now)
+        )
+        migrated_count += 1
+
+    # Also handle dates that have only scratch (no workflow_entries) — those should
+    # become day_documents too, otherwise the user's scratchpad content is orphaned.
+    scratch_only = conn.execute("""
+        SELECT date, content FROM day_scratch
+        WHERE date NOT IN (SELECT date FROM workflow_migration_log)
+          AND date NOT IN (SELECT date FROM day_documents)
+          AND content != ''
+    """).fetchall()
+    for r in scratch_only:
+        date = r[0] if not hasattr(r, 'keys') else r['date']
+        sc = r[1] if not hasattr(r, 'keys') else r['content']
+        now = datetime.utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO day_documents (date, content, updated) VALUES (?,?,?)",
+            (date, f'<div class="wf-block wf-block-scratch">{sc}</div>', now)
+        )
+        conn.execute(
+            "INSERT INTO workflow_migration_log (date, migrated_at) VALUES (?,?)",
+            (date, now)
+        )
+        migrated_count += 1
+
+
+register_seed(_migrate_entries_to_documents)
 
 
 # ── HTML sanitizer ───────────────────────────────────────────────────────────
@@ -65,6 +181,19 @@ _ALLOWED_ATTRS = {
     "a":   {"href", "class", "data-gel-id", "data-entry-id", "title"},
     "td":  {"colspan", "rowspan"},
     "th":  {"colspan", "rowspan"},
+    # Block-level tags can carry data-groups (comma-separated project group names)
+    # for the unified-document tagging UI.
+    "div": {"data-groups", "contenteditable"},
+    "p":   {"data-groups"},
+    "ul":  {"data-groups"},
+    "ol":  {"data-groups"},
+    "table": {"data-groups"},
+    "pre": {"data-groups"},
+    "blockquote": {"data-groups"},
+    "h3":  {"data-groups"},
+    "h4":  {"data-groups"},
+    # span gets contenteditable for the time-chip widget (so it's not editable text)
+    "span": {"contenteditable"},
     # generic class allowlist for our own styling hooks
     "*":   {"class"},
 }
@@ -151,6 +280,18 @@ def sanitize_html(raw: str) -> str:
                 continue
             if name in ("src", "href"):
                 if not _safe_url(val):
+                    continue
+            if name == "contenteditable":
+                # Only allow contenteditable="false" — used by widget-style chips
+                # (time stamps). "true" or empty values are rejected to keep the
+                # editor's normal behaviour predictable.
+                if val.strip().lower() != "false":
+                    continue
+            if name == "data-groups":
+                # Normalise: comma-separated, no spaces around commas, no empty entries.
+                parts = [p.strip() for p in val.split(",") if p.strip()]
+                val = ",".join(parts)
+                if not val:
                     continue
             if name == "class":
                 val = _safe_class(val)
@@ -336,35 +477,109 @@ def delete_workflow_entry(entry_id: int):
     return {"deleted": entry_id}
 
 
-# ── Scratchpad ──────────────────────────────────────────────────────────────
+# ── Day document (unified rich doc per date) ─────────────────────────────────
 
-@router.get("/workflow/{date}/scratch")
-def get_scratch(date: str):
+@router.get("/workflow/{date}/document")
+def get_document(date: str):
     with get_db() as conn:
-        row = conn.execute("SELECT content, updated FROM day_scratch WHERE date=?", (date,)).fetchone()
+        row = conn.execute(
+            "SELECT content, updated FROM day_documents WHERE date=?", (date,)
+        ).fetchone()
     if not row:
         return {"date": date, "content": "", "updated": None}
     return {"date": date, "content": row["content"], "updated": row["updated"]}
 
 
-class ScratchUpdate(BaseModel):
+class DocumentUpdate(BaseModel):
     content: str
 
 
-@router.put("/workflow/{date}/scratch")
-def update_scratch(date: str, body: ScratchUpdate):
+@router.put("/workflow/{date}/document")
+def update_document(date: str, body: DocumentUpdate):
     now = datetime.utcnow().isoformat()
     clean = sanitize_html(body.content)
     with get_db() as conn:
-        existing = conn.execute("SELECT 1 FROM day_scratch WHERE date=?", (date,)).fetchone()
+        existing = conn.execute("SELECT 1 FROM day_documents WHERE date=?", (date,)).fetchone()
         if existing:
-            conn.execute("UPDATE day_scratch SET content=?, updated=? WHERE date=?",
+            conn.execute("UPDATE day_documents SET content=?, updated=? WHERE date=?",
                          (clean, now, date))
         else:
-            conn.execute("INSERT INTO day_scratch (date, content, updated) VALUES (?,?,?)",
+            conn.execute("INSERT INTO day_documents (date, content, updated) VALUES (?,?,?)",
                          (date, clean, now))
+        # Mark as migrated so a startup re-migration doesn't try to re-fill it.
+        conn.execute(
+            "INSERT OR IGNORE INTO workflow_migration_log (date, migrated_at) VALUES (?,?)",
+            (date, now))
         conn.commit()
     return {"date": date, "content": clean, "updated": now}
+
+
+class AppendBlock(BaseModel):
+    """Used by protocol-run / task-done auto-inserts: append a block to today's
+    document instead of inserting a workflow_entries row."""
+    date:    Optional[str] = None
+    html:    str
+    groups:  Optional[list[str]] = None    # list of group names to tag with
+
+
+@router.post("/workflow/document/append")
+def append_to_document(body: AppendBlock):
+    """Append HTML to a day's document. Used for protocol starts/completions
+    and task completions. The caller passes pre-built HTML (sanitized server-side)."""
+    date = body.date or datetime.utcnow().strftime("%Y-%m-%d")
+    now = datetime.utcnow().isoformat()
+    clean_block = sanitize_html(body.html)
+    # If groups were specified, splice them into the top-level block tag(s)
+    if body.groups:
+        groups_attr = ','.join(body.groups)
+        clean_block = re.sub(
+            r'^<(div|p|ul|ol|table|pre|blockquote|h3|h4)\b',
+            rf'<\1 data-groups="{html_lib.escape(groups_attr)}"',
+            clean_block, count=1
+        )
+    with get_db() as conn:
+        row = conn.execute("SELECT content FROM day_documents WHERE date=?", (date,)).fetchone()
+        if row:
+            new_content = (row["content"] or '') + '\n' + clean_block
+            conn.execute("UPDATE day_documents SET content=?, updated=? WHERE date=?",
+                         (new_content, now, date))
+        else:
+            conn.execute("INSERT INTO day_documents (date, content, updated) VALUES (?,?,?)",
+                         (date, clean_block, now))
+        conn.execute(
+            "INSERT OR IGNORE INTO workflow_migration_log (date, migrated_at) VALUES (?,?)",
+            (date, now))
+        conn.commit()
+    return {"date": date, "appended": True}
+
+
+def _extract_blocks_for_llm(html: str) -> list[dict]:
+    """Walk the document, split into top-level blocks, extract their data-groups
+    and plain-text content. Returns [{groups: [str], text: str}, ...]."""
+    if not html:
+        return []
+    # Match top-level block-level elements with optional data-groups.
+    # This is a coarse parser — we only care about top-level blocks, and we accept
+    # that nested blocks (tables inside divs, etc.) get their groups from the
+    # parent. That matches the editor UX where group-tagging is per top-level block.
+    pattern = re.compile(
+        r'<(?P<tag>div|p|ul|ol|table|pre|blockquote|h3|h4)'
+        r'(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)\s*>',
+        re.IGNORECASE | re.DOTALL
+    )
+    blocks = []
+    pos = 0
+    for m in pattern.finditer(html):
+        attrs = m.group('attrs') or ''
+        grp_m = re.search(r'data-groups="([^"]*)"', attrs)
+        groups = [g.strip() for g in (grp_m.group(1) if grp_m else '').split(',') if g.strip()]
+        # Rebuild the block tag so html_to_plain_text sees the full element
+        full = m.group(0)
+        text = html_to_plain_text(full).strip()
+        if text:
+            blocks.append({'groups': groups, 'text': text})
+        pos = m.end()
+    return blocks
 
 
 # ── Image upload + serve ─────────────────────────────────────────────────────
@@ -396,8 +611,10 @@ def serve_wf_image(filename: str):
 
 # ── Process Day — background worker ─────────────────────────────────────────
 
-def _process_day_worker(job_id: str, date: str, entries: list[dict]):
-    """Runs in a background thread. Updates job state in SQLite as it progresses."""
+def _process_day_worker(job_id: str, date: str, blocks: list[dict]):
+    """Runs in a background thread. Updates job state in SQLite as it progresses.
+    `blocks` is a list of {groups: [str], text: str} produced by _extract_blocks_for_llm.
+    """
     _ssh.enrich_running = True
     try:
         # ── Wake 3090 ────────────────────────────────────────────────────
@@ -415,31 +632,51 @@ def _process_day_worker(job_id: str, date: str, entries: list[dict]):
             return
         _set_job(job_id, phase="llm_ready", stage="LLM is ready")
 
-        # ── Group entries ────────────────────────────────────────────────
-        by_group: dict[str, list[dict]] = {}
-        for e in entries:
-            g = e.get("group_name") or "General"
-            by_group.setdefault(g, []).append(e)
+        # ── Partition blocks by tag ──────────────────────────────────────
+        # Tagged blocks → one bucket per group they're tagged with (multi-tag
+        # means the block goes into every named bucket).
+        # Untagged blocks → shared "context" appended to every bucket's prompt.
+        by_group: dict[str, list[str]] = {}
+        untagged: list[str] = []
+        for b in blocks:
+            if not b['groups']:
+                untagged.append(b['text'])
+                continue
+            for g in b['groups']:
+                by_group.setdefault(g, []).append(b['text'])
+
+        # If nothing is tagged but there's untagged content, fall back to a single
+        # "General" notebook entry — otherwise the LLM has nothing to write.
+        if not by_group and untagged:
+            by_group["General"] = []   # will be filled from untagged below
+
+        if not by_group:
+            _set_job(job_id, status="failed", phase="done",
+                     stage="Day document is empty — nothing to process")
+            return
 
         group_names = list(by_group.keys())
         total = len(group_names)
         created = []
         errors = []
+        untagged_text = "\n\n".join(untagged) if untagged else ""
 
         for idx, group in enumerate(group_names):
             _set_job(job_id, phase="processing", stage=f"Processing {group}...", progress=idx, total=total)
 
-            notes = by_group[group]
-            def _entry_text(n):
-                """HTML entries → plain text; plain entries pass through."""
-                c = n.get("content", "")
-                if n.get("format") == "html":
-                    return html_to_plain_text(c)
-                return c
-            notes_text = "\n".join(
-                f"[{n['time']}] {'[TASK DONE] ' if n['type']=='task_done' else ''}{_entry_text(n)}"
-                for n in notes
-            )
+            tagged_text = "\n\n".join(by_group[group])
+            # Build the prompt body. Untagged content is included as context but
+            # marked as such so the LLM treats it as supporting info rather than
+            # the primary record.
+            if untagged_text and tagged_text:
+                notes_text = (
+                    f"=== Notes tagged for {group} ===\n{tagged_text}\n\n"
+                    f"=== General context for the day (untagged) ===\n{untagged_text}"
+                )
+            elif untagged_text:
+                notes_text = f"=== Day's notes (untagged) ===\n{untagged_text}"
+            else:
+                notes_text = tagged_text
 
             # ── Call LLM with retry ──────────────────────────────────────
             last_err = None
@@ -474,7 +711,6 @@ def _process_day_worker(job_id: str, date: str, entries: list[dict]):
                 errors.append({"group": group, "error": last_err or "Unknown error after 3 attempts"})
                 continue
 
-            # ── Insert entry — wrap every field in str() ─────────────────
             try:
                 now = datetime.utcnow().isoformat()
                 title = str(result_data.get("title", "")) or f"Workflow {date}"
@@ -524,16 +760,19 @@ def process_workflow_day(body: dict):
         return {"error": f"A job is already running (started {running['created']})",
                 "job_id": running["job_id"]}
 
+    # Read the day document and split into blocks for per-group processing.
     with get_db() as conn:
-        entries = [dict(r) for r in conn.execute(
-            "SELECT * FROM workflow_entries WHERE date=? ORDER BY time ASC", (date,)).fetchall()]
-    if not entries:
-        return {"error": "No workflow entries for this date"}
+        doc_row = conn.execute(
+            "SELECT content FROM day_documents WHERE date=?", (date,)).fetchone()
+    doc_html = (doc_row["content"] if doc_row else "") or ""
+    blocks = _extract_blocks_for_llm(doc_html)
+    if not blocks:
+        return {"error": "Day document is empty — nothing to process"}
 
     job_id = uuid.uuid4().hex[:12]
     _create_job(job_id, date)
 
-    thread = threading.Thread(target=_process_day_worker, args=(job_id, date, entries), daemon=True)
+    thread = threading.Thread(target=_process_day_worker, args=(job_id, date, blocks), daemon=True)
     thread.start()
 
     return {"job_id": job_id}
@@ -564,13 +803,36 @@ def process_day_reset():
 
 @router.post("/workflow/task-done")
 def workflow_task_done(body: dict):
+    """Auto-append a task-completed block to today's document."""
     now = datetime.utcnow().isoformat()
     date = datetime.utcnow().strftime("%Y-%m-%d")
     time_ = datetime.utcnow().strftime("%H:%M")
+    text = body.get("text", "") or ""
+    group = body.get("group_name") or None
+
+    # Build the HTML block. The time chip is contenteditable=false so it doesn't
+    # interleave with the user's typing.
+    safe_text = html_lib.escape(text)
+    groups_attr = f' data-groups="{html_lib.escape(group)}"' if group else ''
+    time_chip = f'<span class="wf-time" contenteditable="false">{html_lib.escape(time_)}</span> '
+    block = (
+        f'<p class="wf-block wf-task-done"{groups_attr}>'
+        f'{time_chip}<strong>\u2713 Task done:</strong> {safe_text}'
+        f'</p>'
+    )
+
+    clean_block = sanitize_html(block)
     with get_db() as conn:
+        row = conn.execute("SELECT content FROM day_documents WHERE date=?", (date,)).fetchone()
+        if row:
+            new_content = (row["content"] or '') + '\n' + clean_block
+            conn.execute("UPDATE day_documents SET content=?, updated=? WHERE date=?",
+                         (new_content, now, date))
+        else:
+            conn.execute("INSERT INTO day_documents (date, content, updated) VALUES (?,?,?)",
+                         (date, clean_block, now))
         conn.execute(
-            "INSERT INTO workflow_entries (date,time,type,content,group_name,task_id,created,updated) VALUES (?,?,?,?,?,?,?,?)",
-            (date, time_, "task_done", body.get("text", ""), body.get("group_name", ""),
-             body.get("task_id"), now, now))
+            "INSERT OR IGNORE INTO workflow_migration_log (date, migrated_at) VALUES (?,?)",
+            (date, now))
         conn.commit()
     return {"added": True}
