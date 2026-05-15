@@ -753,11 +753,49 @@ async function spSaveRunToEntry(runId) {
       steps_json: JSON.stringify(rs.steps), recipe_json: JSON.stringify(rs.recipe),
       entry_id: entry.id || null
     });
+    /* Append a completion block to today's workflow document. List the completed
+       steps (no times per user pref) plus any deviations. Tagged with the run's
+       group so process-day pulls it into the right notebook entry. */
+    try {
+      var doneSteps = rs.steps.filter(function(s) { return s.done; });
+      var devSteps = rs.steps.filter(function(s) { return s.deviation && s.deviation.trim(); });
+      var stepHtml = '';
+      if (doneSteps.length) {
+        stepHtml += '<ul>' + doneSteps.map(function(s) {
+          var line = _gelEsc(s.text);
+          if (s.deviation && s.deviation.trim()) {
+            line += '<br><em style="color:#b89a3a">\u21b3 ' + _gelEsc(s.deviation) + '</em>';
+          }
+          return '<li>' + line + '</li>';
+        }).join('') + '</ul>';
+      }
+      var completionHtml =
+        '<p class="wf-block wf-protocol">' +
+          '<strong>\u2713 Completed protocol:</strong> ' + _gelEsc(rs.protocol.title) +
+          ' (' + doneSteps.length + ' / ' + rs.steps.length + ' steps' +
+          (devSteps.length ? ', ' + devSteps.length + ' deviation' + (devSteps.length > 1 ? 's' : '') : '') +
+          ')' +
+        '</p>' + stepHtml;
+      await api('POST', '/api/workflow/document/append', {
+        date: today,
+        html: completionHtml,
+        groups: rs.group_name ? [rs.group_name] : null,
+      });
+    } catch(_appendErr) {
+      /* Non-fatal — notebook entry already saved successfully */
+    }
     toast('Saved to ' + rs.group_name + ' \u2713');
     await _removeRun(rs.runId);
     if (_scratchProtoRun && _scratchProtoRun.runId === rs.runId) _scratchProtoRun = null;
     if (typeof setView === 'function') setView('protocols'); else loadView();
   } catch(e) { toast('Save failed: ' + e.message, true); }
+}
+
+/* Tiny local HTML escaper so we don't depend on workflow.js loading first */
+function _gelEsc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+  });
 }
 
 function spSaveToEntry() { spSaveRunToEntry(null); }
