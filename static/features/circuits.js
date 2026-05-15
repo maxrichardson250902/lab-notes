@@ -1235,4 +1235,4 @@ function _cdRenderPaletteButtons() {
 registerView('circuits', function(container) {
   container.innerHTML = '<div id="circuits-view"></div>';
   _cdRender();
-});
+}, {wide: true});
