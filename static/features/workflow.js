@@ -76,189 +76,331 @@ async function renderWorkflow(el) {
 
   if (data.summary) html += '<div class="day-summary">' + esc(data.summary) + '</div>';
 
-  html += '<div class="timeline" id="workflow-timeline">';
-  if (!entries.length) {
-    html += '<div style="padding:32px 0 32px 82px;color:var(--muted);font-size:14px;font-style:italic">No entries yet — jot notes below, they get processed into formatted notebook entries.</div>';
-  } else {
-    // snapshot active runs from localStorage for cross-referencing
-    var _activeRunsNow = [];
-    try { _activeRunsNow = JSON.parse(localStorage.getItem('lab_proto_runs') || '[]'); } catch(_e) {}
-
-    html += entries.map(function(e) {
-      var isTask  = e.type === 'task_done';
-      var isProto = e.type === 'protocol_run';
-
-      // for protocol_run entries, extract protocol title from content and find active run
-      var protoActions = '';
-      if (isProto) {
-        // content is "Running protocol: <title>" — extract title
-        var protoTitle = e.content.replace(/^Running protocol:\s*/i, '').trim();
-        // find matching active run by protocol title
-        var activeRun = _activeRunsNow.find(function(r) {
-          return r.protocol && r.protocol.title === protoTitle;
-        });
-        if (activeRun) {
-          var done = activeRun.steps.filter(function(s) { return s.done; }).length;
-          var pct  = Math.round((done / activeRun.steps.length) * 100);
-          protoActions = '<div style="margin-top:6px;padding:6px 8px;background:#e8f0e8;border-radius:4px;display:flex;align-items:center;gap:8px">' +
-            '<div style="flex:1">' +
-              '<div style="font-size:11px;font-weight:600;color:#5b7a5e">&#9654; In progress &nbsp;&#183;&nbsp; ' + done + '/' + activeRun.steps.length + ' steps (' + pct + '%)</div>' +
-              '<div style="height:3px;background:#c8d8c8;border-radius:2px;margin-top:3px"><div style="height:100%;width:' + pct + '%;background:#5b7a5e;border-radius:2px"></div></div>' +
-            '</div>' +
-            '<button class="btn primary" style="font-size:11px;padding:3px 10px" onclick="wfResumeRun(\x27' + activeRun.runId + '\x27)">Resume</button>' +
-          '</div>';
-        } else {
-          // run completed or not started yet — link to protocol history
-          protoActions = '<div style="margin-top:6px">' +
-            '<button class="btn" style="font-size:11px;color:#5b7a5e" onclick="wfViewProtocolHistory(\x27' + esc(protoTitle) + '\x27)">&#128196; View protocol history</button>' +
-          '</div>';
-        }
-      }
-
-      return '<div class="timeline-entry" id="we-' + e.id + '">' +
-        '<div class="timeline-time">' + esc(e.time || '') + '</div>' +
-        '<div class="timeline-dot ' + (isTask ? 'task' : isProto ? 'protocol' : 'note') + '"></div>' +
-        '<div class="timeline-body">' +
-          '<div class="timeline-card ' + (isTask ? 'task-card' : isProto ? 'protocol-card-tl' : 'note-card') + '">' +
-            (e.group_name ? '<div class="timeline-card-group">' + esc(e.group_name) + '</div>' : '') +
-            /* HTML entries render through wfRenderRich (server already sanitized); plain through esc(). */
-            '<div class="timeline-card-text" id="wt-' + e.id + '"' + (e.format === 'html' ? ' data-format="html"' : '') + '>' +
-              (e.format === 'html' ? wfRenderRich(e.content) : esc(e.content)) +
-            '</div>' +
-            protoActions +
-            '<div class="timeline-actions">' +
-              '<button class="btn" onclick="editWorkflowEntry(' + e.id + ')">Edit</button>' +
-              '<button class="btn" onclick="tagWorkflowEntry(' + e.id + ')" title="Set project group">Tag</button>' +
-              '<button class="btn" style="color:var(--red)" onclick="deleteWorkflowEntry(' + e.id + ')">&#215;</button>' +
-            '</div>' +
-          '</div>' +
-        '</div>' +
-      '</div>';
-    }).join('');
-  }
-  html += '</div>';
-
-  // ── group input — dropdown if groups exist, text if not ───────────────────
-  var groupControl;
-  if (_wfNotebookGroups.length) {
-    var groupOpts = '<option value="">Project (optional)</option>' +
-      _wfNotebookGroups.map(function(g) { return '<option value="' + esc(g) + '">' + esc(g) + '</option>'; }).join('');
-    groupControl = '<select id="wf-group" ' +
-      'style="background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:4px;outline:none">' +
-      groupOpts + '</select>';
-  } else {
-    groupControl = '<input type="text" id="wf-group" placeholder="Project (optional)" spellcheck="false" ' +
-      'style="width:140px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:4px;outline:none"/>';
-  }
-
-  html += '<div style="margin-top:8px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 14px">' +
-    '<div style="display:flex;gap:8px;margin-bottom:8px">' + groupControl + '</div>' +
-    /* Rich-text input. The contenteditable div is wired by wfEditorAttach() in the setTimeout below. */
-    '<div id="wf-input-wrap">' +
-      '<div id="wf-input" data-placeholder="Jot down what you\x27re doing… (Tab inserts table, paste/drop images)"></div>' +
-      '<div class="wf-tool-row">' +
-        '<button class="wf-tool-btn" onclick="_wfInputApi.cmd(\'bold\')" title="Bold (Ctrl+B)"><strong>B</strong></button>' +
-        '<button class="wf-tool-btn" onclick="_wfInputApi.cmd(\'italic\')" title="Italic (Ctrl+I)"><em>I</em></button>' +
-        '<button class="wf-tool-btn" onclick="_wfInputApi.cmd(\'underline\')" title="Underline"><u>U</u></button>' +
+  /* ── Unified day-document layout ──────────────────────────────────────
+     Left column: the editable document.
+     Right column: group sidebar (tag current block, show legend, project totals).
+     Bottom of left column: the document toolbar.
+  */
+  html += '<div class="wf-doc-layout">' +
+    '<div class="wf-doc-main">' +
+      '<div id="wf-doc" data-placeholder="Start typing your day\u2019s notes \u2014 a timestamp will appear on every new line. Tab inserts a table. Paste / drop / + Image for images. Select a block + use the Groups menu to tag it."></div>' +
+      '<div class="wf-doc-toolbar">' +
+        '<button class="wf-tool-btn" onclick="_wfDocApi.cmd(\'bold\')" title="Bold"><strong>B</strong></button>' +
+        '<button class="wf-tool-btn" onclick="_wfDocApi.cmd(\'italic\')" title="Italic"><em>I</em></button>' +
+        '<button class="wf-tool-btn" onclick="_wfDocApi.cmd(\'underline\')" title="Underline"><u>U</u></button>' +
         '<div class="wf-tool-sep"></div>' +
-        '<button class="wf-tool-btn" onclick="_wfInputApi.cmd(\'insertUnorderedList\')" title="Bulleted list">&bull; List</button>' +
-        '<button class="wf-tool-btn" onclick="_wfInputApi.insertTable()" title="Insert table (or press Tab on empty line)">&#9783; Table</button>' +
-        '<button class="wf-tool-btn" onclick="_wfInputApi.insertImage()" title="Insert image (or paste/drop)">&#128247; Image</button>' +
-        '<button class="wf-tool-btn" onclick="_wfInputApi.insertGel()" title="Insert link to a gel">&#129516; Gel</button>' +
+        '<button class="wf-tool-btn" onclick="_wfDocApi.cmd(\'insertUnorderedList\')">&bull; List</button>' +
+        '<button class="wf-tool-btn" onclick="_wfDocApi.insertTable()" title="Insert 2x2 table (or press Tab)">&#9783; Table</button>' +
+        '<button class="wf-tool-btn" onclick="_wfDocApi.insertImage()">&#128247; Image</button>' +
+        '<button class="wf-tool-btn" onclick="_wfDocApi.insertGel()">&#129516; Gel</button>' +
+        '<div class="wf-tool-sep"></div>' +
+        '<button class="wf-tool-btn" onclick="wfInsertTimeChip()" title="Insert current time (Ctrl+T)">&#128338; Time</button>' +
+        '<div class="wf-tool-sep"></div>' +
+        '<button class="wf-tool-btn wf-tool-btn-primary" onclick="wfOpenTagPicker()" title="Tag the current block (Ctrl+G)">&#127991; Groups\u2026</button>' +
         '<div style="flex:1"></div>' +
-        '<button class="wf-tool-btn" style="background:#5b7a5e;color:#fff;border-color:#5b7a5e" onclick="addWorkflowNote()" title="Add entry (or press Enter)">Add</button>' +
+        '<div id="wf-doc-saved" style="font-size:11px;color:#8a7f72">\u00a0</div>' +
+      '</div>' +
+      '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">' +
+        '<div id="wf-proto-picker-wrap">' +
+          '<button class="btn" style="color:#5b7a5e;font-size:12px" onclick="wfShowProtoPicker()">&#9654; Run a protocol</button>' +
+        '</div>' +
       '</div>' +
     '</div>' +
-    '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">' +
-      '<div id="wf-proto-picker-wrap">' +
-        '<button class="btn" style="color:#5b7a5e;font-size:12px" onclick="wfShowProtoPicker()">&#9654; Run a protocol</button>' +
+    '<div class="wf-doc-side">' +
+      '<div class="wf-doc-side-h">Groups in this day</div>' +
+      '<div id="wf-doc-side-groups" style="min-height:60px"></div>' +
+      '<div class="wf-doc-side-h" style="margin-top:14px">Untagged blocks</div>' +
+      '<div id="wf-doc-side-untagged" style="font-size:12px;color:#8a7f72"></div>' +
+      '<div class="wf-doc-side-help">' +
+        'Click a block then <strong>Groups\u2026</strong> to tag it. ' +
+        'Untagged content is included as context with every group at end-of-day processing.' +
       '</div>' +
-    '</div>' +
-  '</div>';
-
-  /* Scratchpad section — rendered below the protocol picker so it doesn't
-     dominate the page. Auto-loads + saves on blur. */
-  html += '<div style="margin-top:14px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 14px">' +
-    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">' +
-      '<div style="font-variant:small-caps;font-size:12px;letter-spacing:.08em;color:#8a7f72;font-weight:600">Scratchpad \u00b7 ' + _workflowDate + '</div>' +
-      '<div id="wf-scratch-saved" style="font-size:11px;color:#8a7f72">\u00a0</div>' +
-    '</div>' +
-    '<div id="wf-scratch" data-placeholder="Free-form notes for this day. Not sent to LLM. Tab inserts table; paste/drop images."></div>' +
-    '<div class="wf-tool-row">' +
-      '<button class="wf-tool-btn" onclick="_wfScratchApi.cmd(\'bold\')"><strong>B</strong></button>' +
-      '<button class="wf-tool-btn" onclick="_wfScratchApi.cmd(\'italic\')"><em>I</em></button>' +
-      '<button class="wf-tool-btn" onclick="_wfScratchApi.cmd(\'underline\')"><u>U</u></button>' +
-      '<div class="wf-tool-sep"></div>' +
-      '<button class="wf-tool-btn" onclick="_wfScratchApi.cmd(\'insertUnorderedList\')">&bull; List</button>' +
-      '<button class="wf-tool-btn" onclick="_wfScratchApi.insertTable()">&#9783; Table</button>' +
-      '<button class="wf-tool-btn" onclick="_wfScratchApi.insertImage()">&#128247; Image</button>' +
-      '<button class="wf-tool-btn" onclick="_wfScratchApi.insertGel()">&#129516; Gel</button>' +
     '</div>' +
   '</div>';
 
   el.innerHTML = html;
+  _wfInjectDocStyles();
   setTimeout(function() {
-    /* Attach the rich editor to the inline input. Enter = submit; Shift+Enter = newline. */
-    var inputEl = document.getElementById('wf-input');
-    if (inputEl) {
-      window._wfInputApi = wfEditorAttach(inputEl, {
-        placeholder: inputEl.getAttribute('data-placeholder'),
-        minHeight: '32px',
-        onSubmit: function() { addWorkflowNote(); },
-      });
-      window._wfInputApi.focus();
-    }
-    /* Attach the scratchpad editor with auto-save on blur. */
-    var scratchEl = document.getElementById('wf-scratch');
-    if (scratchEl) {
-      window._wfScratchApi = wfEditorAttach(scratchEl, {
-        placeholder: scratchEl.getAttribute('data-placeholder'),
-        minHeight: '120px',
-        onBlur: function(html) { _wfSaveScratch(html); },
-        /* Auto-save while typing — debounced. Keeps work safe without spamming the server. */
-        onChange: _wfScratchDebouncedSave,
-      });
-      /* Load scratch content for this date */
-      _wfLoadScratch();
-    }
+    var docEl = document.getElementById('wf-doc');
+    if (!docEl) return;
+    window._wfDocApi = wfEditorAttach(docEl, {
+      placeholder: docEl.getAttribute('data-placeholder'),
+      minHeight: '280px',
+      onChange: function() {
+        _wfDocDebouncedSave();
+        _wfRefreshSidebar();
+      },
+      onBlur: function(html) { _wfSaveDoc(html); },
+    });
+    docEl.addEventListener('keydown', _wfDocKeydownExtras);
+    docEl.addEventListener('click', _wfRefreshCurrentBlock);
+    docEl.addEventListener('keyup', _wfRefreshCurrentBlock);
+    _wfLoadDoc();
   }, 50);
 }
 
-/* ── Scratchpad load/save ─────────────────────────────────────────────────── */
-
-var _wfScratchSaveTimer = null;
-async function _wfLoadScratch() {
-  try {
-    var data = await api('GET', '/api/workflow/' + _workflowDate + '/scratch');
-    if (window._wfScratchApi) window._wfScratchApi.setHtml(data.content || '');
-  } catch(e) {
-    /* Non-fatal — empty scratchpad on error */
-  }
+/* ── Doc layout CSS (injected once) ───────────────────────────── */
+var _wfDocStylesInjected = false;
+function _wfInjectDocStyles() {
+  if (_wfDocStylesInjected) return;
+  _wfDocStylesInjected = true;
+  var s = document.createElement('style');
+  s.textContent = [
+    '.wf-doc-layout { display:flex; gap:14px; margin-top:8px; align-items:flex-start; }',
+    '.wf-doc-main { flex:1; min-width:0; background:var(--surface,#faf8f4); border:1px solid var(--border,#d5cec0); border-radius:6px; padding:12px 14px; }',
+    '.wf-doc-side { width:240px; background:var(--surface,#faf8f4); border:1px solid var(--border,#d5cec0); border-radius:6px; padding:12px; font-size:12.5px; }',
+    '.wf-doc-side-h { font-variant:small-caps; font-size:11px; letter-spacing:.08em; color:#8a7f72; font-weight:600; margin-bottom:6px; }',
+    '.wf-doc-side-help { margin-top:14px; padding-top:10px; border-top:1px solid #ece7dd; font-size:11px; color:#8a7f72; line-height:1.5; }',
+    '.wf-doc-toolbar { display:flex; gap:4px; align-items:center; flex-wrap:wrap; padding:6px 0 4px 0; margin-top:4px; border-top:1px solid #ece7dd; }',
+    '.wf-tool-btn-primary { background:#5b7a5e !important; color:#fff !important; border-color:#5b7a5e !important; }',
+    '#wf-doc .wf-block, #wf-doc p[data-groups], #wf-doc table[data-groups], #wf-doc ul[data-groups], #wf-doc ol[data-groups] { padding-left:8px; border-left:3px solid transparent; transition:border-color .15s; }',
+    '#wf-doc [data-groups] { border-left-color:#7a9e7e; background:rgba(122,158,126,0.04); }',
+    '#wf-doc .wf-task-done { border-left-color:#b89a3a; background:rgba(184,154,58,0.06); }',
+    '#wf-doc .wf-protocol { border-left-color:#5b7aa0; background:rgba(91,122,160,0.06); }',
+    '#wf-doc .wf-current-block { box-shadow: -3px 0 0 0 #5b7a5e inset; }',
+    '.wf-time { display:inline-block; font-family:"SF Mono",Monaco,Consolas,monospace; font-size:.8em; padding:1px 6px; background:#f0ebe3; border-radius:3px; color:#8a7f72; user-select:none; margin-right:4px; }',
+    '.wf-group-chip { display:inline-block; padding:2px 8px; background:#e8f0e8; color:#3a5a3d; border:1px solid #b5ccb5; border-radius:10px; font-size:11px; margin:2px 3px 2px 0; cursor:pointer; }',
+    '.wf-group-chip.active { background:#5b7a5e; color:#fff; border-color:#5b7a5e; }',
+    '.wf-tag-modal { position:fixed; inset:0; z-index:1100; background:rgba(60,52,42,.35); display:flex; align-items:center; justify-content:center; }',
+    '.wf-tag-modal-inner { background:#faf8f4; border:1px solid #d5cec0; border-radius:8px; width:420px; max-width:92vw; padding:14px 16px; }',
+  ].join('\n');
+  document.head.appendChild(s);
 }
-function _wfScratchDebouncedSave() {
-  if (_wfScratchSaveTimer) clearTimeout(_wfScratchSaveTimer);
-  /* 1.5s after the last keystroke. Gives the user breathing room without
-     racing the server on every character. */
-  _wfScratchSaveTimer = setTimeout(function() {
-    if (window._wfScratchApi) _wfSaveScratch(window._wfScratchApi.getHtml());
+
+/* ── Document load / save ─────────────────────────────────────────────── */
+
+var _wfDocSaveTimer = null;
+var _wfCurrentBlock = null;
+async function _wfLoadDoc() {
+  try {
+    var data = await api('GET', '/api/workflow/' + _workflowDate + '/document');
+    if (window._wfDocApi) {
+      window._wfDocApi.setHtml(data.content || '');
+      _wfRefreshSidebar();
+    }
+  } catch(e) {}
+}
+function _wfDocDebouncedSave() {
+  if (_wfDocSaveTimer) clearTimeout(_wfDocSaveTimer);
+  _wfDocSaveTimer = setTimeout(function() {
+    if (window._wfDocApi) _wfSaveDoc(window._wfDocApi.getHtml());
   }, 1500);
 }
-async function _wfSaveScratch(html) {
-  if (!window._wfScratchApi) return;
-  var saveEl = document.getElementById('wf-scratch-saved');
-  if (saveEl) saveEl.textContent = 'Saving…';
+async function _wfSaveDoc(html) {
+  if (!window._wfDocApi) return;
+  var saveEl = document.getElementById('wf-doc-saved');
+  if (saveEl) saveEl.textContent = 'Saving\u2026';
   try {
-    var resp = await fetch('/api/workflow/' + _workflowDate + '/scratch', {
+    var resp = await fetch('/api/workflow/' + _workflowDate + '/document', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: html }),
     });
     if (!resp.ok) throw new Error(resp.statusText);
-    if (window._wfScratchApi) window._wfScratchApi.markClean();
+    window._wfDocApi.markClean();
     if (saveEl) saveEl.textContent = 'Saved \u00b7 ' + new Date().toLocaleTimeString();
   } catch(e) {
     if (saveEl) saveEl.textContent = 'Save failed';
   }
+}
+
+/* Time chip — inserts current HH:MM as a non-editable chip */
+function wfInsertTimeChip() {
+  if (!window._wfDocApi) return;
+  var now = new Date();
+  var hh = String(now.getHours()).padStart(2, '0');
+  var mm = String(now.getMinutes()).padStart(2, '0');
+  var chip = '<span class="wf-time" contenteditable="false">' + hh + ':' + mm + '</span>&nbsp;';
+  document.execCommand('insertHTML', false, chip);
+}
+
+/* Doc-specific keydown: Ctrl+T (time), Ctrl+G (tag picker), Enter auto-time-chip */
+function _wfDocKeydownExtras(e) {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 't' || e.key === 'T')) {
+    e.preventDefault(); wfInsertTimeChip(); return;
+  }
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'g' || e.key === 'G')) {
+    e.preventDefault(); wfOpenTagPicker(); return;
+  }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    var sel = window.getSelection();
+    if (!sel.anchorNode) return;
+    var inLi = sel.anchorNode.parentNode && sel.anchorNode.parentNode.closest && sel.anchorNode.parentNode.closest('li, td, th');
+    if (inLi) return;
+    setTimeout(function() {
+      var s = window.getSelection();
+      if (!s.anchorNode) return;
+      var block = s.anchorNode.parentNode;
+      while (block && block.id !== 'wf-doc' && !(block.matches && block.matches('p, div, h3, h4, blockquote'))) {
+        block = block.parentNode;
+      }
+      if (!block || block.id === 'wf-doc') return;
+      if (block.querySelector && block.querySelector('.wf-time')) return;
+      var now = new Date();
+      var hh = String(now.getHours()).padStart(2, '0');
+      var mm = String(now.getMinutes()).padStart(2, '0');
+      var chip = document.createElement('span');
+      chip.className = 'wf-time';
+      chip.contentEditable = 'false';
+      chip.textContent = hh + ':' + mm;
+      block.insertBefore(chip, block.firstChild);
+      block.insertBefore(document.createTextNode(' '), chip.nextSibling);
+      if (window._wfDocApi) _wfDocDebouncedSave();
+    }, 0);
+  }
+}
+
+/* Track current top-level block under caret */
+function _wfRefreshCurrentBlock() {
+  var sel = window.getSelection();
+  if (!sel.anchorNode) { _wfCurrentBlock = null; return; }
+  var docRoot = document.getElementById('wf-doc');
+  if (!docRoot) return;
+  var node = sel.anchorNode;
+  while (node && node !== docRoot) {
+    if (node.nodeType === 1 && /^(P|DIV|UL|OL|TABLE|PRE|BLOCKQUOTE|H3|H4)$/.test(node.tagName)) {
+      while (node.parentNode && node.parentNode !== docRoot) node = node.parentNode;
+      _wfCurrentBlock = node;
+      Array.prototype.forEach.call(docRoot.querySelectorAll('.wf-current-block'), function(el) {
+        el.classList.remove('wf-current-block');
+      });
+      node.classList.add('wf-current-block');
+      return;
+    }
+    node = node.parentNode;
+  }
+  _wfCurrentBlock = null;
+}
+
+/* Sidebar refresh */
+function _wfRefreshSidebar() {
+  var docRoot = document.getElementById('wf-doc');
+  if (!docRoot) return;
+  var blocks = Array.prototype.filter.call(docRoot.children, function(c) {
+    return /^(P|DIV|UL|OL|TABLE|PRE|BLOCKQUOTE|H3|H4)$/.test(c.tagName);
+  });
+  var counts = {};
+  var untagged = 0;
+  blocks.forEach(function(b) {
+    var gs = (b.getAttribute('data-groups') || '').split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+    if (!gs.length) { untagged++; return; }
+    gs.forEach(function(g) { counts[g] = (counts[g] || 0) + 1; });
+  });
+  var listEl = document.getElementById('wf-doc-side-groups');
+  if (listEl) {
+    var names = Object.keys(counts).sort();
+    if (!names.length) {
+      listEl.innerHTML = '<div style="color:#8a7f72;font-size:11px;font-style:italic">No tagged blocks yet</div>';
+    } else {
+      listEl.innerHTML = names.map(function(g) {
+        return '<div style="display:flex;justify-content:space-between;padding:3px 0">' +
+               '<span class="wf-group-chip active">' + esc(g) + '</span>' +
+               '<span style="color:#8a7f72;font-size:11px">' + counts[g] + ' block' + (counts[g] > 1 ? 's' : '') + '</span>' +
+               '</div>';
+      }).join('');
+    }
+  }
+  var untaggedEl = document.getElementById('wf-doc-side-untagged');
+  if (untaggedEl) {
+    untaggedEl.textContent = untagged === 0
+      ? 'None \u2014 everything tagged.'
+      : untagged + ' untagged block' + (untagged > 1 ? 's' : '') + ' (will be context for all groups).';
+  }
+}
+
+/* Tag picker modal */
+async function wfOpenTagPicker() {
+  if (!_wfCurrentBlock) {
+    toast('Click on a block first', true);
+    return;
+  }
+  var candidates = {};
+  _wfNotebookGroups.forEach(function(g) { candidates[g] = true; });
+  var docRoot = document.getElementById('wf-doc');
+  if (docRoot) {
+    Array.prototype.forEach.call(docRoot.querySelectorAll('[data-groups]'), function(el) {
+      (el.getAttribute('data-groups') || '').split(',').forEach(function(g) {
+        g = g.trim(); if (g) candidates[g] = true;
+      });
+    });
+  }
+  var current = (_wfCurrentBlock.getAttribute('data-groups') || '').split(',')
+    .map(function(s) { return s.trim(); }).filter(Boolean);
+  var currentSet = {}; current.forEach(function(g) { currentSet[g] = true; });
+
+  var existing = document.getElementById('wf-tag-modal');
+  if (existing) existing.remove();
+  var modal = document.createElement('div');
+  modal.id = 'wf-tag-modal';
+  modal.className = 'wf-tag-modal';
+  modal.onclick = function(e) { if (e.target === modal) wfCloseTagPicker(); };
+  var groupNames = Object.keys(candidates).sort();
+  var chipsHtml = groupNames.length
+    ? groupNames.map(function(g) {
+        var cls = 'wf-group-chip' + (currentSet[g] ? ' active' : '');
+        return '<span class="' + cls + '" onclick="wfToggleTag(this, \'' + esc(g).replace(/'/g, '&#39;') + '\')">' + esc(g) + '</span>';
+      }).join('')
+    : '<div style="color:#8a7f72;font-size:12px">No groups yet \u2014 type one below.</div>';
+  modal.innerHTML =
+    '<div class="wf-tag-modal-inner">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">' +
+        '<div style="font-weight:600">Tag this block</div>' +
+        '<span style="cursor:pointer;color:#8a7f72;font-size:1.2rem" onclick="wfCloseTagPicker()">&times;</span>' +
+      '</div>' +
+      '<div style="font-size:11.5px;color:#8a7f72;margin-bottom:8px">Click to toggle. Multiple allowed.</div>' +
+      '<div id="wf-tag-chips" style="min-height:40px;padding:6px;background:#fff;border:1px solid #e0d9cd;border-radius:4px;margin-bottom:10px">' + chipsHtml + '</div>' +
+      '<div style="display:flex;gap:6px;margin-bottom:10px">' +
+        '<input id="wf-tag-new" type="text" placeholder="New group name\u2026" style="flex:1;padding:5px 8px;border:1px solid #d5cec0;border-radius:4px;font-family:inherit" ' +
+          'onkeydown="if(event.key===\'Enter\'){event.preventDefault();wfAddNewTag();}">' +
+        '<button class="wf-tool-btn" onclick="wfAddNewTag()">+ Add</button>' +
+      '</div>' +
+      '<div style="display:flex;justify-content:flex-end;gap:6px">' +
+        '<button class="wf-tool-btn" onclick="wfCloseTagPicker()">Cancel</button>' +
+        '<button class="wf-tool-btn wf-tool-btn-primary" onclick="wfApplyTags()">Apply</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+  setTimeout(function() { var inp = document.getElementById('wf-tag-new'); if (inp) inp.focus(); }, 50);
+}
+
+function wfCloseTagPicker() { var m = document.getElementById('wf-tag-modal'); if (m) m.remove(); }
+function wfToggleTag(chipEl, name) {
+  if (chipEl.classList.contains('active')) chipEl.classList.remove('active');
+  else chipEl.classList.add('active');
+}
+function wfAddNewTag() {
+  var inp = document.getElementById('wf-tag-new');
+  if (!inp || !inp.value.trim()) return;
+  var name = inp.value.trim();
+  var existing = document.querySelectorAll('#wf-tag-chips .wf-group-chip');
+  for (var i = 0; i < existing.length; i++) {
+    if (existing[i].textContent.replace(/×/g, '').trim() === name) {
+      existing[i].classList.add('active'); inp.value = ''; return;
+    }
+  }
+  var holder = document.getElementById('wf-tag-chips');
+  if (holder) {
+    var chip = document.createElement('span');
+    chip.className = 'wf-group-chip active';
+    chip.textContent = name;
+    chip.onclick = function() { wfToggleTag(chip, name); };
+    holder.appendChild(chip);
+  }
+  inp.value = '';
+}
+function wfApplyTags() {
+  if (!_wfCurrentBlock) { wfCloseTagPicker(); return; }
+  var active = document.querySelectorAll('#wf-tag-chips .wf-group-chip.active');
+  var names = [];
+  Array.prototype.forEach.call(active, function(c) { names.push(c.textContent.replace(/×/g, '').trim()); });
+  if (names.length) {
+    _wfCurrentBlock.setAttribute('data-groups', names.join(','));
+  } else {
+    _wfCurrentBlock.removeAttribute('data-groups');
+  }
+  wfCloseTagPicker();
+  _wfDocDebouncedSave();
+  _wfRefreshSidebar();
 }
 
 // ── protocol picker ───────────────────────────────────────────────────────────
@@ -341,11 +483,21 @@ function wfLaunchProtoRun() {
   var p = (S.protocols || []).find(function(x) { return x.id === parseInt(sel.value); });
   if (!p) return;
 
-  // log in timeline
-  api('POST', '/api/workflow', {
-    content:    'Running protocol: ' + p.title,
-    type:       'protocol_run',
-    group_name: group
+  /* Append a protocol-start block to today's document, tagged with the chosen group.
+     Refresh the editor afterwards so the user sees the new line. */
+  var now = new Date();
+  var hh = String(now.getHours()).padStart(2, '0');
+  var mm = String(now.getMinutes()).padStart(2, '0');
+  var html = '<p class="wf-block wf-protocol">' +
+             '<span class="wf-time" contenteditable="false">' + hh + ':' + mm + '</span> ' +
+             '<strong>\u25b6 Started protocol:</strong> ' + esc(p.title) +
+             '</p>';
+  api('POST', '/api/workflow/document/append', {
+    html: html,
+    groups: [group],
+  }).then(function() {
+    /* Reload doc so the new block appears in the editor */
+    if (typeof _wfLoadDoc === 'function') _wfLoadDoc();
   });
 
   if (typeof spLaunchRunDirect === 'function') {
