@@ -1256,4 +1256,4 @@ async function renderGelAnnotation(el) {
   gelRenderFull();
 }
 
-registerView('gel_annotation', renderGelAnnotation);
+registerView('gel_annotation', renderGelAnnotation, {wide:true});
