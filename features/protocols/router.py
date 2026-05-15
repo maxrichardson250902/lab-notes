@@ -11,7 +11,7 @@ _llm_semaphore = asyncio.Semaphore(1)
 # Track protocols currently being extracted in background
 _extracting: dict[int, str] = {}   # pid -> stage description
 
-from core.database import register_table, get_db
+from core.database import register_table, register_seed, ensure_column, get_db
 from core.llm import fetch_url_text
 from core.ssh import ensure_pc_online, start_llm, call_llm_3090, enrich_log, elog, detected_os, active_backend
 
@@ -40,6 +40,11 @@ register_table("active_runs", """CREATE TABLE IF NOT EXISTS active_runs (
     scale_factor REAL NOT NULL DEFAULT 1.0,
     started_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL)""")
+
+# Idempotent column-add for the "Are you still running this?" daily check-in.
+# Stores ISO-8601 timestamp until which we should NOT prompt; null/empty = ask.
+register_seed(lambda conn: ensure_column(conn, "active_runs",
+                                         "snoozed_until", "TEXT DEFAULT NULL"))
 
 register_table("protocol_runs", """CREATE TABLE IF NOT EXISTS protocol_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -514,6 +519,148 @@ def delete_active_run(run_id: str):
         conn.execute("DELETE FROM active_runs WHERE run_id=?", (run_id,))
         conn.commit()
     return {"deleted": run_id}
+
+
+# ── Daily check-in support ──────────────────────────────────────────────────
+# Runs started on previous calendar days trigger a blocking popup on app load.
+# The user can mark them done, snooze (don't ask again for 24h), or cancel.
+
+@router.get("/active-runs/stale")
+def list_stale_runs():
+    """Return runs that should trigger the 'are you still running this?' prompt.
+    Criteria: started before today (local date — but we compare ISO strings, see note)
+    AND (snoozed_until IS NULL OR snoozed_until < now).
+
+    Note on date comparison: started_at is stored as UTC ISO. We compare its
+    date prefix to today's UTC date. If you're in a timezone where 'today' differs
+    by hour, edge cases near midnight may misfire — acceptable trade-off for keeping
+    this lightweight and avoiding a tz library."""
+    now = datetime.utcnow()
+    today = now.strftime("%Y-%m-%d")
+    now_iso = now.isoformat()
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM active_runs "
+            "WHERE substr(started_at, 1, 10) < ? "
+            "  AND (snoozed_until IS NULL OR snoozed_until = '' OR snoozed_until < ?) "
+            "ORDER BY started_at ASC",
+            (today, now_iso)
+        ).fetchall()
+    return {"runs": [dict(r) for r in rows]}
+
+
+class SnoozeRequest(BaseModel):
+    hours: Optional[int] = 24
+
+
+@router.post("/active-runs/{run_id}/snooze")
+def snooze_active_run(run_id: str, body: SnoozeRequest):
+    """Suppress the daily prompt for this run for `hours` hours.
+    Used when the user clicks 'Still running' — long-running things like
+    overnight cultures should be able to defer the question."""
+    hours = max(1, min(body.hours or 24, 24 * 14))  # clamp to 1h..14d for sanity
+    until = (datetime.utcnow() + timedelta(hours=hours)).isoformat()
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        row = conn.execute("SELECT 1 FROM active_runs WHERE run_id=?", (run_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Active run not found")
+        conn.execute(
+            "UPDATE active_runs SET snoozed_until=?, updated_at=? WHERE run_id=?",
+            (until, now, run_id)
+        )
+        conn.commit()
+    return {"run_id": run_id, "snoozed_until": until}
+
+
+class CancelRunRequest(BaseModel):
+    reason: Optional[str] = ""
+    date:   Optional[str] = None   # YYYY-MM-DD; defaults to today
+
+
+@router.post("/active-runs/{run_id}/cancel")
+def cancel_active_run(run_id: str, body: CancelRunRequest):
+    """Cancel a run: save a notebook entry marked CANCELLED, delete the active
+    run record. Notebook entry preserves the partial step progress + recipe so
+    you can see what was done before cancellation."""
+    now = datetime.utcnow().isoformat()
+    date = body.date or datetime.utcnow().strftime("%Y-%m-%d")
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM active_runs WHERE run_id=?", (run_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Active run not found")
+        r = dict(row)
+
+    # Reconstruct steps + recipe for the notebook entry
+    try:
+        protocol = json.loads(r.get("protocol_json") or "{}")
+    except Exception:
+        protocol = {}
+    try:
+        steps = json.loads(r.get("steps_json") or "[]")
+    except Exception:
+        steps = []
+    done_steps = [s for s in steps if s.get("done")]
+    devs = [s.get("deviation", "") for s in steps if s.get("deviation")]
+
+    # Build notes body. "[CANCELLED]" prefix makes it grep-friendly in the
+    # notebook so you can find these later.
+    title = protocol.get("title") or f"Protocol #{r.get('protocol_id')}"
+    lines = [
+        f"[CANCELLED] Protocol: {title}",
+        f"Started: {(r.get('started_at') or '')[:16].replace('T', ' ')}",
+        f"Cancelled: {now[:16].replace('T', ' ')}",
+        f"Progress: {len(done_steps)} / {len(steps)} steps completed before cancellation",
+    ]
+    if body.reason:
+        lines.append(f"Reason: {body.reason}")
+    if done_steps:
+        lines.append("\nSteps completed before cancellation:")
+        for s in done_steps:
+            lines.append(f"- {s.get('text', '')}")
+            if s.get("deviation"):
+                lines.append(f"  ↳ deviation: {s['deviation']}")
+    notes_body = "\n".join(lines)
+
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO entries (title,group_name,subgroup,date,notes,results,yields,issues,created,updated) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                f"[CANCELLED] {title}",
+                r.get("group_name") or "",
+                r.get("subgroup") or "",
+                date,
+                notes_body,
+                "",
+                "",
+                f"Run cancelled. Reason: {body.reason or '(none given)'}",
+                now, now,
+            ),
+        )
+        entry_id = cur.lastrowid
+        # Also save a protocol_runs row marked cancelled — keeps the protocol
+        # history honest (you can see what happened).
+        conn.execute(
+            "INSERT INTO protocol_runs (protocol_id,date,group_name,steps_done,steps_total,"
+            "deviations,steps_json,recipe_json,entry_id,created) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                r.get("protocol_id"),
+                date,
+                r.get("group_name") or "",
+                len(done_steps),
+                len(steps),
+                "\n".join(devs) + (f"\n[CANCELLED: {body.reason or '(no reason given)'}]"),
+                r.get("steps_json") or "[]",
+                r.get("recipe_json"),
+                entry_id,
+                now,
+            ),
+        )
+        conn.execute("DELETE FROM active_runs WHERE run_id=?", (run_id,))
+        conn.commit()
+    return {"cancelled": run_id, "entry_id": entry_id}
 
 @router.post("/protocols")
 async def create_from_url(body: CreateProtocol):
