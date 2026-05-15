@@ -182,8 +182,10 @@ function _wfInjectDocStyles() {
     '.wf-run-recipe th { background:#f0ebe3; padding:3px 6px; text-align:left; font-weight:600; color:#8a7f72; border-bottom:1px solid #e0d9cd; position:sticky; top:0; }',
     '.wf-run-recipe td { padding:3px 6px; border-bottom:1px solid #f0ebe3; color:#4a4139; white-space:nowrap; }',
     '.wf-run-recipe tr:last-child td { border-bottom:none; }',
-    '.wf-run-resume { margin-top:6px; width:100%; background:#5b7a5e; color:#fff; border:none; padding:5px; border-radius:3px; cursor:pointer; font-size:11px; }',
+    '.wf-run-resume { background:#5b7a5e; color:#fff; border:none; padding:5px; border-radius:3px; cursor:pointer; font-size:11px; }',
     '.wf-run-resume:hover { background:#4a6b4d; }',
+    '.wf-run-finish { background:#faf8f4; color:#5b7a5e; border:1px solid #5b7a5e; padding:5px; border-radius:3px; cursor:pointer; font-size:11px; }',
+    '.wf-run-finish:hover { background:#e8f0e8; }',
     '.wf-doc-toolbar { display:flex; gap:4px; align-items:center; flex-wrap:wrap; padding:6px 0 4px 0; margin-top:4px; border-top:1px solid #ece7dd; }',
     '.wf-tool-btn-primary { background:#5b7a5e !important; color:#fff !important; border-color:#5b7a5e !important; }',
     '#wf-doc .wf-block, #wf-doc p[data-groups], #wf-doc table[data-groups], #wf-doc ul[data-groups], #wf-doc ol[data-groups] { padding-left:8px; border-left:3px solid transparent; transition:border-color .15s; }',
@@ -403,10 +405,29 @@ function _wfRenderRunCard(run) {
     html += '</tbody></table></div>';
   }
 
-  html += '<button class="wf-run-resume" onclick="wfResumeRun(\'' + esc(run.runId).replace(/\'/g, '&#39;') + '\')">Resume</button>';
+  /* Two-button row: Resume keeps the run going; Finish jumps to scratch view
+     and highlights the save-to-entry button for one-tap completion. */
+  var rid = esc(run.runId).replace(/\'/g, '&#39;');
+  html += '<div style="display:flex;gap:4px;margin-top:6px">';
+  html += '<button class="wf-run-resume" onclick="wfResumeRun(\'' + rid + '\')" style="flex:1">Resume</button>';
+  html += '<button class="wf-run-finish" onclick="wfFinishRun(\'' + rid + '\')" title="Mark protocol finished" style="flex:1">\u2713 Finish</button>';
+  html += '</div>';
   html += '</div>';
   return html;
 }
+
+function wfFinishRun(runId) {
+  /* Hand off to scratch.js. spResumeAndFinish loads the run state, switches
+     to the scratch view, and highlights the Save-to-Entry button. */
+  if (typeof spResumeAndFinish === 'function') {
+    spResumeAndFinish(runId);
+  } else if (typeof setView === 'function') {
+    /* Fallback: just resume into scratch view */
+    if (typeof spResumeRunById === 'function') spResumeRunById(runId);
+    else { setView('scratch'); }
+  }
+}
+window.wfFinishRun = wfFinishRun;
 
 /* Tag picker modal */
 async function wfOpenTagPicker() {
