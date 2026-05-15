@@ -47,7 +47,11 @@ header{display:flex;align-items:center;gap:10px;padding:16px 24px;border-bottom:
 .btn.primary:hover{background:var(--accent2)}
 
 /* Content */
-.content{flex:1;padding:24px;overflow-y:auto;max-width:1100px}
+.content{flex:1;padding:24px;overflow-y:auto;max-width:1100px;width:100%;margin:0 auto;box-sizing:border-box}
+/* Wide views: data-dense / tool-like UIs (workflow doc, cloning, gel, sanger,
+   importer, timeline, pipeline). Soft cap so it doesn't stretch absurdly wide
+   on huge displays. Per-view registration in core.js via registerView(name, fn, {wide:true}). */
+.content.wide{max-width:1800px;padding:18px 24px}
 
 /* Stats row */
 .stats-row{display:flex;gap:12px;margin-bottom:24px}
