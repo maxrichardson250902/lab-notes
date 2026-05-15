@@ -44,6 +44,9 @@ class ExportPartInput(BaseModel):
 class ExportGBRequest(BaseModel):
     name: str
     parts: List[ExportPartInput]
+    # 'circular' | 'linear'. The frontend chooses based on target (auto-defaults
+    # to circular when target is plasmid) or via the user toggle in the save modal.
+    topology: Optional[str] = "linear"
 
 class SavePartInput(BaseModel):
     name: str
@@ -53,10 +56,17 @@ class SavePartInput(BaseModel):
     direction: Optional[int] = 1
 
 class SaveToDBRequest(BaseModel):
-    target: str  # parts, kit_parts, plasmids, primers
+    target: str  # parts, kit_parts, plasmids, primers, gblocks
     circuit_name: str
     extra: Optional[dict] = {}
     parts: List[SavePartInput]
+    # If true, write a .gb file alongside the DB row and set gb_file on the row.
+    # Defaults true because losing annotations on save is the bug we're fixing.
+    write_gb: Optional[bool] = True
+    # 'circular' | 'linear'. Used when write_gb=True. Defaults to circular for
+    # plasmids, linear otherwise — but the frontend should pass an explicit value
+    # based on the save-modal toggle.
+    topology: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # GenBank parser (uses BioPython)
@@ -161,7 +171,10 @@ GB_DIR = "/data/gb_files"
 # ---------------------------------------------------------------------------
 @router.get("/circuits/sequences")
 def list_sequences():
-    """Return all plasmids, primers, kit_parts that have .gb files."""
+    """Return all DNA inventory items that have .gb files on disk.
+    Five types are surfaced: plasmid, primer, kitpart, gblock, part.
+    Items without a corresponding .gb file are filtered out — circuits operates
+    on parsed GenBank annotations, so an entry without a file is unusable here."""
     with get_db() as conn:
         plasmids = conn.execute(
             "SELECT id, name, use, box_location, glycerol_location, gb_file, created "
@@ -179,25 +192,43 @@ def list_sequences():
             ).fetchall()
         except Exception:
             kit_parts = []
+        try:
+            gblocks = conn.execute(
+                "SELECT id, name, sequence, length, use, gb_file, project, created "
+                "FROM gblocks WHERE gb_file IS NOT NULL AND gb_file != '' ORDER BY name"
+            ).fetchall()
+        except Exception:
+            gblocks = []
+        try:
+            parts = conn.execute(
+                "SELECT id, name, sequence, length, project, subcategory, part_type, gb_file, created "
+                "FROM parts WHERE gb_file IS NOT NULL AND gb_file != '' ORDER BY name"
+            ).fetchall()
+        except Exception:
+            parts = []
 
     items = []
-    for p in plasmids:
-        d = dict(p)
-        d["type"] = "plasmid"
-        d["has_file"] = os.path.isfile(os.path.join(GB_DIR, f"plasmid_{d['id']}.gb"))
-        items.append(d)
-    for p in primers:
-        d = dict(p)
-        d["type"] = "primer"
-        d["has_file"] = os.path.isfile(os.path.join(GB_DIR, f"primer_{d['id']}.gb"))
-        items.append(d)
-    for p in kit_parts:
-        d = dict(p)
-        d["type"] = "kitpart"
-        d["has_file"] = os.path.isfile(os.path.join(GB_DIR, f"kitpart_{d['id']}.gb"))
-        items.append(d)
+    # Each type maps to a (table_rows, type_string, file_prefix) triple.
+    # The file_prefix matches the on-disk naming convention used by import_data.
+    for rows, tname, prefix in (
+        (plasmids,  "plasmid",  "plasmid"),
+        (primers,   "primer",   "primer"),
+        (kit_parts, "kitpart",  "kitpart"),
+        (gblocks,   "gblock",   "gblock"),
+        (parts,     "part",     "part"),
+    ):
+        for p in rows:
+            d = dict(p)
+            d["type"] = tname
+            d["has_file"] = os.path.isfile(os.path.join(GB_DIR, f"{prefix}_{d['id']}.gb"))
+            items.append(d)
 
     return {"items": items}
+
+
+# Allowed type strings for the parse / reindex endpoints. Kept in sync with
+# the list_sequences output so any type returned by it can be re-fetched.
+_VALID_SEQ_TYPES = ("primer", "plasmid", "kitpart", "gblock", "part")
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +236,8 @@ def list_sequences():
 # ---------------------------------------------------------------------------
 @router.get("/circuits/sequences/{seq_type}/{seq_id}/parse")
 def parse_sequence(seq_type: str, seq_id: int):
-    if seq_type not in ("primer", "plasmid", "kitpart"):
-        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', or 'kitpart'")
+    if seq_type not in _VALID_SEQ_TYPES:
+        raise HTTPException(400, f"seq_type must be one of: {', '.join(_VALID_SEQ_TYPES)}")
     fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
     return parse_genbank(fpath)
 
@@ -217,8 +248,8 @@ def parse_sequence(seq_type: str, seq_id: int):
 @router.post("/circuits/reindex")
 def reindex_sequence(body: ReindexRequest):
     """Rotate a circular sequence so new_origin becomes position 0."""
-    if body.seq_type not in ("primer", "plasmid", "kitpart"):
-        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', or 'kitpart'")
+    if body.seq_type not in _VALID_SEQ_TYPES:
+        raise HTTPException(400, f"seq_type must be one of: {', '.join(_VALID_SEQ_TYPES)}")
     fpath = os.path.join(GB_DIR, f"{body.seq_type}_{body.seq_id}.gb")
     if not os.path.isfile(fpath):
         raise HTTPException(404, "GenBank file not found")
@@ -363,52 +394,60 @@ def delete_design(did: int):
 # ---------------------------------------------------------------------------
 # Export GenBank
 # ---------------------------------------------------------------------------
-@router.post("/circuits/export-gb")
-def export_gb(body: ExportGBRequest):
-    """Concatenate part sequences and export as a GenBank string."""
+# Helper: build a GenBank string from a list of parts
+# ---------------------------------------------------------------------------
+def _build_genbank(parts: list, name: str, topology: str = "linear") -> tuple[str, int]:
+    """Concatenate `parts` (each having .name, .seq/.sequence, .direction, .type,
+    .color optional) into one GenBank record. Returns (gb_string, length)."""
     from Bio.Seq import Seq
     from Bio.SeqRecord import SeqRecord
     from Bio.SeqFeature import SeqFeature, FeatureLocation
     from Bio import SeqIO as _SeqIO
     from io import StringIO
 
-    parts_with_seq = [p for p in body.parts if p.seq]
-    if not parts_with_seq:
-        raise HTTPException(400, "No parts have sequences")
+    if topology not in ("linear", "circular"):
+        topology = "linear"
 
     full_seq = ""
     features = []
 
-    for p in parts_with_seq:
+    for p in parts:
+        # Tolerate both ExportPartInput (.seq) and SavePartInput (.sequence) shapes
+        raw = getattr(p, "seq", None) or getattr(p, "sequence", "") or ""
+        seq_clean = raw.upper().replace(" ", "").replace("\n", "")
+        if not seq_clean:
+            continue
         start = len(full_seq)
-        full_seq += p.seq.upper().replace(" ", "").replace("\n", "")
+        full_seq += seq_clean
         end = len(full_seq)
-
-        strand = 1 if p.direction == 1 else -1
-        gb_type = PART_TO_GB_TYPE.get(p.type, "misc_feature")
+        direction = getattr(p, "direction", 1) or 1
+        strand = 1 if direction == 1 else -1
+        part_type = getattr(p, "type", None) or getattr(p, "part_type", None) or "misc"
+        gb_type = PART_TO_GB_TYPE.get(part_type, "misc_feature")
+        color = getattr(p, "color", None) or "#95A5A6"
 
         feat = SeqFeature(
             FeatureLocation(start, end, strand=strand),
             type=gb_type,
             qualifiers={
                 "label": [p.name],
-                "ApEinfo_fwdcolor": [p.color or "#95A5A6"],
-                "ApEinfo_revcolor": [p.color or "#95A5A6"],
+                "ApEinfo_fwdcolor": [color],
+                "ApEinfo_revcolor": [color],
             },
         )
         features.append(feat)
 
-    # Build record
-    safe_name = body.name.replace(" ", "_")[:16]
+    if not full_seq:
+        raise HTTPException(400, "No parts have sequences")
+
+    safe_name = name.replace(" ", "_")[:16]
     rec = SeqRecord(
         Seq(full_seq),
         id=safe_name,
         name=safe_name,
-        description=body.name,
-        annotations={"molecule_type": "DNA", "topology": "linear"},
+        description=name,
+        annotations={"molecule_type": "DNA", "topology": topology},
     )
-
-    # Add source feature
     source = SeqFeature(
         FeatureLocation(0, len(full_seq)),
         type="source",
@@ -418,51 +457,127 @@ def export_gb(body: ExportGBRequest):
 
     output = StringIO()
     _SeqIO.write(rec, output, "genbank")
+    return output.getvalue(), len(full_seq)
 
+
+# ---------------------------------------------------------------------------
+# Export circuit as a GenBank string (download from frontend)
+# ---------------------------------------------------------------------------
+@router.post("/circuits/export-gb")
+def export_gb(body: ExportGBRequest):
+    """Concatenate part sequences and export as a GenBank string."""
+    parts_with_seq = [p for p in body.parts if p.seq]
+    if not parts_with_seq:
+        raise HTTPException(400, "No parts have sequences")
+    gb_content, length = _build_genbank(parts_with_seq, body.name,
+                                        topology=body.topology or "linear")
     return {
-        "gb_content": output.getvalue(),
-        "length": len(full_seq),
+        "gb_content": gb_content,
+        "length": length,
         "num_parts": len(parts_with_seq),
     }
 
 
 # ---------------------------------------------------------------------------
-# Save circuit parts to any DB table
+# Save circuit parts to any DB table (with annotations preserved as .gb files)
 # ---------------------------------------------------------------------------
-VALID_TARGETS = ("parts", "kit_parts", "plasmids", "primers")
+VALID_TARGETS = ("parts", "kit_parts", "plasmids", "primers", "gblocks")
+
+# Map target → on-disk .gb filename prefix (matches import_data's convention).
+_TARGET_TO_PREFIX = {
+    "parts":     "part",
+    "kit_parts": "kitpart",
+    "plasmids":  "plasmid",
+    "primers":   "primer",
+    "gblocks":   "gblock",
+}
+# Map target → the cloning view's type string (singular). Frontend can use
+# this to build a "View in cloning" link via the existing cross-view nav.
+_TARGET_TO_CLONING_TYPE = {
+    "parts":     "part",
+    "kit_parts": "kitpart",
+    "plasmids":  "plasmid",
+    "primers":   "primer",
+    "gblocks":   "gblock",
+}
+
+
+def _write_circuit_gb(target: str, row_id: int, parts: list, name: str,
+                      topology: str) -> str:
+    """Build a .gb for the given parts and persist it at /data/gb_files/<prefix>_<id>.gb.
+    Returns the filename used (for the gb_file column)."""
+    gb_content, _length = _build_genbank(parts, name, topology=topology)
+    prefix = _TARGET_TO_PREFIX[target]
+    fname = f"{prefix}_{row_id}.gb"
+    fpath = os.path.join(GB_DIR, fname)
+    os.makedirs(GB_DIR, exist_ok=True)
+    with open(fpath, "w") as f:
+        f.write(gb_content)
+    return fname
+
 
 @router.post("/circuits/save-to-db")
 def save_to_db(body: SaveToDBRequest):
-    """Save one or more circuit parts to the chosen DB table."""
+    """Save circuit parts to the chosen DB table, writing a .gb per row so the
+    annotations are preserved and the new entry is browsable in cloning view.
+
+    Combining rules:
+      - target='plasmids' with multiple parts → ONE row containing the whole
+        concatenated circuit (because "one plasmid per part" makes no sense).
+      - any other target → one row per part.
+    Frontend's "save single" mode just sends one part either way."""
     if body.target not in VALID_TARGETS:
         raise HTTPException(400, f"Invalid target: {body.target}. Must be one of {VALID_TARGETS}")
 
+    # Decide topology: explicit > default-circular-for-plasmids > linear
+    topology = body.topology
+    if topology not in ("linear", "circular"):
+        topology = "circular" if body.target == "plasmids" else "linear"
+
     now = datetime.utcnow().isoformat()
     extra = body.extra or {}
-    saved = []
 
+    # Filter out parts with no sequence — they're not savable
+    usable_parts = [p for p in body.parts if (p.sequence or "").strip()]
+    if not usable_parts:
+        raise HTTPException(400, "No parts have sequences")
+
+    # Decide save strategy
+    combine_all = (body.target == "plasmids" and len(usable_parts) > 1)
+    save_groups = [usable_parts] if combine_all else [[p] for p in usable_parts]
+
+    saved = []
     with get_db() as conn:
-        for p in body.parts:
-            seq = p.sequence.upper().replace(" ", "").replace("\n", "")
-            if not seq:
+        for group in save_groups:
+            # Build the row name. Combined: use the circuit name. Single-part: use the part name.
+            row_name = body.circuit_name if combine_all else group[0].name
+            # Concatenate sequences for the row
+            full_seq = "".join((p.sequence or "").upper().replace(" ", "").replace("\n", "")
+                               for p in group)
+            if not full_seq:
                 continue
 
-            direction_label = "forward" if p.direction == 1 else "reverse"
-            source_desc = f"From {p.source}" if p.source else f"Circuit: {body.circuit_name}"
+            # Insert the row first (we need the id to name the .gb file)
+            direction_label = "forward" if group[0].direction == 1 else "reverse"
+            source_desc = (
+                f"Circuit: {body.circuit_name} ({len(group)} parts)" if combine_all else
+                (f"From {group[0].source}" if group[0].source else f"Circuit: {body.circuit_name}")
+            )
+            part_type = group[0].part_type if not combine_all else "circuit"
 
             if body.target == "parts":
                 cur = conn.execute(
                     "INSERT INTO parts (name, description, sequence, length, project, "
                     "subcategory, part_type, notes, created) VALUES (?,?,?,?,?,?,?,?,?)",
                     (
-                        p.name,
+                        row_name,
                         source_desc,
-                        seq,
-                        len(seq),
+                        full_seq,
+                        len(full_seq),
                         extra.get("project", body.circuit_name),
                         extra.get("subcategory", ""),
-                        p.part_type or "",
-                        extra.get("notes", f"{p.part_type} ({direction_label})"),
+                        part_type or "",
+                        extra.get("notes", f"{part_type} ({direction_label})"),
                         now,
                     ),
                 )
@@ -471,19 +586,20 @@ def save_to_db(body: SaveToDBRequest):
                     "INSERT INTO kit_parts (name, kit_name, part_type, description, created) "
                     "VALUES (?,?,?,?,?)",
                     (
-                        p.name,
+                        row_name,
                         extra.get("kit_name", "Circuit Design"),
-                        p.part_type or "",
+                        part_type or "",
                         source_desc,
                         now,
                     ),
                 )
             elif body.target == "plasmids":
                 cur = conn.execute(
-                    "INSERT INTO plasmids (name, use, created) VALUES (?,?,?)",
+                    "INSERT INTO plasmids (name, use, project, created) VALUES (?,?,?,?)",
                     (
-                        p.name,
+                        row_name,
                         extra.get("use", source_desc),
+                        extra.get("project", body.circuit_name),
                         now,
                     ),
                 )
@@ -491,13 +607,53 @@ def save_to_db(body: SaveToDBRequest):
                 cur = conn.execute(
                     "INSERT INTO primers (name, sequence, use, created) VALUES (?,?,?,?)",
                     (
-                        p.name,
-                        seq,
+                        row_name,
+                        full_seq,
                         extra.get("use", source_desc),
                         now,
                     ),
                 )
+            elif body.target == "gblocks":
+                cur = conn.execute(
+                    "INSERT INTO gblocks (name, sequence, length, project, use, notes, created) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (
+                        row_name,
+                        full_seq,
+                        len(full_seq),
+                        extra.get("project", body.circuit_name),
+                        extra.get("use", source_desc),
+                        extra.get("notes", ""),
+                        now,
+                    ),
+                )
 
-            saved.append({"id": cur.lastrowid, "name": p.name, "length": len(seq)})
+            row_id = cur.lastrowid
+
+            # Write the .gb file if requested. Failures here roll back the
+            # row insert so we don't end up with DB rows pointing at missing files.
+            gb_filename = None
+            if body.write_gb:
+                try:
+                    gb_filename = _write_circuit_gb(
+                        body.target, row_id, group, row_name, topology
+                    )
+                    conn.execute(
+                        f"UPDATE {body.target} SET gb_file=? WHERE id=?",
+                        (gb_filename, row_id),
+                    )
+                except Exception as e:
+                    # Roll back this row's insert so DB stays consistent.
+                    conn.execute(f"DELETE FROM {body.target} WHERE id=?", (row_id,))
+                    raise HTTPException(500, f"Failed to write .gb for {row_name}: {e}")
+
+            saved.append({
+                "id": row_id,
+                "name": row_name,
+                "length": len(full_seq),
+                "target": body.target,
+                "cloning_type": _TARGET_TO_CLONING_TYPE[body.target],
+                "gb_file": gb_filename,
+            })
         conn.commit()
-    return {"saved": saved, "count": len(saved)}
+    return {"saved": saved, "count": len(saved), "topology": topology, "combined": combine_all}
