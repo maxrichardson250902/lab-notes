@@ -152,7 +152,10 @@ async function _getAllRuns() {
     '.sp-timer-popup{position:fixed;bottom:24px;right:24px;background:#faf8f4;border:2px solid #c0392b;border-radius:8px;padding:16px 20px;z-index:3000;min-width:260px;max-width:380px;box-shadow:0 4px 20px rgba(60,52,42,.2)}',
     '.sp-timer-popup-title{font-weight:700;font-size:13px;color:#c0392b;margin-bottom:4px}',
     '.sp-timer-popup-text{font-size:12px;color:#4a4139;margin-bottom:10px;line-height:1.5}',
-    '.sp-step.timer-expired{border-left:3px solid #c0392b;background:#fff8f8}'
+    '.sp-step.timer-expired{border-left:3px solid #c0392b;background:#fff8f8}',
+    /* Brief highlight when navigated here via "Finish" from dashboard */
+    '@keyframes sp-finish-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(91,122,94,.4); } 50% { box-shadow: 0 0 0 8px rgba(91,122,94,0); } }',
+    '.sp-finish-highlight { animation: sp-finish-pulse 1.1s ease-in-out 2; }'
   ].join('');
   document.head.appendChild(s);
 })();
@@ -580,6 +583,25 @@ async function spResumeRunById(runId) {
   toast('Run not found', true);
 }
 
+/* Resume a run and immediately scroll to the finish-button context.
+   Used by the "Finish" button on the workflow sidebar — keeps the user inside
+   the regular save flow (so they can review recipe/steps) rather than committing
+   silently from another view. */
+async function spResumeAndFinish(runId) {
+  await spResumeRunById(runId);
+  /* Give the scratch view a moment to render, then scroll the finish button
+     into view so it's obvious what to do next. */
+  setTimeout(function() {
+    var btn = document.querySelector('[data-sp-finish]') || document.querySelector('.sp-finish-btn');
+    if (btn) {
+      btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      btn.classList.add('sp-finish-highlight');
+      setTimeout(function() { btn.classList.remove('sp-finish-highlight'); }, 2200);
+    }
+  }, 300);
+}
+window.spResumeAndFinish = spResumeAndFinish;
+
 async function spDiscardRunById(runId) {
   if (!confirm('Discard this run? Progress will be lost.')) return;
   await _removeRun(runId);
@@ -626,7 +648,7 @@ function _renderProtoRunInScratch(el) {
       '<div class="sp-run-footer">' +
         '<button class="btn" onclick="spShowSummary()">View summary</button>' +
         '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
-        '<button class="btn primary" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
+        '<button class="btn primary sp-finish-btn" data-sp-finish="1" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
       '</div>' +
     '</div>';
   // initialise timer buttons for each step (after DOM is set)
