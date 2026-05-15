@@ -6217,4 +6217,4 @@ function _clSendGblockToCircuit(idx) {
 window._clSendToCircuit = _clSendToCircuit;
 window._clSendGblockToCircuit = _clSendGblockToCircuit;
 
-registerView('cloning', renderCloning);
+registerView('cloning', renderCloning, {wide:true});
