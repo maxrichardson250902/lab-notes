@@ -2973,4 +2973,4 @@ if (document.readyState === 'loading') {
 }
 
 // Register with core
-registerView('import_data', renderDnaManager);
+registerView('import_data', renderDnaManager, {wide:true});
