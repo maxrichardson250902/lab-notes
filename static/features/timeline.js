@@ -133,4 +133,4 @@ async function generatePredictions(){
     toast('Failed: '+e.message,true);
   }
 }
-registerView('timeline', renderTimeline);
+registerView('timeline', renderTimeline, {wide:true});
