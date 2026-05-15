@@ -409,7 +409,11 @@ function _cdSaveComposite() {
         seq: fullSeq,
         type: 'plasmid',
         annotations: anns,
-        topology: 'linear',
+        /* "Save composite" goes through the cloning bulk-save path and saves
+           the whole assembled construct as a plasmid — circular by definition.
+           The newer save modal has a per-save toggle, but this older entry
+           point doesn't, so default to circular as the sensible plasmid behaviour. */
+        topology: 'circular',
       }],
       overwrite: true,
     });
@@ -444,6 +448,7 @@ var SAVE_TARGETS = [
   { key: 'kit_parts', label: 'Kit Parts', fields: ['name','kit_name','part_type','description'] },
   { key: 'plasmids',  label: 'Plasmids',  fields: ['name','use'] },
   { key: 'primers',   label: 'Primers',   fields: ['name','sequence','use'] },
+  { key: 'gblocks',   label: 'gBlocks',   fields: ['name','sequence','project','use','notes'] },
 ];
 
 function _cdOpenSaveModal(mode) {
@@ -525,6 +530,41 @@ function _cdRenderSaveModal() {
   } else if (targetKey === 'primers') {
     extraFields = '<div style="margin-bottom:8px"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Use / Description</label>'
       + '<input id="cd-save-use" type="text" value="Circuit design: ' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>';
+  } else if (targetKey === 'gblocks') {
+    extraFields = '<div style="display:flex;gap:8px;margin-bottom:8px">'
+      + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Project</label>'
+      + '<input id="cd-save-project" type="text" value="' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
+      + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Use</label>'
+      + '<input id="cd-save-use" type="text" value="Circuit design: ' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
+      + '</div>'
+      + '<div style="margin-bottom:8px"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Notes</label>'
+      + '<input id="cd-save-notes" type="text" value="" placeholder="Optional notes..." style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>';
+  }
+
+  // Topology toggle — applies to the .gb file that gets written. Defaults to
+  // circular when target is plasmid (the obvious case), linear everywhere else.
+  var defaultCircular = (targetKey === 'plasmids');
+  var topologyBlock = '<div style="margin-bottom:8px;display:flex;align-items:center;gap:10px;padding:8px 10px;background:#f0ebe3;border:1px solid #d5cec0;border-radius:4px">'
+    + '<label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72;flex-shrink:0">Topology</label>'
+    + '<label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:.85rem;color:#4a4139">'
+    + '  <input type="radio" name="cd-save-topology" value="circular" ' + (defaultCircular ? 'checked' : '') + ' style="margin:0" /> Circular'
+    + '</label>'
+    + '<label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:.85rem;color:#4a4139">'
+    + '  <input type="radio" name="cd-save-topology" value="linear" ' + (!defaultCircular ? 'checked' : '') + ' style="margin:0" /> Linear'
+    + '</label>'
+    + '<span style="flex:1;font-size:.72rem;color:#8a7f72;text-align:right">'
+    + (defaultCircular ? 'Plasmid \u2192 defaults to circular' : 'Default for ' + (target ? target.label : targetKey))
+    + '</span>'
+    + '</div>';
+  extraFields += topologyBlock;
+
+  // When saving multiple parts to plasmids, combine into ONE row — flag this
+  // so the user isn't surprised. For other multi-part targets, one row per part.
+  var combineNotice = '';
+  if (mode !== 'single' && targetKey === 'plasmids' && partsToSave.length > 1) {
+    combineNotice = '<div style="margin-bottom:8px;padding:6px 10px;background:#fff4d6;border:1px solid #e8c569;border-radius:4px;font-size:.78rem;color:#7a5a1d">'
+      + '\u24D8 ' + partsToSave.length + ' parts will be combined into <strong>one plasmid</strong> containing the full circuit.'
+      + '</div>';
   }
 
   overlay.innerHTML = '<div style="background:#faf8f4;border:1px solid #d5cec0;border-radius:8px;padding:20px;width:480px;max-width:90vw;max-height:80vh;overflow-y:auto;box-shadow:0 8px 40px rgba(0,0,0,.18)">'
@@ -536,6 +576,7 @@ function _cdRenderSaveModal() {
     + '<div style="display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap">' + tabs + '</div>'
     + '<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72;margin-bottom:6px">' + (mode === 'single' ? 'Part' : 'Parts') + ' to save</div>'
     + '<div style="background:#f0ebe3;border:1px solid #d5cec0;border-radius:4px;padding:8px 10px;margin-bottom:14px;max-height:120px;overflow-y:auto">' + partsList + '</div>'
+    + combineNotice
     + extraFields
     + '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">'
     + '<button onclick="cdCloseSaveModal()" style="padding:6px 16px;border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;cursor:pointer;font-size:.85rem;color:#4a4139">Cancel</button>'
@@ -573,12 +614,29 @@ function _cdConfirmSave() {
   } else if (targetKey === 'plasmids' || targetKey === 'primers') {
     var useEl = document.getElementById('cd-save-use');
     extra.use = useEl ? useEl.value : '';
+  } else if (targetKey === 'gblocks') {
+    var projEl2 = document.getElementById('cd-save-project');
+    var useEl2 = document.getElementById('cd-save-use');
+    var notesEl2 = document.getElementById('cd-save-notes');
+    extra.project = projEl2 ? projEl2.value : _cd.name;
+    extra.use = useEl2 ? useEl2.value : '';
+    extra.notes = notesEl2 ? notesEl2.value : '';
   }
+
+  // Read topology radio. If neither is checked (shouldn't happen but be defensive),
+  // fall back to circular-for-plasmids, linear-otherwise.
+  var topology;
+  var topRadios = document.getElementsByName('cd-save-topology');
+  for (var i = 0; i < topRadios.length; i++) {
+    if (topRadios[i].checked) { topology = topRadios[i].value; break; }
+  }
+  if (!topology) topology = (targetKey === 'plasmids') ? 'circular' : 'linear';
 
   api('POST', '/api/circuits/save-to-db', {
     target: targetKey,
     circuit_name: _cd.name,
     extra: extra,
+    topology: topology,
     parts: partsToSave.map(function(p) {
       return {
         name: p.name,
@@ -591,10 +649,54 @@ function _cdConfirmSave() {
   }).then(function(r) {
     _cdCloseSaveModal();
     var targetLabel = (SAVE_TARGETS.find(function(t) { return t.key === targetKey; }) || {}).label || targetKey;
-    toast('Saved ' + r.count + ' to ' + targetLabel);
+    /* If a single new item was created, offer "View in cloning". For multi-row
+       saves (e.g. all parts → parts table) just show the count. */
+    if (r.saved && r.saved.length === 1) {
+      var item = r.saved[0];
+      _cdShowSaveToast(
+        r.combined
+          ? 'Saved combined plasmid \u201c' + item.name + '\u201d to ' + targetLabel
+          : 'Saved \u201c' + item.name + '\u201d to ' + targetLabel,
+        item.cloning_type, item.id
+      );
+    } else {
+      toast('Saved ' + r.count + ' to ' + targetLabel);
+    }
   }).catch(function(e) { toast('Save failed: ' + e.message); });
 }
 window.cdConfirmSave = _cdConfirmSave;
+
+/* Custom toast with a "View in cloning" action button — only shown when we have
+   exactly one created row to navigate to. Disappears after 6s or on action. */
+function _cdShowSaveToast(message, cloningType, cloningId) {
+  /* Remove any existing custom toast first */
+  var existing = document.getElementById('cd-save-toast');
+  if (existing) existing.remove();
+
+  var el = document.createElement('div');
+  el.id = 'cd-save-toast';
+  el.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#4a4139;color:#faf8f4;padding:12px 18px;border-radius:6px;font-size:14px;box-shadow:0 4px 16px rgba(0,0,0,.25);display:flex;align-items:center;gap:12px;z-index:3000;max-width:90vw';
+  el.innerHTML = '<span>\u2713 ' + esc(message) + '</span>'
+    + '<button id="cd-toast-view" style="background:#5b7a5e;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:13px">View in cloning \u2192</button>'
+    + '<button id="cd-toast-close" style="background:transparent;color:#bdb5a8;border:none;cursor:pointer;font-size:18px;padding:0 4px">\u00d7</button>';
+  document.body.appendChild(el);
+
+  document.getElementById('cd-toast-view').addEventListener('click', function() {
+    el.remove();
+    /* navigateWith is the new helper in core.js — cloning view consumes the
+       {type, id} pending-params and auto-selects the sequence. */
+    if (typeof navigateWith === 'function') {
+      navigateWith('cloning', { type: cloningType, id: cloningId });
+    } else if (typeof setView === 'function') {
+      if (typeof S !== 'undefined') S._pendingSelect = { type: cloningType, id: cloningId };
+      setView('cloning');
+    }
+  });
+  document.getElementById('cd-toast-close').addEventListener('click', function() { el.remove(); });
+
+  /* Auto-dismiss after 6s — long enough to read & decide, short enough to not linger */
+  setTimeout(function() { if (el.parentNode) el.remove(); }, 6000);
+}
 
 function _cdPasteSeq() {
   _cdOpenSeqPanel(_cd.selectedIdx, true);
@@ -868,7 +970,7 @@ function _cdRenderSeqList() {
   var el = document.getElementById('cd-seq-list');
   if (!el) return;
   var filter = _cd.seqFilter;
-  var groups = { kitpart: [], plasmid: [], primer: [] };
+  var groups = { kitpart: [], plasmid: [], primer: [], gblock: [], part: [] };
   _cd.sequences.forEach(function(s) {
     if (filter && s.name.toLowerCase().indexOf(filter) === -1 && (s.kit_name || '').toLowerCase().indexOf(filter) === -1) return;
     if (groups[s.type]) groups[s.type].push(s);
@@ -876,9 +978,11 @@ function _cdRenderSeqList() {
 
   var html = '';
   var sections = [
-    { key: 'kitpart', label: 'Kit Parts', icon: '\uD83E\uDDF0' },
     { key: 'plasmid', label: 'Plasmids', icon: '\uD83E\uDDEC' },
-    { key: 'primer', label: 'Primers', icon: '\uD83E\uDD8A' },
+    { key: 'kitpart', label: 'Kit Parts', icon: '\uD83E\uDDF0' },
+    { key: 'part',    label: 'Parts',     icon: '\uD83E\uDDEA' },
+    { key: 'gblock',  label: 'gBlocks',   icon: '\uD83E\uDDF5' },
+    { key: 'primer',  label: 'Primers',   icon: '\uD83E\uDD8A' },
   ];
   sections.forEach(function(sec) {
     var items = groups[sec.key];
