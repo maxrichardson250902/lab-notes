@@ -804,4 +804,4 @@ function sgStyles() {
 </style>';
 }
 
-registerView('sanger', renderSanger);
+registerView('sanger', renderSanger, {wide:true});
