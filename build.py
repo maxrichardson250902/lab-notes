@@ -17,6 +17,7 @@ FEATURE_ORDER = [
     "notebook", "wf_editor", "workflow",  "protocols", "summaries","pipeline" ,"addform",
      "scratch", "reminders", "gel_annotation", "timeline",
     "predictions","plan_converter","circuits","cloning","sanger", "dilution","import_data","backup","tm_calc",  "import", "enrichment",
+    "settings",
 ]
 
 
