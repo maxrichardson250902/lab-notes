@@ -576,10 +576,30 @@ function _runHistoryRowHTML(run) {
   var steps=[]; try{steps=JSON.parse(run.steps_json||'[]');}catch(e){}
   var sh=''; if(steps.length){sh='<ol class="run-detail-steps">'; steps.forEach(function(s){sh+='<li class="'+(s.done?'done':'')+'">'+esc(s.text);if(s.deviation&&s.deviation.trim())sh+=' <span class="run-detail-deviation">&#8594; '+esc(s.deviation)+'</span>';sh+='</li>';}); sh+='</ol>';}
   var rh=''; try{_parseRecipeArray(run.recipe_json).forEach(function(rec){if(rec&&rec.rows&&rec.rows.length){rh+='<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:#8a7f72;margin:10px 0 6px">'+esc(rec.name||'Recipe')+'</div><div style="overflow-x:auto"><table class="recipe-table"><thead><tr>';rec.columns.forEach(function(c){rh+='<th>'+esc(c)+'</th>';});rh+='</tr></thead><tbody>';rec.rows.forEach(function(row){rh+='<tr>';rec.columns.forEach(function(_,ci){rh+='<td style="padding:5px 10px;font-size:12px">'+esc(row[ci]||'')+'</td>';});rh+='</tr>';});rh+='</tbody></table></div>';}});}catch(e){}
-  return '<div class="run-history-row" id="rhr-'+run.id+'"><div class="run-history-summary" onclick="protoToggleRunDetail('+run.id+')"><div class="run-history-date">'+esc(date)+'</div><div class="run-history-pct">'+pct+'% done</div>'+(run.deviations?'<div class="run-history-devs">'+run.deviations+' dev</div>':'')+'<div class="run-history-group">&#128193; '+esc(run.group_name)+'</div><div style="font-size:11px;color:#b0a898">&#9660;</div></div><div class="run-history-detail">'+sh+rh+(run.entry_id?'<div style="margin-top:10px"><button class="btn" style="font-size:12px" onclick="protoViewEntry('+run.entry_id+')">&#128196; View entry</button></div>':'')+'</div></div>';
+  return '<div class="run-history-row" id="rhr-'+run.id+'"><div class="run-history-summary" onclick="protoToggleRunDetail('+run.id+')"><div class="run-history-date">'+esc(date)+'</div><div class="run-history-pct">'+pct+'% done</div>'+(run.deviations?'<div class="run-history-devs">'+run.deviations+' dev</div>':'')+'<div class="run-history-group">&#128193; '+esc(run.group_name)+'</div><div style="font-size:11px;color:#b0a898">&#9660;</div></div><div class="run-history-detail">'+sh+rh+
+    /* Action row: view-entry link + delete button. Delete is destructive so
+       it sits at the right with red styling and asks for confirmation. */
+    '<div style="margin-top:10px;display:flex;gap:6px;align-items:center">' +
+      (run.entry_id?'<button class="btn" style="font-size:12px" onclick="protoViewEntry('+run.entry_id+')">&#128196; View entry</button>':'') +
+      '<div style="flex:1"></div>' +
+      '<button class="btn" style="font-size:11px;color:#c0392b" onclick="protoDeleteRun('+run.id+','+run.protocol_id+')">Delete run record</button>' +
+    '</div>' +
+  '</div></div>';
 }
 function protoToggleRunDetail(id) { document.getElementById('rhr-'+id)?.classList.toggle('open'); }
 function protoViewEntry(id) { if(typeof setView==='function'){S._jumpToEntry=id;setView('notebook');} }
+
+async function protoDeleteRun(runId, protocolId) {
+  if (!confirm('Delete this run record? The linked notebook entry will not be touched.')) return;
+  try {
+    await api('DELETE', '/api/protocol-runs/' + runId);
+    toast('Run record deleted');
+    /* Re-fetch the history list for this protocol */
+    if (typeof protoLoadRunHistory === 'function') await protoLoadRunHistory(protocolId);
+  } catch (e) {
+    toast('Delete failed: ' + e.message, true);
+  }
+}
 
 // ── tag input ─────────────────────────────────────────────────────────────────
 function _tagInputHTML(key, initial) {
