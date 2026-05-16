@@ -471,6 +471,22 @@ def save_protocol_run(body: SaveRun):
         conn.commit()
         return dict(conn.execute("SELECT * FROM protocol_runs WHERE id=?", (cur.lastrowid,)).fetchone())
 
+
+@router.delete("/protocol-runs/{run_id}")
+def delete_protocol_run(run_id: int):
+    """Remove a protocol_run row. Does NOT delete the linked notebook entry —
+    that's the user's data and they can delete it separately if they want.
+    Useful for cleaning up accidentally-duplicated runs."""
+    with get_db() as conn:
+        row = conn.execute("SELECT 1 FROM protocol_runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Protocol run not found")
+        conn.execute("DELETE FROM protocol_runs WHERE id=?", (run_id,))
+        conn.commit()
+    return {"deleted": run_id}
+
+
+
 @router.get("/active-runs")
 def list_active_runs():
     with get_db() as conn:
