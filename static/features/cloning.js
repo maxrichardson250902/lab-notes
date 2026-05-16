@@ -101,6 +101,29 @@ var _cl = {
   },
 };
 
+/* ── Multi-tab state ──────────────────────────────────────────────────────
+   _clTabs is an array of "slot" objects, each holding the subset of _cl that
+   belongs to a single open sequence. _clActiveTab is the index of the
+   currently-displayed tab.
+
+   Why a side-array rather than putting _cl.tabs inside _cl: leaves the bulk of
+   cloning.js (which reads _cl.foo) untouched. The tab manager copies fields
+   in and out of _cl on tab switch. Treat _cl as a "render slot" — it always
+   reflects the active tab.
+
+   _clTabFields lists exactly which _cl keys are per-tab. Anything not listed
+   stays shared (e.g. `sequences` library, OC integration state). When adding
+   new per-tab state, add the key here. */
+var _clTabs = [];           // [{ id, type, name, savedSlot }]
+var _clActiveTab = -1;      // -1 = no tabs open yet
+var _clTabFields = [
+  'selected', 'parsed', 'tab', 'editFeature', 'featuresDirty',
+  'showCircular', 'showLinear', 'showTranslation',
+  'search', 'lastSelection',
+  'pd', 'sa', 'ipcr', 'ad',
+];
+var _CL_TABS_STORAGE_KEY = 'lab_cloning_tabs';
+
 /* ── script loader ─────────────────────────────────────────── */
 var _altExpanded = {};  // track which primer alt sections are expanded
 window._altExpanded = _altExpanded;
@@ -149,59 +172,19 @@ function _clLoadConfig() {
 }
 
 function _clSelectSequence(type, id, skipHistory) {
+  /* This used to load directly into the single _cl slot. Now it routes through
+     _clTabOpen, which either focuses the existing tab for this sequence or
+     opens a new one. The behaviour for users hasn't changed when they have at
+     most one tab open. */
   _cl.sidebarOpen = false;
-  _cl.selected = { type: type, id: id };
   if (!skipHistory) {
     history.pushState({ cl: 'seq', type: type, id: id }, '', '#' + type + '/' + id);
   }
-  _cl.parsed = null;
-  _cl.loading = true;
-  // Reset all primer results and product preview
-  _cl.pd.custom.result = null;
-  _cl.pd.pcr.result = null;
-  _cl.pd.seq.result = null;
-  _cl.pd.kld.result = null;
-  _cl.pd.kld.selectedFwdIdx = 0;
-  _cl.pd.kld.selectedRevIdx = 0;
-  _cl.pd.kld.lockedPrimer = null;
-  _cl.pd._viewingProduct = false;
-  _cl.pd._saveTopo = 'circular';  // topology for saving products
-  _cl.pd._productPreview = null;
-  _cl.pd._productBaseBody = null;
-  _cl.featuresDirty = false;
-  _cl.editFeature = null;
-  _cl.sa.orfs.result = null;
-  _cl.sa.re.result = null;
-  _cl.sa.tools.result = null;
-  _cl.sa.digest.result = null;
-  _cl.sa.blast.result = null;
-  _cl.sa.blast.seq = '';
-  _cl.sa.scan.result = null;
-  _cl.ipcr = { expanded: _cl.ipcr.expanded, primer1: '', primer2: '', name1: 'Primer 1', name2: 'Primer 2', result: null, loading: false, maxMm: 2 };
-  _cl.search.query = '';
-  _cl.ad.gibson.result = null;
-  _cl.ad.goldengate.result = null;
-  _cl.ad.digestligate.result = null;
-  _cl.ad.runGibson.result = null;
-  _cl.ad.runGG.result = null;
-  _cl.ad._libPicker = null;
-  _cl.search.results = null;
-  _cl.search.activeIdx = 0;
-  _cl.search.open = false;
-  _clRender();
-
-  api('GET', '/api/cloning/sequences/' + type + '/' + id + '/parse')
-    .then(function(data) {
-      _cl.parsed = data;
-      _cl.loading = false;
-      _clRender();
-      setTimeout(function() { _clRenderSeqViz(); }, 50);
-    })
-    .catch(function(err) {
-      _cl.loading = false;
-      toast('Failed to parse GenBank file: ' + (err.message || err), true);
-      _clRender();
-    });
+  _clTabOpen(type, id).then(function() {
+    /* After tab is open, render SeqViz for the active tab. _clRender already
+       ran inside _clTabOpen, but SeqViz mount happens async. */
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  });
 }
 
 /* ── SeqViz renderer ───────────────────────────────────────── */
@@ -647,6 +630,250 @@ function _clSelLen(start, end) {
   return (_cl.parsed.seq.length - start) + end;
 }
 
+/* ── Tab manager ───────────────────────────────────────────────────────────
+   Public functions:
+     _clTabOpen(type, id, name)  - open a new tab or switch to existing
+     _clTabClose(idx)            - close a tab (with dirty-warn)
+     _clTabSwitch(idx)           - switch active to idx
+     _clTabsLoad()               - hydrate from localStorage (call on first entry)
+     _clTabsPersist()            - write current tabs metadata to localStorage
+
+   Tab slot shape: { type, id, name, savedSlot }
+     savedSlot holds the snapshot of _clTabFields keys for that tab when it's
+     NOT the active tab. The active tab's slot.savedSlot is stale by design —
+     the live state is in _cl. */
+
+function _clSnapshotActive() {
+  /* Copy each per-tab field from _cl into a fresh object. We do shallow refs;
+     since users don't mutate the nested structures in place from another tab,
+     this is safe enough. If it becomes a problem, JSON.parse(JSON.stringify())
+     would deep-clone. */
+  var snap = {};
+  for (var i = 0; i < _clTabFields.length; i++) {
+    snap[_clTabFields[i]] = _cl[_clTabFields[i]];
+  }
+  return snap;
+}
+
+function _clRestoreInto(slot) {
+  /* Apply a savedSlot back into _cl. Missing fields fall back to whatever
+     _cl currently has (which is the previous tab's values — that's why we
+     always call _clSnapshotActive first). */
+  if (!slot) return;
+  for (var i = 0; i < _clTabFields.length; i++) {
+    var k = _clTabFields[i];
+    if (k in slot) _cl[k] = slot[k];
+  }
+}
+
+function _clTabsPersist() {
+  /* Store only metadata: type, id, name, activeIdx. Sequence data refetches on
+     reload. Skip tabs with no id (unsaved "new" tabs) — they can't be
+     reconstructed without their data. */
+  try {
+    var meta = {
+      activeIdx: _clActiveTab,
+      tabs: _clTabs.map(function(t) {
+        return { type: t.type, id: t.id, name: t.name };
+      }).filter(function(t) { return t.type && t.id; }),
+    };
+    localStorage.setItem(_CL_TABS_STORAGE_KEY, JSON.stringify(meta));
+  } catch (e) {
+    /* localStorage full or disabled — non-fatal, just don't persist. */
+  }
+}
+
+async function _clTabsLoad() {
+  /* Hydrate _clTabs from localStorage on first entry. For each persisted tab,
+     refetch its sequence so we have parsed data. Done in order so the user
+     sees tabs filling in left-to-right.
+
+     Returns true if anything was loaded, false if there was nothing to load. */
+  var raw = null;
+  try { raw = localStorage.getItem(_CL_TABS_STORAGE_KEY); } catch (e) {}
+  if (!raw) return false;
+  var meta;
+  try { meta = JSON.parse(raw); } catch (e) { return false; }
+  if (!meta || !meta.tabs || !meta.tabs.length) return false;
+
+  for (var i = 0; i < meta.tabs.length; i++) {
+    var t = meta.tabs[i];
+    try {
+      var parsed = await api('GET', '/api/cloning/sequences/' + t.type + '/' + t.id + '/parse');
+      _clTabs.push({
+        type: t.type, id: t.id, name: parsed.name || t.name,
+        savedSlot: _clFreshSlot(t.type, t.id, parsed),
+      });
+    } catch (e) {
+      /* Sequence might have been deleted while we were away — silently skip. */
+    }
+  }
+  if (_clTabs.length) {
+    _clActiveTab = Math.min(meta.activeIdx || 0, _clTabs.length - 1);
+    /* Restore the active tab into _cl so the renderer has data. */
+    _clRestoreInto(_clTabs[_clActiveTab].savedSlot);
+  }
+  return _clTabs.length > 0;
+}
+
+function _clFreshSlot(type, id, parsed) {
+  /* Build a fresh per-tab slot — initialised state for an open sequence.
+     Inherits the user's view-mode preferences from the currently-active tab
+     so opening a new tab feels continuous. */
+  return {
+    selected: { type: type, id: id },
+    parsed: parsed,
+    tab: 'viewer',
+    editFeature: null,
+    featuresDirty: false,
+    showCircular: _cl.showCircular,
+    showLinear: _cl.showLinear,
+    showTranslation: _cl.showTranslation,
+    search: { open: false, query: '', results: null, activeIdx: 0 },
+    lastSelection: { start: 0, end: 0 },
+    /* For pd/sa/ipcr/ad, start with the default structure. Stealing initial
+       values from _cl would carry over half-finished panels from the previous
+       tab — wrong. Use the same defaults that _cl literal had. */
+    pd: {
+      expanded: false, mode: 'custom', saving: false, criteriaOpen: false,
+      criteria: { dimerDgMax: -6, dimerDgWarn: -6, dimerDgFail: -9, tmDeviation: 3,
+                  gcMin: 40, gcMax: 60, penalizeHairpin: true, gcClampWeight: 6, junctionGcWeight: 5 },
+      custom: { start: '', end: '', direction: 'forward', tail: '', tailOrientation: 'product', result: null, designing: false },
+      pcr: { targetStart: '', targetEnd: '', tmTarget: 62, result: null, designing: false },
+      seq: { regionStart: '', regionEnd: '', readLen: 900, tmTarget: 62, result: null, designing: false },
+      kld: { startPos: '', endPos: '', insertSeq: '', tmTarget: 62, maxLen: 60, mgConc: 1.5,
+             optimize: false, exhaustive: false, lockedPrimer: null, result: null,
+             designing: false, selectedFwdIdx: 0, selectedRevIdx: 0 },
+    },
+    sa: {
+      expanded: false, mode: 'orfs',
+      orfs: { minLen: 100, result: null, loading: false, showOnMap: true, expandedOrf: null, hiddenOrfs: {} },
+      re: { enzymes: '', result: null, loading: false, showOnMap: true, filterCuts: 'all' },
+      tools: { input: '', result: null, lastOp: '' },
+      digest: { enzymes: '', result: null, loading: false },
+      blast: { seq: '', program: 'blastn', database: 'nt', maxHits: 10, result: null, loading: false, expandedHit: null },
+      scan: { result: null, loading: false, showOnMap: true, filterCat: 'all' },
+    },
+    ipcr: { expanded: false, primer1: '', primer2: '', name1: 'Primer 1', name2: 'Primer 2', result: null, loading: false, maxMm: 2 },
+    ad: {
+      expanded: false, mode: 'gibson', gibsonSub: 'design', ggSub: 'design',
+      gibson: { fragments: [], vector: null, overlapLen: 25, tmTarget: 62, result: null, designing: false,
+                bins: [], useBins: false, comboResult: null, orderSheet: null },
+      goldengate: { enzyme: 'BsaI', bins: [], vector: null, result: null, designing: false },
+      digestligate: { enzyme1: '', enzyme2: '', vectorSeq: '', vectorName: '', insertSeq: '', insertName: '', result: null, designing: false },
+      runGibson: { fragments: [], circular: true, minOverlap: 15, result: null, running: false },
+      runGG: { fragments: [], vector: null, enzyme: 'BsaI', result: null, running: false },
+      _libPicker: null, _libLoading: false, showPrimersOnMap: false,
+    },
+  };
+}
+
+async function _clTabOpen(type, id, opts) {
+  /* If a tab for this sequence already exists, switch to it. Otherwise add
+     a new tab at the end and switch to it. Returns the new active index. */
+  for (var i = 0; i < _clTabs.length; i++) {
+    if (_clTabs[i].type === type && _clTabs[i].id === id) {
+      return _clTabSwitch(i);
+    }
+  }
+  /* Parse the sequence to get a name + annotations */
+  var parsed;
+  try {
+    parsed = await api('GET', '/api/cloning/sequences/' + type + '/' + id + '/parse');
+  } catch (e) {
+    toast('Could not load sequence: ' + e.message, true);
+    return _clActiveTab;
+  }
+  /* Snapshot the currently-active tab before pushing the new one */
+  if (_clActiveTab >= 0 && _clTabs[_clActiveTab]) {
+    _clTabs[_clActiveTab].savedSlot = _clSnapshotActive();
+  }
+  var slot = _clFreshSlot(type, id, parsed);
+  _clTabs.push({ type: type, id: id, name: parsed.name || ('seq ' + id), savedSlot: slot });
+  _clActiveTab = _clTabs.length - 1;
+  _clRestoreInto(slot);
+  _seqVizFingerprint = null;    // force SeqViz re-render for new content
+  _clTabsPersist();
+  _clRender();
+  return _clActiveTab;
+}
+
+function _clTabSwitch(idx) {
+  if (idx === _clActiveTab) return idx;
+  if (idx < 0 || idx >= _clTabs.length) return _clActiveTab;
+  /* Save active tab's live state back into its slot */
+  if (_clActiveTab >= 0 && _clTabs[_clActiveTab]) {
+    _clTabs[_clActiveTab].savedSlot = _clSnapshotActive();
+  }
+  _clActiveTab = idx;
+  _clRestoreInto(_clTabs[idx].savedSlot);
+  _seqVizFingerprint = null;
+  _clTabsPersist();
+  _clRender();
+  return idx;
+}
+
+function _clTabClose(idx) {
+  if (idx < 0 || idx >= _clTabs.length) return;
+  /* Dirty-check: if the user has unsaved edits in this tab, warn before close.
+     We check the slot's savedSlot.featuresDirty for inactive tabs and _cl's
+     live featuresDirty for the active one. */
+  var isActive = (idx === _clActiveTab);
+  var dirty = isActive ? _cl.featuresDirty
+                       : (_clTabs[idx].savedSlot && _clTabs[idx].savedSlot.featuresDirty);
+  if (dirty) {
+    if (!confirm('Close "' + _clTabs[idx].name + '"? Unsaved changes to features will be lost.')) {
+      return;
+    }
+  }
+  _clTabs.splice(idx, 1);
+  if (_clTabs.length === 0) {
+    /* No tabs left — clear active sequence so render shows the empty state */
+    _clActiveTab = -1;
+    _cl.selected = null;
+    _cl.parsed = null;
+    _cl.featuresDirty = false;
+  } else {
+    /* Pick a new active tab: same index if it exists, else previous */
+    var newActive;
+    if (isActive) {
+      newActive = Math.min(idx, _clTabs.length - 1);
+      _clActiveTab = newActive;
+      _clRestoreInto(_clTabs[newActive].savedSlot);
+      _seqVizFingerprint = null;
+    } else if (idx < _clActiveTab) {
+      /* A tab to our left closed — our index shifted */
+      _clActiveTab--;
+    }
+  }
+  _clTabsPersist();
+  _clRender();
+}
+
+function _clRenderTabStrip() {
+  /* The tab bar at the top of the cloning view. Returns HTML string. */
+  if (!_clTabs.length) {
+    return '<div class="cl-tab-strip"><div class="cl-tab-strip-empty">No sequences open \u2014 pick one from the sidebar to begin.</div></div>';
+  }
+  var h = '<div class="cl-tab-strip">';
+  for (var i = 0; i < _clTabs.length; i++) {
+    var t = _clTabs[i];
+    var active = (i === _clActiveTab);
+    var dirty = active ? _cl.featuresDirty
+                       : (t.savedSlot && t.savedSlot.featuresDirty);
+    h += '<div class="cl-tab' + (active ? ' active' : '') + '" onclick="_clTabSwitch(' + i + ')" title="' + esc(t.type) + ' #' + t.id + '">' +
+         '<span class="cl-tab-name">' + esc(t.name) + (dirty ? ' <span class="cl-tab-dirty">\u2022</span>' : '') + '</span>' +
+         '<span class="cl-tab-close" onclick="event.stopPropagation();_clTabClose(' + i + ')" title="Close tab">\u00d7</span>' +
+         '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+window._clTabSwitch = _clTabSwitch;
+window._clTabClose = _clTabClose;
+window._clTabOpen = _clTabOpen;
+
 /* ── main render ───────────────────────────────────────────── */
 var _clEl = null;
 var _seqVizFingerprint = null;  // cache to skip unnecessary re-renders
@@ -668,6 +895,11 @@ function _clRender() {
   h += '<button onclick="_clSetTab(\x27opencloning\x27)" style="padding:.35rem .8rem;font-size:.78rem;border:none;cursor:pointer;' +
        (_cl.tab === 'opencloning' ? 'background:#5b7a5e;color:#fff;' : 'background:#faf8f4;color:#4a4139;') + '">OpenCloning</button>';
   h += '</div></div></div>';
+
+  /* Multi-sequence tab strip — sits between the workbench header and the
+     viewer/OC body. Empty until the user opens a sequence; auto-renders when
+     they pick something from the sidebar. */
+  h += _clRenderTabStrip();
 
   if (_cl.tab === 'viewer') { h += _clRenderViewerTab(); }
   else { h += _clRenderOCTab(); }
@@ -5981,6 +6213,12 @@ async function renderCloning(el) {
   if (!alreadyLoaded) {
     el.innerHTML = '<div style="text-align:center;padding:3rem;color:#8a7f72;"><div style="font-size:1.4rem;margin-bottom:.5rem;">\u23f3</div>Loading Cloning Workbench\u2026</div>';
     await Promise.all([_clLoadSequences(), _clLoadConfig(), _loadSeqVizDeps()]);
+    /* First-time entry: hydrate any previously-open tabs from localStorage.
+       Done after sequences load so the sidebar list is populated when the
+       user looks for the active tab's library entry. */
+    if (!_clTabs.length) {
+      await _clTabsLoad();
+    }
   } else {
     /* SeqViz deps need to be present but loadSeqVizDeps is itself idempotent */
     _loadSeqVizDeps();
@@ -6001,6 +6239,11 @@ async function renderCloning(el) {
     return;
   }
   _clRender();
+  /* If we have tabs (either just hydrated or already loaded), SeqViz needs to
+     mount for the active tab. */
+  if (_clActiveTab >= 0 && _cl.parsed) {
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+  }
   /* Restore scroll position from previous visit. The render is synchronous
      (no async data fetches in _clRender), so the DOM is in place by now. */
   if (typeof _clScrollY === 'number' && _clScrollY > 0) {
