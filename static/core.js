@@ -57,6 +57,7 @@ let S = {
     wide_view_max_px: 1800,
     default_view: 'notebook',
     sidebar_auto_hide: false,
+    sidebar_peek_delay_ms: 150,
     auto_save_delay_ms: 1500,
   },
 };
@@ -136,14 +137,16 @@ function applySettings() {
   const sb = document.getElementById('sidebar');
   if (zone && sb && !zone.dataset.bound) {
     zone.dataset.bound = '1';
-    /* Delayed show: 300ms hover threshold. Casual mouse movement past the left
-       edge shouldn't trigger the panel. The timer is cancelled if the mouse
-       leaves before it fires. */
+    /* Delayed show: configurable hover threshold (sidebar_peek_delay_ms,
+       default 150ms). Casual mouse movement past the edge shouldn't trigger
+       the panel. The timer is cancelled if the mouse leaves before it fires. */
     var peekTimer = null;
     const showSoon = () => {
       if (!S.settings.sidebar_auto_hide) return;
       if (peekTimer) clearTimeout(peekTimer);
-      peekTimer = setTimeout(() => { sb.classList.add('peek'); }, 300);
+      var delay = (typeof S.settings.sidebar_peek_delay_ms === 'number')
+                  ? S.settings.sidebar_peek_delay_ms : 150;
+      peekTimer = setTimeout(() => { sb.classList.add('peek'); }, delay);
     };
     const cancelOrHide = (hide) => {
       if (peekTimer) { clearTimeout(peekTimer); peekTimer = null; }
