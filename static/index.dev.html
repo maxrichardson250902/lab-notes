@@ -11,6 +11,10 @@
 <body>
 <div class="layout">
 
+<!-- Sidebar peek zone: invisible 14px strip on the left edge. Hovering it
+     reveals the sidebar when in auto-hide mode. No-op when auto-hide is off. -->
+<div class="sidebar-peek-zone" id="sidebar-peek-zone"></div>
+
 <!-- Sidebar -->
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-logo">
@@ -73,6 +77,9 @@
     <div class="nav-item" id="nav-backup" onclick="setView('backup')"> 
     <span>&#128190;</span><span>Backup</span>
     </div>
+    <div class="nav-item" id="nav-settings" onclick="setView('settings')">
+      <span>&#9881;</span><span>Settings</span>
+    </div>
     <div class="nav-divider"></div>
     <!-- Dynamic nav items from features go here -->
     <div id="dynamic-nav"></div>
@@ -122,6 +129,7 @@
 <script src="/static/features/dilution.js"></script>
 <script src="/static/features/import.js"></script>
 <script src="/static/features/enrichment.js"></script>
+<script src="/static/features/settings.js"></script>
 <script src="/static/proto-timer.js"></script>
 
 <!-- Boot -->
