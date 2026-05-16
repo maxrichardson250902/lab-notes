@@ -1336,7 +1336,16 @@ function _cdRenderPaletteButtons() {
 }
 
 // ── Register view ──────────────────────────────────────────────────────
+/* Per-view scroll memory. Set on view-leave, restored on view-enter. */
+var _cdScrollY = 0;
 registerView('circuits', function(container) {
   container.innerHTML = '<div id="circuits-view"></div>';
   _cdRender();
+  /* Restore scroll position after the render lands. */
+  if (typeof _cdScrollY === 'number' && _cdScrollY > 0) {
+    setTimeout(function() {
+      var content = document.getElementById('content');
+      if (content) content.scrollTop = _cdScrollY;
+    }, 0);
+  }
 }, {wide: true});
