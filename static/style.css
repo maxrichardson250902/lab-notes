@@ -28,6 +28,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 .nav-item{display:flex;align-items:center;gap:8px;padding:7px 18px;cursor:pointer;font-size:13px;color:var(--muted);transition:background .1s,color .1s;border-left:2px solid transparent}
 .nav-item:hover{background:var(--surface2);color:var(--text)}
 .nav-item.active{color:var(--accent);border-left-color:var(--accent);background:var(--tag-bg)}
+/* Icon column: fixed width so labels align regardless of whether the icon is
+   an emoji (wide) or a Unicode symbol (narrow). The first span in each
+   nav-item is the icon. Text-align centre keeps narrower glyphs centred. */
+.nav-item > span:first-child{display:inline-block;width:20px;text-align:center;font-size:14px;line-height:1;flex-shrink:0}
 .nav-item .count{margin-left:auto;font-size:10px;font-family:var(--mono);background:var(--surface2);padding:1px 6px;border-radius:10px;color:var(--dim)}
 .nav-divider{height:1px;background:var(--border);margin:8px 18px}
 .group-nav{display:flex;align-items:center;gap:6px;padding:5px 18px 5px 28px;cursor:pointer;font-size:12px;color:var(--muted);transition:background .1s,color .1s;border-left:2px solid transparent}
@@ -53,16 +57,21 @@ header{display:flex;align-items:center;gap:10px;padding:16px 24px;border-bottom:
    so settings can adjust it without rebuilding CSS. */
 .content.wide{max-width:var(--wide-cap, 1800px);padding:18px 24px}
 
-/* Auto-hide sidebar mode: the sidebar collapses to 0 width by default, and
-   slides out as an overlay when the user hovers the left edge. The "left-edge
+/* Auto-hide sidebar mode: the sidebar collapses to a thin slice by default
+   (so the user knows it's there) and slides out as an overlay when the user
+   hovers the left edge. The slice is 6px of accent colour. The "left-edge
    detector" is a 14px transparent strip that catches the mouse. Hovering
    either it or the sidebar itself reveals the sidebar.
    We don't push content when revealing — the sidebar overlays it. That's the
    point: content stays the width it was. */
-body.auto-hide-sidebar .sidebar { width:0; min-width:0; border-right:none; position:fixed; top:0; left:0; height:100vh; z-index:200; box-shadow:none; }
-body.auto-hide-sidebar .sidebar.collapsed { width:0; min-width:0; }
-body.auto-hide-sidebar .sidebar:hover,
-body.auto-hide-sidebar .sidebar.peek { width:220px; min-width:220px; border-right:1px solid var(--border); box-shadow:2px 0 12px rgba(0,0,0,.18); }
+body.auto-hide-sidebar .sidebar { width:6px; min-width:6px; border-right:none; position:fixed; top:0; left:0; height:100vh; z-index:200; box-shadow:none; background:var(--accent,#5b7a5e); overflow:hidden; }
+/* When peeking, hide the slice and show the full sidebar normal way */
+body.auto-hide-sidebar .sidebar.peek { width:220px; min-width:220px; border-right:1px solid var(--border); box-shadow:2px 0 12px rgba(0,0,0,.18); background:var(--surface,#faf8f4); overflow:auto; }
+/* Hide inner content while collapsed so only the slice shows */
+body.auto-hide-sidebar .sidebar:not(.peek) .sidebar-logo,
+body.auto-hide-sidebar .sidebar:not(.peek) .sidebar-scroll { display:none; }
+body.auto-hide-sidebar .sidebar.collapsed { width:6px; min-width:6px; }
+/* Peek zone covers the slice + extends a bit beyond so it's easy to land */
 body.auto-hide-sidebar .sidebar-peek-zone { position:fixed; top:0; left:0; width:14px; height:100vh; z-index:199; }
 
 /* Stats row */
