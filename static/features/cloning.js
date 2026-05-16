@@ -5973,8 +5973,18 @@ function _adCopyPrimer(key) {
 /* ── main entry ────────────────────────────────────────────── */
 async function renderCloning(el) {
   _clEl = el;
-  el.innerHTML = '<div style="text-align:center;padding:3rem;color:#8a7f72;"><div style="font-size:1.4rem;margin-bottom:.5rem;">\u23f3</div>Loading Cloning Workbench\u2026</div>';
-  await Promise.all([_clLoadSequences(), _clLoadConfig(), _loadSeqVizDeps()]);
+  /* If we already loaded sequences and have something to show, skip the
+     full reload — just re-render from existing _cl state. This is what makes
+     navigating away to circuits and back feel instant and preserves the open
+     sequence / panel state. */
+  var alreadyLoaded = (_cl.sequences && _cl.sequences.length > 0) || _cl.current;
+  if (!alreadyLoaded) {
+    el.innerHTML = '<div style="text-align:center;padding:3rem;color:#8a7f72;"><div style="font-size:1.4rem;margin-bottom:.5rem;">\u23f3</div>Loading Cloning Workbench\u2026</div>';
+    await Promise.all([_clLoadSequences(), _clLoadConfig(), _loadSeqVizDeps()]);
+  } else {
+    /* SeqViz deps need to be present but loadSeqVizDeps is itself idempotent */
+    _loadSeqVizDeps();
+  }
   // Honour a pending selection from another view. Two compatible sources:
   //   - legacy: S._pendingSelect = { type, id } (importer's \uD83E\uDDEC button)
   //   - new:    consumeNavParams('cloning') returns { type, id }
@@ -5991,7 +6001,17 @@ async function renderCloning(el) {
     return;
   }
   _clRender();
+  /* Restore scroll position from previous visit. The render is synchronous
+     (no async data fetches in _clRender), so the DOM is in place by now. */
+  if (typeof _clScrollY === 'number' && _clScrollY > 0) {
+    var content = document.getElementById('content');
+    if (content) content.scrollTop = _clScrollY;
+  }
 }
+
+/* Per-view scroll memory. Set on view-leave (see scroll-save hook in core.js),
+   restored on view-enter. */
+var _clScrollY = 0;
 
 // ── expose globals
 window._clSelectSequence = _clSelectSequence;
