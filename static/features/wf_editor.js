@@ -79,6 +79,9 @@ function _wfInjectStyles() {
     '.wf-gel-pick { display:flex; align-items:center; gap:10px; padding:8px; cursor:pointer; border-radius:4px; }',
     '.wf-gel-pick:hover { background:#f0ebe3; }',
     '.wf-gel-pick-thumb { width:48px; height:48px; object-fit:cover; border-radius:3px; background:#e8e2d6; }',
+    /* Floating "Delete table" button — sits above the active table in the editor */
+    '.wf-del-table-btn { display:none; position:fixed; z-index:500; padding:3px 10px; font-size:11.5px; color:#c0392b; background:#fff; border:1px solid #e8b4b0; border-radius:4px; cursor:pointer; font-family:inherit; box-shadow:0 1px 4px rgba(0,0,0,.08); }',
+    '.wf-del-table-btn:hover { background:#fdecea; border-color:#c0392b; }',
   ].join('\n');
   document.head.appendChild(s);
 }
@@ -263,7 +266,86 @@ window.wfEditorAttach = function(el, opts) {
     if (opts.onChange) opts.onChange(el.innerHTML);
   }
 
-  /* ── Keydown — handles Enter (submit), Tab (table), Shift+Tab (back) ── */
+  /* ── Floating "Delete table" button ────────────────────────────────────────
+     Appears at the top-right of any table the user clicks into. Single shared
+     element (one per editor instance) repositioned via getBoundingClientRect.
+     Hidden when the click moves outside the table, when the table is removed,
+     or when the editor loses focus. */
+  var _wfDelTableBtn = null;
+  var _wfActiveTable = null;
+  function _wfShowDeleteTableBtn(table) {
+    _wfActiveTable = table;
+    if (!_wfDelTableBtn) {
+      _wfDelTableBtn = document.createElement('button');
+      _wfDelTableBtn.type = 'button';
+      _wfDelTableBtn.className = 'wf-del-table-btn';
+      _wfDelTableBtn.innerHTML = '\u00d7 Delete table';
+      _wfDelTableBtn.title = 'Remove the entire table';
+      /* Use mousedown not click — click fires after editor blurs the button
+         which can lose the contenteditable selection. mousedown is reliable. */
+      _wfDelTableBtn.addEventListener('mousedown', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (!_wfActiveTable) return;
+        if (!confirm('Delete this whole table?')) return;
+        var t = _wfActiveTable;
+        var next = t.nextElementSibling || t.previousElementSibling || el;
+        t.parentNode.removeChild(t);
+        if (next && el.contains(next)) _wfMoveCaretInto(next);
+        _wfHideDeleteTableBtn();
+        markDirty();
+      });
+      document.body.appendChild(_wfDelTableBtn);
+    }
+    var rect = table.getBoundingClientRect();
+    _wfDelTableBtn.style.display = 'block';
+    _wfDelTableBtn.style.position = 'fixed';
+    /* Right-align with the table; sit just above it. clamp so it stays in
+       viewport if the table is near the top of the screen. */
+    var top = rect.top - 28;
+    if (top < 4) top = rect.top + 4;
+    _wfDelTableBtn.style.top = top + 'px';
+    _wfDelTableBtn.style.right = Math.max(8, window.innerWidth - rect.right) + 'px';
+  }
+  function _wfHideDeleteTableBtn() {
+    _wfActiveTable = null;
+    if (_wfDelTableBtn) _wfDelTableBtn.style.display = 'none';
+  }
+  /* Show/hide the button as the user clicks around */
+  el.addEventListener('click', function(e) {
+    var table = _wfFindAncestor(e.target, 'TABLE');
+    if (table && el.contains(table)) {
+      _wfShowDeleteTableBtn(table);
+    } else {
+      _wfHideDeleteTableBtn();
+    }
+  });
+  /* Reposition on scroll/resize while a table is active */
+  function _wfRepositionDelBtn() {
+    if (_wfActiveTable && _wfDelTableBtn && _wfDelTableBtn.style.display !== 'none') {
+      /* If the table was removed from the DOM (e.g. via Backspace), drop it */
+      if (!document.body.contains(_wfActiveTable)) {
+        _wfHideDeleteTableBtn();
+        return;
+      }
+      _wfShowDeleteTableBtn(_wfActiveTable);
+    }
+  }
+  window.addEventListener('scroll', _wfRepositionDelBtn, true);
+  window.addEventListener('resize', _wfRepositionDelBtn);
+  /* Hide when the editor loses focus — but not immediately, because the user
+     might be clicking the delete button itself. The mousedown handler on the
+     button preventDefaults to keep the editor focused, but blurring elsewhere
+     should clear. Use a small timeout so the button click can fire first. */
+  el.addEventListener('blur', function() {
+    setTimeout(function() {
+      if (document.activeElement !== el && _wfDelTableBtn !== document.activeElement) {
+        _wfHideDeleteTableBtn();
+      }
+    }, 150);
+  });
+
+
   el.addEventListener('keydown', function(e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       /* If inside a list or table, let the browser handle it (creates new li/row). */
@@ -277,6 +359,58 @@ window.wfEditorAttach = function(el, opts) {
         opts.onSubmit(el.innerHTML);
       }
       return;
+    }
+
+    if (e.key === 'Backspace') {
+      /* Backspace inside an empty table cell: delete the current row. If that
+         was the last row, delete the whole table.
+         We only do this when the cell is empty (no text, no images, no nested
+         elements with content) — otherwise normal Backspace character-delete
+         applies. This is the "gentle" mode: you have to clear the cell first.
+         The aggressive alternative (delete row on any Backspace at start of
+         cell) is too easy to trigger accidentally and would lose data. */
+      var sel = window.getSelection();
+      var anchor = sel.anchorNode;
+      var cell = _wfFindAncestor(anchor, 'TD') || _wfFindAncestor(anchor, 'TH');
+      if (cell) {
+        /* "Empty" = no visible content. textContent.trim() === '' covers text;
+           we also reject cells that contain images or any non-empty children. */
+        var hasMedia = cell.querySelector('img, video, .wf-time-chip, table');
+        var isEmpty = !hasMedia && (cell.textContent || '').trim() === '';
+        if (isEmpty) {
+          e.preventDefault();
+          var row = cell.parentNode;  /* TR */
+          var table = _wfFindAncestor(row, 'TABLE');
+          var nextFocus = null;
+          /* Find where to put the caret after deletion: prefer the cell in the
+             same column of the next row, then the previous row, then the
+             element after the table (if we're deleting the whole table). */
+          var rowIdx = Array.prototype.indexOf.call(table ? table.querySelectorAll('tr') : [], row);
+          var cellIdx = Array.prototype.indexOf.call(row.children, cell);
+          if (table) {
+            var allRows = table.querySelectorAll('tr');
+            if (allRows.length > 1) {
+              /* Pick the row that will replace this one in screen position */
+              var targetRow = allRows[rowIdx + 1] || allRows[rowIdx - 1];
+              if (targetRow && targetRow.children[cellIdx]) {
+                nextFocus = targetRow.children[cellIdx];
+              } else if (targetRow) {
+                nextFocus = targetRow.firstElementChild;
+              }
+              row.parentNode.removeChild(row);
+            } else {
+              /* Last row — drop the whole table. Caret goes to the element
+                 after the table, or before it if there's nothing after. */
+              nextFocus = table.nextElementSibling || table.previousElementSibling || el;
+              table.parentNode.removeChild(table);
+            }
+          }
+          if (nextFocus) _wfMoveCaretInto(nextFocus);
+          markDirty();
+          return;
+        }
+        /* Cell has content — fall through to default Backspace */
+      }
     }
 
     if (e.key === 'Tab') {
