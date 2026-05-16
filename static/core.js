@@ -85,6 +85,15 @@ async function boot() {
   }
   buildSidebarNav();
   await load();
+  /* Initial view render. load() deliberately doesn't call loadView() because
+     it's also used for periodic refresh of sidebar counts — a periodic render
+     would wipe in-progress forms. So the first render is our responsibility
+     here. Mark the active nav item too. */
+  document.querySelectorAll('.nav-item').forEach(el => {
+    const id = el.id.replace('nav-', '');
+    el.classList.toggle('active', id === S.view);
+  });
+  await loadView();
   setInterval(load, 600000);
   /* One-time daily check-in: prompt about any active runs from previous days.
      Wrapped in setTimeout(0) so the initial view renders first — otherwise the
@@ -127,12 +136,23 @@ function applySettings() {
   const sb = document.getElementById('sidebar');
   if (zone && sb && !zone.dataset.bound) {
     zone.dataset.bound = '1';
-    /* Show sidebar on either the zone or the sidebar itself receiving the mouse. */
-    const show = () => { if (S.settings.sidebar_auto_hide) sb.classList.add('peek'); };
-    const hide = () => { sb.classList.remove('peek'); };
-    zone.addEventListener('mouseenter', show);
-    sb.addEventListener('mouseenter', show);
-    sb.addEventListener('mouseleave', hide);
+    /* Delayed show: 300ms hover threshold. Casual mouse movement past the left
+       edge shouldn't trigger the panel. The timer is cancelled if the mouse
+       leaves before it fires. */
+    var peekTimer = null;
+    const showSoon = () => {
+      if (!S.settings.sidebar_auto_hide) return;
+      if (peekTimer) clearTimeout(peekTimer);
+      peekTimer = setTimeout(() => { sb.classList.add('peek'); }, 300);
+    };
+    const cancelOrHide = (hide) => {
+      if (peekTimer) { clearTimeout(peekTimer); peekTimer = null; }
+      if (hide) sb.classList.remove('peek');
+    };
+    zone.addEventListener('mouseenter', showSoon);
+    zone.addEventListener('mouseleave', () => cancelOrHide(false));
+    sb.addEventListener('mouseenter', showSoon);
+    sb.addEventListener('mouseleave', () => cancelOrHide(true));
   }
 }
 window.applySettings = applySettings;
