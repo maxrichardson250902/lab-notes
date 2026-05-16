@@ -735,7 +735,13 @@ async function spSaveRunToEntry(runId) {
   var done  = rs.steps.filter(function(s) { return s.done; }).length;
   var devs  = rs.steps.filter(function(s) { return s.deviation.trim(); });
   var inc   = rs.steps.filter(function(s) { return !s.done; });
+  /* Default to today, but honour an override date set by the daily check-in
+     popup (window._spOverrideDate). The override is consumed once and cleared. */
   var today = new Date().toISOString().split('T')[0];
+  if (window._spOverrideDate) {
+    today = window._spOverrideDate;
+    window._spOverrideDate = null;
+  }
   var volCol = _volColIndex(rs.recipe.columns);
 
   var lines = ['## Protocol Run: ' + rs.protocol.title, '', '**Date:** ' + new Date(rs.startedAt).toLocaleString(), '**Progress:** ' + done + ' / ' + rs.steps.length + ' steps completed', ''];
