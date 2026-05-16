@@ -51,10 +51,28 @@ async function renderSettings(el) {
 
   var s = S.settings || {};
 
-  /* Build the options list for select-type settings that pull from views. */
-  var viewOptions = (typeof _navItems !== 'undefined' && _navItems)
-    ? _navItems.map(function(it) { return { value: it.name, label: it.label }; })
-    : [{ value: 'notebook', label: 'Notebook' }];
+  /* List of views that make sense as a default. Kept in sync with the sidebar
+     in index.dev.html. _navItems is intentionally not used here because the
+     sidebar is HTML-defined (not registered programmatically) so _navItems is
+     empty. If the sidebar grows a new view, add it here too. */
+  var viewOptions = [
+    { value: 'notebook', label: 'Notebook' },
+    { value: 'workflow', label: 'Daily Workflow' },
+    { value: 'protocols', label: 'Protocol Library' },
+    { value: 'summaries', label: 'Project Summaries' },
+    { value: 'pipeline', label: 'Pipeline' },
+    { value: 'timeline', label: 'Project Timelines' },
+    { value: 'predictions', label: 'Predicted Tasks' },
+    { value: 'reminders', label: 'Reminders' },
+    { value: 'cloning', label: 'Cloning Workbench' },
+    { value: 'circuits', label: 'Circuits' },
+    { value: 'import_data', label: 'DNA Manager' },
+    { value: 'gel_annotation', label: 'Gel Annotation' },
+    { value: 'sanger', label: 'Sanger' },
+    { value: 'dilution', label: 'Dilution Calculator' },
+    { value: 'tm_calc', label: 'Tm Calculator' },
+    { value: 'scratch', label: 'Scratch Pad' },
+  ];
 
   var html = '<div style="max-width:680px">';
   html += '<h2 style="font-family:var(--serif);font-size:24px;font-weight:600;margin-bottom:6px">Settings</h2>';
