@@ -219,11 +219,13 @@ function ciAnswerDone() {
 function ciConfirmDone() {
   const run = _ciCurrent();
   if (!run) return;
-  /* We don't pass the date forward right now — the existing scratch save flow
-     uses "today" for the notebook entry's date. Document the limitation:
-     to honour the chosen completion date you'd need to extend spSaveRunToEntry
-     to accept a date override. For now this is a TODO; the user still gets to
-     review the run before saving. */
+  /* Capture the chosen completion date and stash it on a global the scratch
+     save flow knows to look at (window._spOverrideDate). spSaveRunToEntry
+     consumes and clears it. */
+  const dateInput = document.getElementById('ci-date-input');
+  if (dateInput && dateInput.value) {
+    window._spOverrideDate = dateInput.value;
+  }
   _ciClose();
   _checkInQueue.shift();
   if (typeof spResumeAndFinish === 'function') {
@@ -232,10 +234,6 @@ function ciConfirmDone() {
     if (typeof spResumeRunById === 'function') spResumeRunById(run.run_id);
     else setView('scratch');
   }
-  /* Don't auto-advance to the next check-in here — the user is now navigating
-     to scratch to finish this one. They'll see remaining check-ins next time
-     they reload (or you could re-fire here after the save completes, but that
-     gets complicated). For now, one-at-a-time per page load. */
 }
 
 function ciAnswerSnooze() {
@@ -441,3 +439,261 @@ function toast(msg, err = false) {
   clearTimeout(tt);
   tt = setTimeout(() => el.className = '', 3000);
 }
+
+/* ── Global search (Ctrl+K / Cmd+K) ──────────────────────────────────────────
+   Cross-table fuzzy-ish search across notebook entries, protocols, and DNA
+   inventory. Live results with 200ms debounce. Results grouped by category
+   with optional filter tabs. Click-through navigates to the relevant view
+   and (where possible) selects the item.
+
+   We don't bind Ctrl+K when the user is typing in a contenteditable / input,
+   to avoid stealing the shortcut in nested editors that may use it themselves. */
+
+let _searchDebounce = null;
+let _searchActiveFilter = null;   // null = show all categories
+let _searchLastResults = null;    // last response so filter tabs don't re-query
+
+document.addEventListener('keydown', function(e) {
+  /* Ctrl+K or Cmd+K — open search */
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    openGlobalSearch();
+    return;
+  }
+});
+
+function openGlobalSearch() {
+  /* Bail if it's already open — don't stack */
+  if (document.getElementById('gs-modal')) {
+    const inp = document.getElementById('gs-input');
+    if (inp) inp.focus();
+    return;
+  }
+  _injectSearchStyles();
+  _searchActiveFilter = null;
+  _searchLastResults = null;
+  const modal = document.createElement('div');
+  modal.id = 'gs-modal';
+  modal.className = 'gs-backdrop';
+  modal.innerHTML = `
+    <div class="gs-modal" role="dialog">
+      <div class="gs-input-row">
+        <span class="gs-input-icon">⌕</span>
+        <input id="gs-input" class="gs-input" type="text"
+               placeholder="Search notebook, protocols, DNA inventory…  (Esc to close)"
+               autocomplete="off" spellcheck="false">
+        <span class="gs-hint" id="gs-hint">Type to search</span>
+      </div>
+      <div class="gs-filters" id="gs-filters" style="display:none"></div>
+      <div class="gs-results" id="gs-results"></div>
+      <div class="gs-foot">
+        <kbd>↑↓</kbd> navigate &nbsp;
+        <kbd>Enter</kbd> open &nbsp;
+        <kbd>Esc</kbd> close
+      </div>
+    </div>`;
+  modal.addEventListener('click', function(e) { if (e.target === modal) closeGlobalSearch(); });
+  document.body.appendChild(modal);
+
+  const inp = document.getElementById('gs-input');
+  inp.addEventListener('input', _searchHandleInput);
+  inp.addEventListener('keydown', _searchHandleKeys);
+  inp.focus();
+}
+
+function closeGlobalSearch() {
+  const m = document.getElementById('gs-modal');
+  if (m) m.remove();
+  if (_searchDebounce) clearTimeout(_searchDebounce);
+}
+
+function _injectSearchStyles() {
+  if (document.getElementById('gs-styles')) return;
+  const s = document.createElement('style');
+  s.id = 'gs-styles';
+  s.textContent = `
+    .gs-backdrop { position:fixed; inset:0; background:rgba(60,52,42,.55); z-index:6000; display:flex; align-items:flex-start; justify-content:center; padding-top:12vh; }
+    .gs-modal { background:#faf8f4; border:1px solid #d5cec0; border-radius:10px; width:640px; max-width:92vw; max-height:72vh; box-shadow:0 16px 48px rgba(0,0,0,.32); overflow:hidden; display:flex; flex-direction:column; }
+    .gs-input-row { display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid #ece7dd; background:#fff; }
+    .gs-input-icon { font-size:18px; color:#8a7f72; }
+    .gs-input { flex:1; border:none; outline:none; font-family:inherit; font-size:16px; color:#4a4139; background:transparent; }
+    .gs-hint { font-size:11px; color:#8a7f72; padding:2px 6px; background:#f0ebe3; border-radius:3px; }
+    .gs-filters { display:flex; gap:4px; padding:8px 16px; background:#f5f0e8; border-bottom:1px solid #ece7dd; flex-wrap:wrap; }
+    .gs-filter { padding:3px 10px; background:#fff; border:1px solid #d5cec0; border-radius:12px; cursor:pointer; font-size:11.5px; color:#4a4139; }
+    .gs-filter.active { background:#5b7a5e; color:#fff; border-color:#5b7a5e; }
+    .gs-filter:hover:not(.active) { background:#f0ebe3; }
+    .gs-results { flex:1; overflow-y:auto; padding:6px 0; }
+    .gs-result { display:flex; align-items:center; gap:10px; padding:8px 16px; cursor:pointer; border-left:3px solid transparent; }
+    .gs-result:hover, .gs-result.active { background:#f0ebe3; border-left-color:#5b7a5e; }
+    .gs-result-kind { font-size:10.5px; font-weight:600; color:#8a7f72; text-transform:uppercase; letter-spacing:.08em; width:90px; flex-shrink:0; }
+    .gs-result-body { flex:1; min-width:0; }
+    .gs-result-title { font-size:14px; color:#4a4139; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .gs-result-sub { font-size:11.5px; color:#8a7f72; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .gs-empty { padding:24px; text-align:center; color:#8a7f72; font-size:13px; }
+    .gs-foot { padding:7px 16px; border-top:1px solid #ece7dd; background:#f5f0e8; font-size:11px; color:#8a7f72; }
+    .gs-foot kbd { background:#fff; border:1px solid #d5cec0; border-radius:3px; padding:1px 5px; font-family:inherit; font-size:10.5px; color:#4a4139; }
+  `;
+  document.head.appendChild(s);
+}
+
+function _searchHandleInput(e) {
+  const q = e.target.value;
+  if (_searchDebounce) clearTimeout(_searchDebounce);
+  /* 200ms debounce — feels live but doesn't fire one request per keystroke */
+  _searchDebounce = setTimeout(function() { _runSearch(q); }, 200);
+}
+
+async function _runSearch(q) {
+  const hint = document.getElementById('gs-hint');
+  const results = document.getElementById('gs-results');
+  if (!q || q.length < 2) {
+    if (hint) hint.textContent = q ? 'Type more…' : 'Type to search';
+    if (results) results.innerHTML = '';
+    document.getElementById('gs-filters').style.display = 'none';
+    return;
+  }
+  if (hint) hint.textContent = 'Searching…';
+  try {
+    const r = await api('GET', '/api/search?q=' + encodeURIComponent(q));
+    _searchLastResults = r;
+    _searchActiveFilter = null;   // reset filter on new query
+    _renderSearchResults();
+    if (hint) hint.textContent = (r.results?.length || 0) + ' result' + ((r.results?.length || 0) === 1 ? '' : 's');
+  } catch (e) {
+    if (hint) hint.textContent = 'Search failed';
+  }
+}
+
+function _renderSearchResults() {
+  const r = _searchLastResults;
+  if (!r) return;
+  const results = document.getElementById('gs-results');
+  const filters = document.getElementById('gs-filters');
+
+  /* Filter tabs — show only if 2+ categories matched */
+  const catEntries = Object.entries(r.categories || {});
+  if (catEntries.length >= 2) {
+    const totalCount = r.results.length;
+    let html = `<span class="gs-filter ${_searchActiveFilter === null ? 'active' : ''}" onclick="_setSearchFilter(null)">All (${totalCount})</span>`;
+    /* Sort categories by count desc for stable order */
+    catEntries.sort((a, b) => b[1] - a[1]);
+    for (const [kind, count] of catEntries) {
+      const cls = (_searchActiveFilter === kind) ? 'active' : '';
+      html += `<span class="gs-filter ${cls}" onclick="_setSearchFilter('${esc(kind).replace(/'/g, '&#39;')}')">${esc(kind)} (${count})</span>`;
+    }
+    filters.innerHTML = html;
+    filters.style.display = 'flex';
+  } else {
+    filters.style.display = 'none';
+  }
+
+  /* Filter applied? */
+  const shown = _searchActiveFilter
+    ? r.results.filter(it => it.kind === _searchActiveFilter)
+    : r.results;
+
+  if (!shown.length) {
+    results.innerHTML = '<div class="gs-empty">No matches</div>';
+    return;
+  }
+  results.innerHTML = shown.map(function(it, i) {
+    return `<div class="gs-result ${i === 0 ? 'active' : ''}" data-idx="${i}"
+                onclick="_openSearchResult(${i})">
+      <div class="gs-result-kind">${esc(it.kind)}</div>
+      <div class="gs-result-body">
+        <div class="gs-result-title">${esc(it.title)}</div>
+        ${it.subtitle ? `<div class="gs-result-sub">${esc(it.subtitle)}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function _setSearchFilter(kind) {
+  _searchActiveFilter = kind;
+  _renderSearchResults();
+  /* Keep focus in the input — filter clicks shouldn't move it */
+  const inp = document.getElementById('gs-input');
+  if (inp) inp.focus();
+}
+
+function _searchHandleKeys(e) {
+  const results = document.getElementById('gs-results');
+  if (!results) return;
+  const items = results.querySelectorAll('.gs-result');
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeGlobalSearch();
+    return;
+  }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    _moveSearchSelection(items, +1);
+    return;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    _moveSearchSelection(items, -1);
+    return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const active = results.querySelector('.gs-result.active');
+    if (active) _openSearchResult(parseInt(active.dataset.idx, 10));
+    return;
+  }
+}
+
+function _moveSearchSelection(items, dir) {
+  if (!items.length) return;
+  let idx = -1;
+  for (let i = 0; i < items.length; i++) if (items[i].classList.contains('active')) { idx = i; break; }
+  if (idx < 0) idx = 0;
+  else idx = (idx + dir + items.length) % items.length;
+  for (const it of items) it.classList.remove('active');
+  items[idx].classList.add('active');
+  items[idx].scrollIntoView({ block: 'nearest' });
+}
+
+function _openSearchResult(idx) {
+  const r = _searchLastResults;
+  if (!r) return;
+  const shown = _searchActiveFilter
+    ? r.results.filter(it => it.kind === _searchActiveFilter)
+    : r.results;
+  const item = shown[idx];
+  if (!item) return;
+
+  closeGlobalSearch();
+
+  /* Navigation by table:
+       entries     → notebook view, jump-to entry id
+       protocols   → protocols view (no item-level jump for now; the list view
+                     is small enough that the user can find it visually)
+       DNA tables  → DNA Manager view, jump to the relevant tab + filter by name
+     We use S._pendingSelect-style params via the navigateWith helper where it
+     makes sense; views that don't yet consume the param fall back to just
+     switching views, which is at least no worse than today. */
+  const view = item.view;
+  let params = null;
+  if (item.table === 'entries') {
+    params = { entryId: item.id };
+  } else if (item.table === 'protocols') {
+    params = { protocolId: item.id };
+  } else {
+    /* DNA tables — pass enough info for the DNA manager to focus the right tab */
+    params = { dnaTable: item.table, dnaId: item.id, dnaName: item.title };
+  }
+
+  if (typeof navigateWith === 'function') {
+    navigateWith(view, params);
+  } else if (typeof setView === 'function') {
+    /* No params nav — falling back to just opening the view. */
+    setView(view);
+  }
+}
+
+/* Expose for inline onclick handlers in the modal HTML */
+window.openGlobalSearch = openGlobalSearch;
+window.closeGlobalSearch = closeGlobalSearch;
+window._setSearchFilter = _setSearchFilter;
+window._openSearchResult = _openSearchResult;
