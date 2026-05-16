@@ -30,6 +30,9 @@ DEFAULTS = {
     "default_view": "notebook",
     # Sidebar auto-hide on view change with hover-to-reveal
     "sidebar_auto_hide": False,
+    # Delay (ms) before the auto-hidden sidebar peeks out when the user hovers
+    # the left edge. Lower = snappier; higher = avoids accidental triggers.
+    "sidebar_peek_delay_ms": 150,
     # Debounce for auto-save in editors (workflow doc, scratch). Milliseconds.
     "auto_save_delay_ms": 1500,
 }
@@ -114,6 +117,14 @@ def update_settings(body: SettingsUpdate):
                 continue
             # Clamp 300ms..10s — anything outside this range is a mistake.
             v = max(300, min(v, 10_000))
+        elif k == "sidebar_peek_delay_ms":
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            # 0..3000ms — 0 = instant, 3s is the upper bound before it stops
+            # feeling like a hover and starts feeling broken.
+            v = max(0, min(v, 3000))
         elif k == "sidebar_auto_hide":
             v = bool(v)
         elif k == "default_view":
