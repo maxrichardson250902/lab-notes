@@ -1,5 +1,23 @@
 // ── NOTEBOOK ──────────────────────────────────────────────────────────────────
 async function renderNotebook(el){
+  /* Honour cross-view navigation from global search (Ctrl+K).
+     A search-nav with entryId should: fetch the entry → switch into its book →
+     scroll to it. We do this here so we have full control over the navigation
+     before the dashboard render kicks in. */
+  var navParams = (typeof consumeNavParams === 'function') ? consumeNavParams('notebook') : null;
+  if (navParams && navParams.entryId) {
+    try {
+      var entry = await api('GET', '/api/entries/' + navParams.entryId);
+      if (entry && entry.group_name) {
+        S.nbBook = entry.group_name;
+        /* Set both the book AND the page so the editor opens to this entry's date */
+        S.nbPage = entry.date;
+        S.filterGroup = entry.group_name;
+        S._nbScrollToEntry = entry.id;
+      }
+    } catch (e) { /* fall through */ }
+  }
+
   if(S.nbBook){
     await renderNotebookBook(el);
     return;
@@ -273,6 +291,17 @@ async function renderNotebookBook(el){
           if(ev.target.files[0]) uploadEntryImage(e.id,ev.target.files[0]);
         });
       });
+    }
+    /* Search-nav scroll target: clear and act on it after render. */
+    if (S._nbScrollToEntry) {
+      var target = document.getElementById('nbe-' + S._nbScrollToEntry);
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        target.style.transition = 'box-shadow 1.2s';
+        target.style.boxShadow = '0 0 0 3px #5b7a5e';
+        setTimeout(function() { target.style.boxShadow = 'none'; }, 1800);
+      }
+      S._nbScrollToEntry = null;
     }
   },0);
 }
