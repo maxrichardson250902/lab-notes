@@ -233,9 +233,12 @@ async function _wfLoadDoc() {
 }
 function _wfDocDebouncedSave() {
   if (_wfDocSaveTimer) clearTimeout(_wfDocSaveTimer);
+  /* Delay comes from user settings (auto_save_delay_ms); fall back to 1500ms
+     if settings aren't loaded yet for any reason. */
+  var delay = (S.settings && S.settings.auto_save_delay_ms) || 1500;
   _wfDocSaveTimer = setTimeout(function() {
     if (window._wfDocApi) _wfSaveDoc(window._wfDocApi.getHtml());
-  }, 1500);
+  }, delay);
 }
 async function _wfSaveDoc(html) {
   if (!window._wfDocApi) return;
