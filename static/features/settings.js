@@ -33,6 +33,16 @@ var SETTINGS_SPEC = [
     type: 'toggle',
   },
   {
+    key: 'sidebar_peek_delay_ms',
+    label: 'Sidebar peek delay',
+    hint: 'How long to hover the left edge before the sidebar appears. Lower = snappier; higher = fewer accidental triggers.',
+    type: 'number',
+    min: 0,
+    max: 3000,
+    step: 50,
+    suffix: 'ms',
+  },
+  {
     key: 'auto_save_delay_ms',
     label: 'Auto-save delay',
     hint: 'How long to wait after you stop typing before auto-saving (workflow doc, scratchpad, etc.). Lower = saves more often but more network traffic.',
