@@ -35,7 +35,23 @@ async function renderWorkflow(el) {
     (_workflowDate < today
       ? '<button onclick="shiftDay(1)">Next &#8594;</button>'
       : '<button disabled style="opacity:.3">Next &#8594;</button>') +
-    '<button class="btn" id="wf-process-btn" onclick="processWorkflowDay()" title="Send this day\x27s notes to the 3090 to format into notebook entries" style="margin-left:10px">&#9881; Process day</button>' +
+    /* Short date for the button — full date in the title attribute. Two formats
+       to keep the button compact: today shows "today", any other day shows
+       "6 May" style. */
+    (function() {
+      var todayStr = new Date().toISOString().slice(0, 10);
+      var label;
+      if (_workflowDate === todayStr) {
+        label = '&#9881; Process today';
+      } else {
+        var dt = new Date(_workflowDate + 'T00:00:00');
+        var short = dt.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+        label = '&#9881; Process \u00b7 ' + short;
+      }
+      return '<button class="btn" id="wf-process-btn" onclick="processWorkflowDay()" ' +
+        'title="Send notes for ' + esc(_workflowDate) + ' to the 3090 to format into notebook entries" ' +
+        'style="margin-left:10px">' + label + '</button>';
+    })() +
   '</div>';
 
   // ── process-day progress overlay ──────────────────────────────────────────
@@ -471,8 +487,14 @@ async function wfOpenTagPicker() {
       '<div style="font-size:11.5px;color:#8a7f72;margin-bottom:8px">Click to toggle. Multiple allowed.</div>' +
       '<div id="wf-tag-chips" style="min-height:40px;padding:6px;background:#fff;border:1px solid #e0d9cd;border-radius:4px;margin-bottom:10px">' + chipsHtml + '</div>' +
       '<div style="display:flex;gap:6px;margin-bottom:10px">' +
-        '<input id="wf-tag-new" type="text" placeholder="New group name\u2026" style="flex:1;padding:5px 8px;border:1px solid #d5cec0;border-radius:4px;font-family:inherit" ' +
+        '<input id="wf-tag-new" type="text" list="wf-tag-suggestions" placeholder="New group name\u2026" ' +
+          'style="flex:1;padding:5px 8px;border:1px solid #d5cec0;border-radius:4px;font-family:inherit" ' +
           'onkeydown="if(event.key===\'Enter\'){event.preventDefault();wfAddNewTag();}">' +
+        /* datalist provides native browser autocomplete — uses candidate names
+           gathered above (notebook groups + already used in this doc). */
+        '<datalist id="wf-tag-suggestions">' +
+        groupNames.map(function(g) { return '<option value="' + esc(g) + '">'; }).join('') +
+        '</datalist>' +
         '<button class="wf-tool-btn" onclick="wfAddNewTag()">+ Add</button>' +
       '</div>' +
       '<div style="display:flex;justify-content:flex-end;gap:6px">' +
