@@ -51,6 +51,14 @@ let S = {
   sidebarOpen: true,
   nbBook: null,
   nbPage: null,
+  /* User settings — fetched on boot from /api/settings. Defaults here so any
+     code that reads S.settings before boot completes gets sensible values. */
+  settings: {
+    wide_view_max_px: 1800,
+    default_view: 'notebook',
+    sidebar_auto_hide: false,
+    auto_save_delay_ms: 1500,
+  },
 };
 
 // ── API helper ───────────────────────────────────────────────────────────────
@@ -64,6 +72,17 @@ async function api(method, path, body) {
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 async function boot() {
+  /* Load user settings BEFORE building nav or loading the initial view, so the
+     default-view setting can drive which view appears first and CSS variables
+     are set before any render. */
+  await loadSettings();
+  applySettings();
+  /* Honour default_view from settings — but only if the user hasn't already
+     navigated somewhere via URL hash etc. We don't have URL routing yet, so
+     just respect the setting. */
+  if (S.settings.default_view && S.settings.default_view !== S.view) {
+    S.view = S.settings.default_view;
+  }
   buildSidebarNav();
   await load();
   setInterval(load, 600000);
@@ -72,6 +91,51 @@ async function boot() {
      popup appears before the user has any UI context. */
   setTimeout(checkStaleRuns, 0);
 }
+
+/* ── Settings load / apply ────────────────────────────────────────────────
+   `loadSettings` fetches from the backend and merges into S.settings.
+   `applySettings` re-reads S.settings and applies the UI side: CSS variable
+   for the wide-view cap, body class for sidebar auto-hide.
+   The settings feature module (features/settings.js) calls applySettings()
+   after a user changes a setting. */
+async function loadSettings() {
+  try {
+    const s = await api('GET', '/api/settings');
+    /* Merge — keep defaults for any keys the server somehow omitted. */
+    Object.assign(S.settings, s);
+  } catch (e) {
+    /* Older backend without /api/settings — silently use defaults. */
+  }
+}
+
+function applySettings() {
+  const s = S.settings || {};
+  /* Wide-view cap: a value of 0 means "no cap" (full viewport width).
+     The stylesheet's .content.wide rule reads from var(--wide-cap). */
+  const cap = (typeof s.wide_view_max_px === 'number' && s.wide_view_max_px > 0)
+    ? s.wide_view_max_px + 'px'
+    : 'none';
+  document.documentElement.style.setProperty('--wide-cap', cap);
+  /* Sidebar auto-hide on view change. The CSS hook (.auto-hide-sidebar on body)
+     plus the JS hook in setView take it from here. */
+  document.body.classList.toggle('auto-hide-sidebar', !!s.sidebar_auto_hide);
+  /* Bind peek-zone hover once. Pure-CSS would work if peek-zone and sidebar
+     shared a parent that responds to :hover-within, but they're siblings under
+     <body>, so we use JS. The handler is idempotent — second binding is no-op
+     because we mark the element. */
+  const zone = document.getElementById('sidebar-peek-zone');
+  const sb = document.getElementById('sidebar');
+  if (zone && sb && !zone.dataset.bound) {
+    zone.dataset.bound = '1';
+    /* Show sidebar on either the zone or the sidebar itself receiving the mouse. */
+    const show = () => { if (S.settings.sidebar_auto_hide) sb.classList.add('peek'); };
+    const hide = () => { sb.classList.remove('peek'); };
+    zone.addEventListener('mouseenter', show);
+    sb.addEventListener('mouseenter', show);
+    sb.addEventListener('mouseleave', hide);
+  }
+}
+window.applySettings = applySettings;
 
 /* ── Daily check-in for stale protocol runs ───────────────────────────────
    On app load, ask the user whether each pre-today active run is finished,
@@ -340,6 +404,15 @@ async function load() {
 }
 
 function setView(v) {
+  /* Save the outgoing view's scroll position so it can be restored on return.
+     Views opt in by having a module-level _<key>ScrollY that we know about
+     here — currently cloning + circuits. Keeping the list small avoids the
+     temptation to over-engineer this into a generic registry. */
+  var content = document.getElementById('content');
+  var sy = content ? content.scrollTop : 0;
+  if (S.view === 'cloning' && typeof _clScrollY !== 'undefined') _clScrollY = sy;
+  if (S.view === 'circuits' && typeof _cdScrollY !== 'undefined') _cdScrollY = sy;
+
   S.view = v;
   S.filterGroup = '';
   if (v === 'notebook') { S.nbBook = null; S.nbPage = null; }
@@ -354,7 +427,7 @@ function setView(v) {
     workflow: 'Daily Workflow', scratch: 'Scratch Pad', reminders: 'Reminders',
     'import': 'Import from OneNote', timeline: 'Project Timelines',
     predictions: 'Predicted Tasks', dilution: 'Dilution Calculator',
-    DNAmanager: 'DNAmanager',
+    DNAmanager: 'DNAmanager', settings: 'Settings',
   };
   document.getElementById('page-title').textContent = titles[v] || v;
 
@@ -363,6 +436,14 @@ function setView(v) {
   else if (v === 'protocols') { btn.textContent = '+ Add protocol'; btn.style.display = ''; }
   else if (v === 'reminders') { btn.textContent = '+ Reminder'; btn.style.display = ''; }
   else                        { btn.style.display = 'none'; }
+
+  /* Auto-hide sidebar after a view change: in auto-hide mode the sidebar
+     should collapse out of the way once the user has made a choice. The
+     `peek` class is removed so hover-reveal is the only way back. */
+  if (S.settings && S.settings.sidebar_auto_hide) {
+    const sb = document.getElementById('sidebar');
+    if (sb) sb.classList.remove('peek');
+  }
 
   loadView();
 }
