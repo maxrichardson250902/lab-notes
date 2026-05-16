@@ -125,6 +125,31 @@ function _dnaRenderTable() {
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function renderDnaManager(el) {
+  /* Consume search-nav params from global search.
+     dnaTable values come from the DB table names; we map them to the local
+     tab-key convention (mostly identical except kit_parts → kitParts). */
+  var navParams = (typeof consumeNavParams === 'function') ? consumeNavParams('import_data') : null;
+  if (navParams && navParams.dnaTable) {
+    var TABLE_TO_TAB = {
+      primers: 'primers',
+      plasmids: 'plasmids',
+      gblocks: 'gblocks',
+      kit_parts: 'kitParts',
+      parts: 'parts',
+    };
+    var tab = TABLE_TO_TAB[navParams.dnaTable];
+    if (tab) {
+      _dna.tab = tab;
+      /* Pre-fill the per-tab search box with the item's name so it stands out
+         in the list. Cleared next render unless the user types something. */
+      if (navParams.dnaName) {
+        _dna.search[tab] = navParams.dnaName;
+      }
+      /* Remember the id so we can highlight the row after render. */
+      _dna._scrollToId = navParams.dnaId;
+      _dna._scrollToTab = tab;
+    }
+  }
   await _dnaLoadAll();
 
   var html = '<div class="dna-manager">';
@@ -184,6 +209,33 @@ async function renderDnaManager(el) {
 
   html += _dnaStyles();
   el.innerHTML = html;
+
+  /* Search-nav highlight: find the row whose visible text contains the
+     navigated item's name and flash it. This is a heuristic (rows have no
+     stable DOM ids tied to row id) but works well enough since we've already
+     pre-filtered the table to just that name. */
+  if (_dna._scrollToId && _dna._scrollToTab === _dna.tab) {
+    var targetName = (_dna.search[_dna.tab] || '').toLowerCase();
+    setTimeout(function() {
+      var rows = el.querySelectorAll('tr');
+      var found = null;
+      for (var i = 0; i < rows.length; i++) {
+        if (targetName && rows[i].textContent.toLowerCase().indexOf(targetName) !== -1) {
+          found = rows[i];
+          break;
+        }
+      }
+      if (found) {
+        found.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        found.style.transition = 'background-color 1.2s';
+        var orig = found.style.backgroundColor;
+        found.style.backgroundColor = '#fff4d6';
+        setTimeout(function() { found.style.backgroundColor = orig; }, 1600);
+      }
+      _dna._scrollToId = null;
+      _dna._scrollToTab = null;
+    }, 50);
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
