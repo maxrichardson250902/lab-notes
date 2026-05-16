@@ -211,37 +211,57 @@ def get_reference_sequence(ref_source, ref_id=None, ref_text=None):
 
 @router.get("/sanger/references")
 def list_references():
-    """Return all DNA items with .gb files across all inventory tables."""
+    """Return all DNA items with .gb files across all inventory tables.
+    Each item carries a `meta` string with table-specific disambiguating context
+    (project, kit_name, subcategory) so similarly-named items can be told apart
+    in the dropdown."""
     items = []
+    # Each tuple: (table, label, prefix, [meta_cols]). meta_cols are columns to
+    # join (filtering blanks) into the meta hint shown after the name.
     tables = [
-        ("plasmids", "Plasmid", "plasmid"),
-        ("kit_parts", "Kit Part", "kit_part"),
-        ("parts", "Part", "part"),
-        ("gblocks", "gBlock", "gblock"),
-        ("primers", "Primer", "primer"),
+        ("plasmids",  "Plasmid",  "plasmid",  ["project"]),
+        ("kit_parts", "Kit Part", "kit_part", ["kit_name", "part_type"]),
+        ("parts",     "Part",     "part",     ["project", "subcategory", "part_type"]),
+        ("gblocks",   "gBlock",   "gblock",   ["project"]),
+        ("primers",   "Primer",   "primer",   ["project", "use"]),
     ]
     gb_dir = pathlib.Path("/data/gb_files")
     with get_db() as conn:
-        for table, label, prefix in tables:
+        for table, label, prefix, meta_cols in tables:
+            # SELECT id, name, gb_file, <meta_cols>. Build dynamically but only
+            # include columns we know exist for this table (defensive against
+            # older schemas missing newer columns).
+            try:
+                existing_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            except Exception:
+                continue
+            present_meta = [c for c in meta_cols if c in existing_cols]
+            select_cols = ["id", "name", "gb_file"] + present_meta
             try:
                 rows = conn.execute(
-                    f"SELECT id, name, gb_file FROM {table} WHERE gb_file IS NOT NULL AND gb_file != ''"
+                    f"SELECT {', '.join(select_cols)} FROM {table} "
+                    f"WHERE gb_file IS NOT NULL AND gb_file != ''"
                 ).fetchall()
             except Exception:
                 continue
             for r in rows:
-                # Check file exists via either naming convention
                 has_file = (
                     (gb_dir / f"{prefix}_{r['id']}.gb").exists() or
                     (gb_dir / r["gb_file"]).exists()
                 )
                 if not has_file:
                     continue
+                meta_parts = []
+                for c in present_meta:
+                    v = r[c]
+                    if v is not None and str(v).strip():
+                        meta_parts.append(str(v).strip())
                 items.append({
                     "id": r["id"],
                     "name": r["name"],
                     "type": table,
                     "label": label,
+                    "meta": " / ".join(meta_parts),
                 })
     return {"items": items}
 
