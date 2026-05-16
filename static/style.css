@@ -1,780 +1,336 @@
-/*
- * core.js — App shell, API helper, view registry, shared helpers.
- *
- * Feature JS files call registerView('name', renderFn) to plug in.
- * registerNav('name', {label, icon, section, countId}) to add sidebar items.
- */
-
-// ── View registry ────────────────────────────────────────────────────────────
-const _views = {};        // name -> async function(el)
-const _viewMeta = {};     // name -> { wide?: bool, ... }
-const _navItems = [];     // {name, label, icon, section, countId}
-
-function registerView(name, renderFn, opts) {
-  _views[name] = renderFn;
-  if (opts) _viewMeta[name] = opts;
+:root{
+  --bg:#f7f5f2;--surface:#ffffff;--surface2:#f0ede8;
+  --border:#e2ddd6;--border2:#cec8be;
+  --text:#2c2a27;--muted:#7a7368;--dim:#b0a89e;
+  --accent:#3d6b4f;--accent2:#2d5039;
+  --amber:#a0622a;--red:#b84040;--blue:#2a5080;
+  --tag-bg:#e8f0ec;--tag-color:#3d6b4f;
+  --mono:'JetBrains Mono',monospace;
+  --serif:'Crimson Pro',Georgia,serif;
+  --sans:'Inter',sans-serif;
 }
-
-function registerNav(name, opts) {
-  _navItems.push({ name, ...opts });
-}
-
-// ── Cross-view navigation params ─────────────────────────────────────────────
-// Single mechanism for "open view X with these params". Replaces ad-hoc flags
-// like S._pendingSelect / S._pendingSanger. Consumer calls consumeNavParams(view)
-// at the end of its renderer; the value is returned once then cleared.
-//
-// Example producer:    navigateWith('cloning', { type: 'plasmid', id: 42 });
-// Example consumer:    var p = consumeNavParams('cloning'); if (p) _clSelectSequence(p.type, p.id);
-function navigateWith(view, params) {
-  S._navParams = { view: view, params: params };
-  setView(view);
-}
-
-function consumeNavParams(view) {
-  if (S._navParams && S._navParams.view === view) {
-    var p = S._navParams.params;
-    S._navParams = null;
-    return p;
-  }
-  return null;
-}
-
-// ── Global state ─────────────────────────────────────────────────────────────
-let S = {
-  view: 'notebook',
-  filterGroup: '',
-  entries: [],
-  protocols: [],
-  summaries: [],
-  stats: {},
-  sidebarOpen: true,
-  nbBook: null,
-  nbPage: null,
-  /* User settings — fetched on boot from /api/settings. Defaults here so any
-     code that reads S.settings before boot completes gets sensible values. */
-  settings: {
-    wide_view_max_px: 1800,
-    default_view: 'notebook',
-    sidebar_auto_hide: false,
-    auto_save_delay_ms: 1500,
-  },
-};
-
-// ── API helper ───────────────────────────────────────────────────────────────
-async function api(method, path, body) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
-  if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(path, opts);
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-// ── Boot ─────────────────────────────────────────────────────────────────────
-async function boot() {
-  /* Load user settings BEFORE building nav or loading the initial view, so the
-     default-view setting can drive which view appears first and CSS variables
-     are set before any render. */
-  await loadSettings();
-  applySettings();
-  /* Honour default_view from settings — but only if the user hasn't already
-     navigated somewhere via URL hash etc. We don't have URL routing yet, so
-     just respect the setting. */
-  if (S.settings.default_view && S.settings.default_view !== S.view) {
-    S.view = S.settings.default_view;
-  }
-  buildSidebarNav();
-  await load();
-  setInterval(load, 600000);
-  /* One-time daily check-in: prompt about any active runs from previous days.
-     Wrapped in setTimeout(0) so the initial view renders first — otherwise the
-     popup appears before the user has any UI context. */
-  setTimeout(checkStaleRuns, 0);
-}
-
-/* ── Settings load / apply ────────────────────────────────────────────────
-   `loadSettings` fetches from the backend and merges into S.settings.
-   `applySettings` re-reads S.settings and applies the UI side: CSS variable
-   for the wide-view cap, body class for sidebar auto-hide.
-   The settings feature module (features/settings.js) calls applySettings()
-   after a user changes a setting. */
-async function loadSettings() {
-  try {
-    const s = await api('GET', '/api/settings');
-    /* Merge — keep defaults for any keys the server somehow omitted. */
-    Object.assign(S.settings, s);
-  } catch (e) {
-    /* Older backend without /api/settings — silently use defaults. */
-  }
-}
-
-function applySettings() {
-  const s = S.settings || {};
-  /* Wide-view cap: a value of 0 means "no cap" (full viewport width).
-     The stylesheet's .content.wide rule reads from var(--wide-cap). */
-  const cap = (typeof s.wide_view_max_px === 'number' && s.wide_view_max_px > 0)
-    ? s.wide_view_max_px + 'px'
-    : 'none';
-  document.documentElement.style.setProperty('--wide-cap', cap);
-  /* Sidebar auto-hide on view change. The CSS hook (.auto-hide-sidebar on body)
-     plus the JS hook in setView take it from here. */
-  document.body.classList.toggle('auto-hide-sidebar', !!s.sidebar_auto_hide);
-  /* Bind peek-zone hover once. Pure-CSS would work if peek-zone and sidebar
-     shared a parent that responds to :hover-within, but they're siblings under
-     <body>, so we use JS. The handler is idempotent — second binding is no-op
-     because we mark the element. */
-  const zone = document.getElementById('sidebar-peek-zone');
-  const sb = document.getElementById('sidebar');
-  if (zone && sb && !zone.dataset.bound) {
-    zone.dataset.bound = '1';
-    /* Show sidebar on either the zone or the sidebar itself receiving the mouse. */
-    const show = () => { if (S.settings.sidebar_auto_hide) sb.classList.add('peek'); };
-    const hide = () => { sb.classList.remove('peek'); };
-    zone.addEventListener('mouseenter', show);
-    sb.addEventListener('mouseenter', show);
-    sb.addEventListener('mouseleave', hide);
-  }
-}
-window.applySettings = applySettings;
-
-/* ── Daily check-in for stale protocol runs ───────────────────────────────
-   On app load, ask the user whether each pre-today active run is finished,
-   still going, or being cancelled. Blocks subsequent interaction until every
-   listed run is answered (or snoozed). Uses /api/active-runs/stale which
-   already filters out today's runs and currently-snoozed runs.
-
-   Re-checking: if you reload the page after answering, the same set won't
-   re-appear because answered = no longer in active_runs OR snoozed_until > now. */
-async function checkStaleRuns() {
-  let stale = [];
-  try {
-    const r = await api('GET', '/api/active-runs/stale');
-    stale = r.runs || [];
-  } catch (e) {
-    /* If the endpoint isn't available (older backend), skip silently rather
-       than blocking the app on a missing feature. */
-    return;
-  }
-  if (!stale.length) return;
-  _checkInQueue = stale.slice();
-  _showNextCheckIn();
-}
-
-let _checkInQueue = [];
-
-function _showNextCheckIn() {
-  if (!_checkInQueue.length) return;
-  const run = _checkInQueue[0];
-  let protocolTitle = 'Protocol';
-  try { protocolTitle = (JSON.parse(run.protocol_json || '{}').title) || protocolTitle; } catch (_) {}
-  const startedDate = (run.started_at || '').slice(0, 10);
-  const startedHuman = startedDate || 'unknown date';
-
-  /* Steps progress, if available */
-  let stepInfo = '';
-  try {
-    const steps = JSON.parse(run.steps_json || '[]');
-    const done = steps.filter(s => s.done).length;
-    stepInfo = `${done} / ${steps.length} steps done before this check-in`;
-  } catch (_) {}
-
-  /* Default the completion-date picker to the start date — matches "I started
-     it yesterday and finished it then but forgot to log it". User can change. */
-  const html = `
-    <div class="ci-backdrop">
-      <div class="ci-modal">
-        <div class="ci-title">Daily check-in</div>
-        <div class="ci-body">
-          <div class="ci-runline">
-            <div class="ci-runtitle">${esc(protocolTitle)}</div>
-            <div class="ci-runmeta">
-              ${run.group_name ? esc(run.group_name) + ' \u00b7 ' : ''}
-              Started <strong>${esc(startedHuman)}</strong>
-              ${stepInfo ? ' \u00b7 ' + esc(stepInfo) : ''}
-            </div>
-          </div>
-          <div class="ci-prompt">Are you still running this?</div>
-          <div class="ci-actions">
-            <button class="ci-btn ci-btn-done" onclick="ciAnswerDone()">
-              <div class="ci-btn-title">Mark done</div>
-              <div class="ci-btn-sub">Save to notebook</div>
-            </button>
-            <button class="ci-btn ci-btn-snooze" onclick="ciAnswerSnooze()">
-              <div class="ci-btn-title">Still running</div>
-              <div class="ci-btn-sub">Snooze 24h</div>
-            </button>
-            <button class="ci-btn ci-btn-cancel" onclick="ciAnswerCancel()">
-              <div class="ci-btn-title">Cancel run</div>
-              <div class="ci-btn-sub">Save as [CANCELLED]</div>
-            </button>
-          </div>
-          <div class="ci-date-row" id="ci-date-row" style="display:none">
-            <label class="ci-date-label">Date completed:</label>
-            <input type="date" id="ci-date-input" class="ci-date-input" value="${esc(startedDate)}">
-            <button class="ci-confirm-btn" id="ci-confirm-btn">Save</button>
-          </div>
-          <div class="ci-reason-row" id="ci-reason-row" style="display:none">
-            <label class="ci-date-label">Reason (optional):</label>
-            <input type="text" id="ci-reason-input" class="ci-reason-input" placeholder="e.g. ran out of reagent">
-            <input type="date" id="ci-cancel-date-input" class="ci-date-input" value="${esc(startedDate)}">
-            <button class="ci-confirm-btn" id="ci-confirm-cancel-btn">Cancel run</button>
-          </div>
-        </div>
-        <div class="ci-foot">
-          ${_checkInQueue.length > 1 ? `${_checkInQueue.length - 1} more after this` : 'Last one'}
-        </div>
-      </div>
-    </div>`;
-
-  let host = document.getElementById('ci-host');
-  if (!host) {
-    host = document.createElement('div');
-    host.id = 'ci-host';
-    document.body.appendChild(host);
-    _injectCheckInStyles();
-  }
-  host.innerHTML = html;
-}
-
-function _injectCheckInStyles() {
-  if (document.getElementById('ci-styles')) return;
-  const s = document.createElement('style');
-  s.id = 'ci-styles';
-  s.textContent = `
-    .ci-backdrop { position:fixed; inset:0; background:rgba(60,52,42,.55); z-index:5000; display:flex; align-items:center; justify-content:center; }
-    .ci-modal { background:#faf8f4; border:1px solid #d5cec0; border-radius:8px; width:480px; max-width:92vw; box-shadow:0 12px 48px rgba(0,0,0,.3); overflow:hidden; }
-    .ci-title { padding:14px 18px; background:#5b7a5e; color:#fff; font-weight:600; font-size:14px; letter-spacing:.04em; }
-    .ci-body { padding:18px; }
-    .ci-runline { padding:10px 12px; background:#f0ebe3; border:1px solid #e0d9cd; border-radius:5px; margin-bottom:14px; }
-    .ci-runtitle { font-size:15px; font-weight:600; color:#4a4139; }
-    .ci-runmeta  { font-size:12px; color:#8a7f72; margin-top:3px; }
-    .ci-prompt { font-size:14px; color:#4a4139; margin-bottom:10px; text-align:center; }
-    .ci-actions { display:flex; gap:8px; }
-    .ci-btn { flex:1; background:#fff; border:1px solid #d5cec0; border-radius:6px; padding:12px 10px; cursor:pointer; text-align:center; transition:all .15s; }
-    .ci-btn:hover { background:#f0ebe3; border-color:#5b7a5e; }
-    .ci-btn-title { font-size:13px; font-weight:600; color:#4a4139; }
-    .ci-btn-sub   { font-size:11px; color:#8a7f72; margin-top:2px; }
-    .ci-btn-done:hover  { background:#e8f0e8; border-color:#5b7a5e; }
-    .ci-btn-cancel:hover { background:#fdeaea; border-color:#c0392b; }
-    .ci-date-row, .ci-reason-row { display:flex; gap:8px; align-items:center; margin-top:14px; padding-top:14px; border-top:1px solid #ece7dd; }
-    .ci-date-label { font-size:12px; color:#8a7f72; flex-shrink:0; }
-    .ci-date-input { padding:5px 8px; border:1px solid #d5cec0; border-radius:4px; background:#fff; font-family:inherit; font-size:13px; color:#4a4139; }
-    .ci-reason-input { flex:1; padding:5px 8px; border:1px solid #d5cec0; border-radius:4px; background:#fff; font-family:inherit; font-size:13px; color:#4a4139; }
-    .ci-confirm-btn { padding:5px 14px; background:#5b7a5e; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:13px; font-weight:500; }
-    .ci-confirm-btn:hover { background:#4a6b4d; }
-    .ci-foot { padding:8px 18px; background:#f0ebe3; font-size:11px; color:#8a7f72; text-align:right; border-top:1px solid #ece7dd; }
-  `;
-  document.head.appendChild(s);
-}
-
-function _ciCurrent() { return _checkInQueue[0]; }
-
-/* "Mark done" — show date picker, then call spResumeAndFinish so the user can
-   review the recipe/steps in the scratch view (per their preference: jump to
-   the existing finish flow rather than silent commit). */
-function ciAnswerDone() {
-  const dr = document.getElementById('ci-date-row');
-  const rr = document.getElementById('ci-reason-row');
-  if (dr) dr.style.display = 'flex';
-  if (rr) rr.style.display = 'none';
-  const btn = document.getElementById('ci-confirm-btn');
-  if (btn) btn.onclick = ciConfirmDone;
-}
-function ciConfirmDone() {
-  const run = _ciCurrent();
-  if (!run) return;
-  /* Capture the chosen completion date and stash it on a global the scratch
-     save flow knows to look at (window._spOverrideDate). spSaveRunToEntry
-     consumes and clears it. */
-  const dateInput = document.getElementById('ci-date-input');
-  if (dateInput && dateInput.value) {
-    window._spOverrideDate = dateInput.value;
-  }
-  _ciClose();
-  _checkInQueue.shift();
-  if (typeof spResumeAndFinish === 'function') {
-    spResumeAndFinish(run.run_id);
-  } else if (typeof setView === 'function') {
-    if (typeof spResumeRunById === 'function') spResumeRunById(run.run_id);
-    else setView('scratch');
-  }
-}
-
-function ciAnswerSnooze() {
-  const run = _ciCurrent();
-  if (!run) return;
-  api('POST', '/api/active-runs/' + encodeURIComponent(run.run_id) + '/snooze', { hours: 24 })
-    .then(function() {
-      toast('Snoozed for 24h');
-      _ciAdvance();
-    })
-    .catch(function(e) { toast('Snooze failed: ' + e.message, true); });
-}
-
-function ciAnswerCancel() {
-  const dr = document.getElementById('ci-date-row');
-  const rr = document.getElementById('ci-reason-row');
-  if (dr) dr.style.display = 'none';
-  if (rr) rr.style.display = 'flex';
-  const btn = document.getElementById('ci-confirm-cancel-btn');
-  if (btn) btn.onclick = ciConfirmCancel;
-}
-function ciConfirmCancel() {
-  const run = _ciCurrent();
-  if (!run) return;
-  const reason = (document.getElementById('ci-reason-input') || {}).value || '';
-  const date = (document.getElementById('ci-cancel-date-input') || {}).value || '';
-  api('POST', '/api/active-runs/' + encodeURIComponent(run.run_id) + '/cancel',
-      { reason: reason, date: date })
-    .then(function() {
-      toast('Cancelled \u2014 saved as [CANCELLED] to notebook');
-      _ciAdvance();
-    })
-    .catch(function(e) { toast('Cancel failed: ' + e.message, true); });
-}
-
-function _ciClose() {
-  const host = document.getElementById('ci-host');
-  if (host) host.innerHTML = '';
-}
-function _ciAdvance() {
-  _checkInQueue.shift();
-  if (_checkInQueue.length) _showNextCheckIn();
-  else _ciClose();
-}
-
-function buildSidebarNav() {
-  // Build dynamic nav items from registered features
-  const container = document.getElementById('dynamic-nav');
-  if (!container) return;
-
-  let currentSection = '';
-  for (const item of _navItems) {
-    if (item.section && item.section !== currentSection) {
-      currentSection = item.section;
-      container.innerHTML += `<div class="nav-divider"></div><div class="nav-section">${esc(item.section)}</div>`;
-    }
-    const countHtml = item.countId ? `<span class="count" id="${item.countId}">0</span>` : '';
-    container.innerHTML += `<div class="nav-item" id="nav-${item.name}" onclick="setView('${item.name}')">
-      <span>${item.icon}</span><span>${esc(item.label)}</span>${countHtml}
-    </div>`;
-  }
-}
-
-async function load() {
-  try {
-    const st = await api('GET', '/api/stats');
-    S.stats = st;
-    const ce = document.getElementById('cnt-entries');
-    if (ce) ce.textContent = st.entries || 0;
-    const cp = document.getElementById('cnt-protocols');
-    if (cp) cp.textContent = st.protocols || 0;
-
-    // Build group nav
-    const gnav = document.getElementById('group-nav');
-    if (gnav) {
-      gnav.innerHTML = (st.groups || []).map(function (g) {
-        return '<div class="group-nav ' + (S.filterGroup === g ? 'active' : '') + '" data-group="' + esc(g) + '"><span>' + esc(g) + '</span></div>';
-      }).join('');
-      gnav.querySelectorAll('.group-nav').forEach(function (el) {
-        el.addEventListener('click', function () { setGroup(this.dataset.group); });
-      });
-    }
-
-    // Scratch and reminder counts
-    try {
-      const sc = await api('GET', '/api/scratch');
-      const cntS = document.getElementById('cnt-scratch');
-      if (cntS) cntS.textContent = sc.entries?.length || 0;
-      const rc = await api('GET', '/api/reminders');
-      const cntR = document.getElementById('cnt-reminders');
-      if (cntR) cntR.textContent = rc.reminders?.length || 0;
-      try {
-        const pc = await api('GET', '/api/predictions');
-        const cntP = document.getElementById('cnt-predictions');
-        if (cntP) cntP.textContent = pc.predictions?.length || 0;
-      } catch {}
-    } catch {}
-
-    // The counts and group-nav above already refreshed in place. We deliberately
-    // do NOT call loadView() here: a periodic full re-render wipes any in-progress
-    // form / dialog / mid-edit state in the active view. Manual navigation is
-    // what triggers re-renders; this loop is just for the sidebar numbers.
-  } catch (e) { console.error(e); }
-}
-
-function setView(v) {
-  /* Save the outgoing view's scroll position so it can be restored on return.
-     Views opt in by having a module-level _<key>ScrollY that we know about
-     here — currently cloning + circuits. Keeping the list small avoids the
-     temptation to over-engineer this into a generic registry. */
-  var content = document.getElementById('content');
-  var sy = content ? content.scrollTop : 0;
-  if (S.view === 'cloning' && typeof _clScrollY !== 'undefined') _clScrollY = sy;
-  if (S.view === 'circuits' && typeof _cdScrollY !== 'undefined') _cdScrollY = sy;
-
-  S.view = v;
-  S.filterGroup = '';
-  if (v === 'notebook') { S.nbBook = null; S.nbPage = null; }
-
-  document.querySelectorAll('.nav-item').forEach(el => {
-    const id = el.id.replace('nav-', '');
-    el.classList.toggle('active', id === v);
-  });
-
-  const titles = {
-    notebook: 'Notebook', protocols: 'Protocol Library', summaries: 'Project Summaries',
-    workflow: 'Daily Workflow', scratch: 'Scratch Pad', reminders: 'Reminders',
-    'import': 'Import from OneNote', timeline: 'Project Timelines',
-    predictions: 'Predicted Tasks', dilution: 'Dilution Calculator',
-    DNAmanager: 'DNAmanager', settings: 'Settings',
-  };
-  document.getElementById('page-title').textContent = titles[v] || v;
-
-  const btn = document.getElementById('add-btn');
-  if (v === 'notebook')       { btn.textContent = '+ New entry'; btn.style.display = ''; }
-  else if (v === 'protocols') { btn.textContent = '+ Add protocol'; btn.style.display = ''; }
-  else if (v === 'reminders') { btn.textContent = '+ Reminder'; btn.style.display = ''; }
-  else                        { btn.style.display = 'none'; }
-
-  /* Auto-hide sidebar after a view change: in auto-hide mode the sidebar
-     should collapse out of the way once the user has made a choice. The
-     `peek` class is removed so hover-reveal is the only way back. */
-  if (S.settings && S.settings.sidebar_auto_hide) {
-    const sb = document.getElementById('sidebar');
-    if (sb) sb.classList.remove('peek');
-  }
-
-  loadView();
-}
-
-function setGroup(g) {
-  S.filterGroup = g; S.view = 'notebook'; S.nbBook = g; S.nbPage = null;
-  document.querySelectorAll('.group-nav').forEach(el => el.classList.toggle('active', el.textContent.trim() === g));
-  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-  document.getElementById('nav-notebook').classList.add('active');
-  document.getElementById('page-title').textContent = 'Notebook — ' + g;
-  document.getElementById('add-btn').textContent = '+ New entry';
-  document.getElementById('add-btn').style.display = '';
-  loadView();
-}
-
-async function loadView() {
-  const el = document.getElementById('content');
-
-  // Apply view-width class. Sources, in priority order:
-  //   1. View metadata via registerView(name, fn, {wide:true})
-  //   2. Special case: notebook in book-page mode (nbBook set) goes wide so
-  //      the entry list + reader pane can sit side-by-side
-  // Default = narrow (CSS .content { max-width: 1100px }).
-  const meta = _viewMeta[S.view] || {};
-  const wideByNotebookCase = (S.view === 'notebook' && S.nbBook);
-  el.classList.toggle('wide', !!(meta.wide || wideByNotebookCase));
-
-  const renderer = _views[S.view];
-  if (renderer) {
-    await renderer(el);
-  } else {
-    el.innerHTML = '<div class="empty"><big>⚠️</big>View "' + esc(S.view) + '" not loaded.</div>';
-  }
-}
-
-// ── Shared form: showAddForm delegates to feature ────────────────────────────
-function showAddForm() {
-  if (S.view === 'reminders' && typeof showAddReminder === 'function') {
-    showAddReminder();
-  } else if (typeof _showAddForm === 'function') {
-    _showAddForm();
-  }
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function toggleSidebar() {
-  S.sidebarOpen = !S.sidebarOpen;
-  document.getElementById('sidebar').classList.toggle('collapsed', !S.sidebarOpen);
-}
-
-function formatDate(d) {
-  const dt = new Date(d + 'T00:00:00');
-  return dt.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
-}
-
-function relTime(iso) {
-  const diff = Date.now() - new Date(iso + 'Z').getTime(), m = Math.floor(diff / 60000);
-  if (m < 1) return 'just now';
-  if (m < 60) return m + 'm ago';
-  const h = Math.floor(m / 60);
-  if (h < 24) return h + 'h ago';
-  return Math.floor(h / 24) + 'd ago';
-}
-
-function esc(s) {
-  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-let tt;
-function toast(msg, err = false) {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = 'show' + (err ? ' err' : '');
-  clearTimeout(tt);
-  tt = setTimeout(() => el.className = '', 3000);
-}
-
-/* ── Global search (Ctrl+K / Cmd+K) ──────────────────────────────────────────
-   Cross-table fuzzy-ish search across notebook entries, protocols, and DNA
-   inventory. Live results with 200ms debounce. Results grouped by category
-   with optional filter tabs. Click-through navigates to the relevant view
-   and (where possible) selects the item.
-
-   We don't bind Ctrl+K when the user is typing in a contenteditable / input,
-   to avoid stealing the shortcut in nested editors that may use it themselves. */
-
-let _searchDebounce = null;
-let _searchActiveFilter = null;   // null = show all categories
-let _searchLastResults = null;    // last response so filter tabs don't re-query
-
-document.addEventListener('keydown', function(e) {
-  /* Ctrl+K or Cmd+K — open search */
-  if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
-    e.preventDefault();
-    openGlobalSearch();
-    return;
-  }
-});
-
-function openGlobalSearch() {
-  /* Bail if it's already open — don't stack */
-  if (document.getElementById('gs-modal')) {
-    const inp = document.getElementById('gs-input');
-    if (inp) inp.focus();
-    return;
-  }
-  _injectSearchStyles();
-  _searchActiveFilter = null;
-  _searchLastResults = null;
-  const modal = document.createElement('div');
-  modal.id = 'gs-modal';
-  modal.className = 'gs-backdrop';
-  modal.innerHTML = `
-    <div class="gs-modal" role="dialog">
-      <div class="gs-input-row">
-        <span class="gs-input-icon">⌕</span>
-        <input id="gs-input" class="gs-input" type="text"
-               placeholder="Search notebook, protocols, DNA inventory…  (Esc to close)"
-               autocomplete="off" spellcheck="false">
-        <span class="gs-hint" id="gs-hint">Type to search</span>
-      </div>
-      <div class="gs-filters" id="gs-filters" style="display:none"></div>
-      <div class="gs-results" id="gs-results"></div>
-      <div class="gs-foot">
-        <kbd>↑↓</kbd> navigate &nbsp;
-        <kbd>Enter</kbd> open &nbsp;
-        <kbd>Esc</kbd> close
-      </div>
-    </div>`;
-  modal.addEventListener('click', function(e) { if (e.target === modal) closeGlobalSearch(); });
-  document.body.appendChild(modal);
-
-  const inp = document.getElementById('gs-input');
-  inp.addEventListener('input', _searchHandleInput);
-  inp.addEventListener('keydown', _searchHandleKeys);
-  inp.focus();
-}
-
-function closeGlobalSearch() {
-  const m = document.getElementById('gs-modal');
-  if (m) m.remove();
-  if (_searchDebounce) clearTimeout(_searchDebounce);
-}
-
-function _injectSearchStyles() {
-  if (document.getElementById('gs-styles')) return;
-  const s = document.createElement('style');
-  s.id = 'gs-styles';
-  s.textContent = `
-    .gs-backdrop { position:fixed; inset:0; background:rgba(60,52,42,.55); z-index:6000; display:flex; align-items:flex-start; justify-content:center; padding-top:12vh; }
-    .gs-modal { background:#faf8f4; border:1px solid #d5cec0; border-radius:10px; width:640px; max-width:92vw; max-height:72vh; box-shadow:0 16px 48px rgba(0,0,0,.32); overflow:hidden; display:flex; flex-direction:column; }
-    .gs-input-row { display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid #ece7dd; background:#fff; }
-    .gs-input-icon { font-size:18px; color:#8a7f72; }
-    .gs-input { flex:1; border:none; outline:none; font-family:inherit; font-size:16px; color:#4a4139; background:transparent; }
-    .gs-hint { font-size:11px; color:#8a7f72; padding:2px 6px; background:#f0ebe3; border-radius:3px; }
-    .gs-filters { display:flex; gap:4px; padding:8px 16px; background:#f5f0e8; border-bottom:1px solid #ece7dd; flex-wrap:wrap; }
-    .gs-filter { padding:3px 10px; background:#fff; border:1px solid #d5cec0; border-radius:12px; cursor:pointer; font-size:11.5px; color:#4a4139; }
-    .gs-filter.active { background:#5b7a5e; color:#fff; border-color:#5b7a5e; }
-    .gs-filter:hover:not(.active) { background:#f0ebe3; }
-    .gs-results { flex:1; overflow-y:auto; padding:6px 0; }
-    .gs-result { display:flex; align-items:center; gap:10px; padding:8px 16px; cursor:pointer; border-left:3px solid transparent; }
-    .gs-result:hover, .gs-result.active { background:#f0ebe3; border-left-color:#5b7a5e; }
-    .gs-result-kind { font-size:10.5px; font-weight:600; color:#8a7f72; text-transform:uppercase; letter-spacing:.08em; width:90px; flex-shrink:0; }
-    .gs-result-body { flex:1; min-width:0; }
-    .gs-result-title { font-size:14px; color:#4a4139; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .gs-result-sub { font-size:11.5px; color:#8a7f72; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .gs-empty { padding:24px; text-align:center; color:#8a7f72; font-size:13px; }
-    .gs-foot { padding:7px 16px; border-top:1px solid #ece7dd; background:#f5f0e8; font-size:11px; color:#8a7f72; }
-    .gs-foot kbd { background:#fff; border:1px solid #d5cec0; border-radius:3px; padding:1px 5px; font-family:inherit; font-size:10.5px; color:#4a4139; }
-  `;
-  document.head.appendChild(s);
-}
-
-function _searchHandleInput(e) {
-  const q = e.target.value;
-  if (_searchDebounce) clearTimeout(_searchDebounce);
-  /* 200ms debounce — feels live but doesn't fire one request per keystroke */
-  _searchDebounce = setTimeout(function() { _runSearch(q); }, 200);
-}
-
-async function _runSearch(q) {
-  const hint = document.getElementById('gs-hint');
-  const results = document.getElementById('gs-results');
-  if (!q || q.length < 2) {
-    if (hint) hint.textContent = q ? 'Type more…' : 'Type to search';
-    if (results) results.innerHTML = '';
-    document.getElementById('gs-filters').style.display = 'none';
-    return;
-  }
-  if (hint) hint.textContent = 'Searching…';
-  try {
-    const r = await api('GET', '/api/search?q=' + encodeURIComponent(q));
-    _searchLastResults = r;
-    _searchActiveFilter = null;   // reset filter on new query
-    _renderSearchResults();
-    if (hint) hint.textContent = (r.results?.length || 0) + ' result' + ((r.results?.length || 0) === 1 ? '' : 's');
-  } catch (e) {
-    if (hint) hint.textContent = 'Search failed';
-  }
-}
-
-function _renderSearchResults() {
-  const r = _searchLastResults;
-  if (!r) return;
-  const results = document.getElementById('gs-results');
-  const filters = document.getElementById('gs-filters');
-
-  /* Filter tabs — show only if 2+ categories matched */
-  const catEntries = Object.entries(r.categories || {});
-  if (catEntries.length >= 2) {
-    const totalCount = r.results.length;
-    let html = `<span class="gs-filter ${_searchActiveFilter === null ? 'active' : ''}" onclick="_setSearchFilter(null)">All (${totalCount})</span>`;
-    /* Sort categories by count desc for stable order */
-    catEntries.sort((a, b) => b[1] - a[1]);
-    for (const [kind, count] of catEntries) {
-      const cls = (_searchActiveFilter === kind) ? 'active' : '';
-      html += `<span class="gs-filter ${cls}" onclick="_setSearchFilter('${esc(kind).replace(/'/g, '&#39;')}')">${esc(kind)} (${count})</span>`;
-    }
-    filters.innerHTML = html;
-    filters.style.display = 'flex';
-  } else {
-    filters.style.display = 'none';
-  }
-
-  /* Filter applied? */
-  const shown = _searchActiveFilter
-    ? r.results.filter(it => it.kind === _searchActiveFilter)
-    : r.results;
-
-  if (!shown.length) {
-    results.innerHTML = '<div class="gs-empty">No matches</div>';
-    return;
-  }
-  results.innerHTML = shown.map(function(it, i) {
-    return `<div class="gs-result ${i === 0 ? 'active' : ''}" data-idx="${i}"
-                onclick="_openSearchResult(${i})">
-      <div class="gs-result-kind">${esc(it.kind)}</div>
-      <div class="gs-result-body">
-        <div class="gs-result-title">${esc(it.title)}</div>
-        ${it.subtitle ? `<div class="gs-result-sub">${esc(it.subtitle)}</div>` : ''}
-      </div>
-    </div>`;
-  }).join('');
-}
-
-function _setSearchFilter(kind) {
-  _searchActiveFilter = kind;
-  _renderSearchResults();
-  /* Keep focus in the input — filter clicks shouldn't move it */
-  const inp = document.getElementById('gs-input');
-  if (inp) inp.focus();
-}
-
-function _searchHandleKeys(e) {
-  const results = document.getElementById('gs-results');
-  if (!results) return;
-  const items = results.querySelectorAll('.gs-result');
-  if (e.key === 'Escape') {
-    e.preventDefault();
-    closeGlobalSearch();
-    return;
-  }
-  if (e.key === 'ArrowDown') {
-    e.preventDefault();
-    _moveSearchSelection(items, +1);
-    return;
-  }
-  if (e.key === 'ArrowUp') {
-    e.preventDefault();
-    _moveSearchSelection(items, -1);
-    return;
-  }
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    const active = results.querySelector('.gs-result.active');
-    if (active) _openSearchResult(parseInt(active.dataset.idx, 10));
-    return;
-  }
-}
-
-function _moveSearchSelection(items, dir) {
-  if (!items.length) return;
-  let idx = -1;
-  for (let i = 0; i < items.length; i++) if (items[i].classList.contains('active')) { idx = i; break; }
-  if (idx < 0) idx = 0;
-  else idx = (idx + dir + items.length) % items.length;
-  for (const it of items) it.classList.remove('active');
-  items[idx].classList.add('active');
-  items[idx].scrollIntoView({ block: 'nearest' });
-}
-
-function _openSearchResult(idx) {
-  const r = _searchLastResults;
-  if (!r) return;
-  const shown = _searchActiveFilter
-    ? r.results.filter(it => it.kind === _searchActiveFilter)
-    : r.results;
-  const item = shown[idx];
-  if (!item) return;
-
-  closeGlobalSearch();
-
-  /* Navigation by table:
-       entries     → notebook view, jump-to entry id
-       protocols   → protocols view (no item-level jump for now; the list view
-                     is small enough that the user can find it visually)
-       DNA tables  → DNA Manager view, jump to the relevant tab + filter by name
-     We use S._pendingSelect-style params via the navigateWith helper where it
-     makes sense; views that don't yet consume the param fall back to just
-     switching views, which is at least no worse than today. */
-  const view = item.view;
-  let params = null;
-  if (item.table === 'entries') {
-    params = { entryId: item.id };
-  } else if (item.table === 'protocols') {
-    params = { protocolId: item.id };
-  } else {
-    /* DNA tables — pass enough info for the DNA manager to focus the right tab */
-    params = { dnaTable: item.table, dnaId: item.id, dnaName: item.title };
-  }
-
-  if (typeof navigateWith === 'function') {
-    navigateWith(view, params);
-  } else if (typeof setView === 'function') {
-    /* No params nav — falling back to just opening the view. */
-    setView(view);
-  }
-}
-
-/* Expose for inline onclick handlers in the modal HTML */
-window.openGlobalSearch = openGlobalSearch;
-window.closeGlobalSearch = closeGlobalSearch;
-window._setSearchFilter = _setSearchFilter;
-window._openSearchResult = _openSearchResult;
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;min-height:100vh}
+
+/* Layout */
+.layout{display:flex;min-height:100vh}
+.sidebar{width:220px;min-width:220px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:hidden;transition:width .2s,min-width .2s}
+.sidebar.collapsed{width:0;min-width:0;border-right:none}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+
+/* Sidebar */
+.sidebar-logo{padding:20px 18px 14px;border-bottom:1px solid var(--border)}
+.sidebar-logo h1{font-family:var(--serif);font-size:20px;font-weight:600;color:var(--text);letter-spacing:-.3px}
+.sidebar-logo p{font-size:11px;color:var(--muted);margin-top:2px;font-family:var(--mono)}
+.sidebar-scroll{flex:1;overflow-y:auto;padding:10px 0}
+.nav-section{padding:6px 18px 4px;font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);font-family:var(--mono)}
+.nav-item{display:flex;align-items:center;gap:8px;padding:7px 18px;cursor:pointer;font-size:13px;color:var(--muted);transition:background .1s,color .1s;border-left:2px solid transparent}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{color:var(--accent);border-left-color:var(--accent);background:var(--tag-bg)}
+.nav-item .count{margin-left:auto;font-size:10px;font-family:var(--mono);background:var(--surface2);padding:1px 6px;border-radius:10px;color:var(--dim)}
+.nav-divider{height:1px;background:var(--border);margin:8px 18px}
+.group-nav{display:flex;align-items:center;gap:6px;padding:5px 18px 5px 28px;cursor:pointer;font-size:12px;color:var(--muted);transition:background .1s,color .1s;border-left:2px solid transparent}
+.group-nav:hover{background:var(--surface2);color:var(--text)}
+.group-nav.active{color:var(--accent);border-left-color:var(--accent)}
+.group-nav .count{margin-left:auto;font-size:10px;font-family:var(--mono);color:var(--dim)}
+
+/* Header */
+header{display:flex;align-items:center;gap:10px;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:50}
+.toggle-sb{background:transparent;border:1px solid var(--border2);color:var(--muted);font-size:12px;padding:4px 9px;cursor:pointer;border-radius:4px;transition:all .15s}
+.toggle-sb:hover{border-color:var(--accent);color:var(--accent)}
+.page-title{font-family:var(--serif);font-size:18px;font-weight:600;color:var(--text)}
+.header-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.btn{padding:6px 14px;background:transparent;border:1px solid var(--border2);color:var(--muted);font-family:var(--sans);font-size:12px;cursor:pointer;border-radius:4px;transition:all .15s;white-space:nowrap}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn.primary:hover{background:var(--accent2)}
+
+/* Content */
+.content{flex:1;padding:24px;overflow-y:auto;max-width:1100px;width:100%;margin:0 auto;box-sizing:border-box}
+/* Wide views: data-dense / tool-like UIs (workflow doc, cloning, gel, sanger,
+   importer, timeline, pipeline). The cap is set via --wide-cap CSS variable
+   so settings can adjust it without rebuilding CSS. */
+.content.wide{max-width:var(--wide-cap, 1800px);padding:18px 24px}
+
+/* Auto-hide sidebar mode: the sidebar collapses to 0 width by default, and
+   slides out as an overlay when the user hovers the left edge. The "left-edge
+   detector" is a 14px transparent strip that catches the mouse. Hovering
+   either it or the sidebar itself reveals the sidebar.
+   We don't push content when revealing — the sidebar overlays it. That's the
+   point: content stays the width it was. */
+body.auto-hide-sidebar .sidebar { width:0; min-width:0; border-right:none; position:fixed; top:0; left:0; height:100vh; z-index:200; box-shadow:none; }
+body.auto-hide-sidebar .sidebar.collapsed { width:0; min-width:0; }
+body.auto-hide-sidebar .sidebar:hover,
+body.auto-hide-sidebar .sidebar.peek { width:220px; min-width:220px; border-right:1px solid var(--border); box-shadow:2px 0 12px rgba(0,0,0,.18); }
+body.auto-hide-sidebar .sidebar-peek-zone { position:fixed; top:0; left:0; width:14px; height:100vh; z-index:199; }
+
+/* Stats row */
+.stats-row{display:flex;gap:12px;margin-bottom:24px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 18px;flex:1}
+.stat-num{font-size:26px;font-weight:600;font-family:var(--serif);color:var(--text);line-height:1}
+.stat-label{font-size:11px;color:var(--muted);margin-top:3px;letter-spacing:.5px;text-transform:uppercase;font-family:var(--mono)}
+
+/* Section labels */
+.section-label{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:12px;display:flex;align-items:center;gap:8px;font-family:var(--mono)}
+.section-label::after{content:'';flex:1;height:1px;background:var(--border)}
+
+/* Entry cards */
+.entries{display:flex;flex-direction:column;gap:10px}
+.entry-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s,box-shadow .15s;cursor:pointer}
+.entry-card:hover{border-color:var(--border2);box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.entry-card.open{border-color:var(--accent)}
+.entry-header{display:flex;align-items:flex-start;gap:12px;padding:14px 16px}
+.entry-date{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap;margin-top:2px;min-width:80px}
+.entry-main{flex:1;min-width:0}
+.entry-title{font-family:var(--serif);font-size:16px;font-weight:600;color:var(--text);line-height:1.3;margin-bottom:3px}
+.entry-group{font-size:11px;color:var(--accent);font-family:var(--mono)}
+.entry-summary{font-size:13px;color:var(--muted);margin-top:4px;line-height:1.5;font-style:italic}
+.entry-actions{display:flex;gap:6px;opacity:0;transition:opacity .15s;flex-shrink:0}
+.entry-card:hover .entry-actions{opacity:1}
+.entry-body{display:none;border-top:1px solid var(--border);padding:16px}
+.entry-card.open .entry-body{display:block}
+
+/* Notebook book/page layout */
+.nb-books{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.nb-book{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px;cursor:pointer;transition:all .15s;position:relative;overflow:hidden}
+.nb-book:hover{border-color:var(--accent);box-shadow:0 4px 16px rgba(0,0,0,.08)}
+.nb-book::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent);border-radius:8px 0 0 8px}
+.nb-book-title{font-family:var(--serif);font-size:20px;font-weight:600;color:var(--text);margin-bottom:6px;padding-left:8px}
+.nb-book-meta{font-family:var(--mono);font-size:11px;color:var(--muted);padding-left:8px}
+.nb-book-dates{font-size:12px;color:var(--dim);margin-top:8px;padding-left:8px}
+.nb-layout{display:flex;gap:0;min-height:calc(100vh - 140px)}
+.nb-page-list{width:220px;min-width:220px;border-right:1px solid var(--border);overflow-y:auto;background:var(--surface)}
+.nb-page-list-hdr{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.nb-page-list-hdr button{background:transparent;border:1px solid var(--border2);color:var(--muted);font-size:12px;padding:4px 10px;cursor:pointer;border-radius:4px;transition:all .15s}
+.nb-page-list-hdr button:hover{border-color:var(--accent);color:var(--accent)}
+.nb-page-list-title{font-family:var(--serif);font-size:14px;font-weight:600;flex:1}
+.nb-page-item{padding:10px 16px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .1s;border-left:3px solid transparent}
+.nb-page-item:hover{background:var(--surface2)}
+.nb-page-item.active{background:var(--tag-bg);border-left-color:var(--accent)}
+.nb-page-date{font-family:var(--mono);font-size:11px;color:var(--accent);margin-bottom:2px}
+.nb-page-titles{font-size:12px;color:var(--muted);line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.nb-page-count{font-size:10px;color:var(--dim);font-family:var(--mono);margin-top:2px}
+.nb-editor{flex:1;overflow-y:auto;padding:24px 32px}
+.nb-editor-date{font-family:var(--serif);font-size:22px;font-weight:600;color:var(--text);margin-bottom:4px}
+.nb-editor-weekday{font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:20px}
+.nb-entry{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px 20px;margin-bottom:16px}
+.nb-entry-title{font-family:var(--serif);font-size:17px;font-weight:600;color:var(--text);margin-bottom:4px;display:flex;align-items:center;gap:8px}
+.nb-entry-sub{font-family:var(--mono);font-size:11px;color:var(--accent);margin-bottom:12px}
+.nb-entry textarea{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:14px;padding:12px 14px;border-radius:4px;outline:none;resize:vertical;line-height:1.7;transition:border-color .15s;min-height:120px}
+.nb-entry textarea:focus{border-color:var(--accent)}
+.nb-entry textarea.big{min-height:200px}
+.nb-field-label{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono);margin-bottom:5px;margin-top:14px}
+.nb-entry-actions{display:flex;gap:8px;margin-top:14px;align-items:center}
+.nb-empty-page{text-align:center;padding:60px 20px;color:var(--muted);font-style:italic;font-size:15px}
+/* Dashboard */
+.dash-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+.dash-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px 18px}
+.dash-card-title{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);font-family:var(--mono);margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.dash-card-title::after{content:'';flex:1;height:1px;background:var(--border)}
+.dash-reminder{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px}
+.dash-reminder:last-child{border-bottom:none}
+.dash-reminder-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;margin-top:6px}
+.dash-reminder-dot.overdue{background:var(--red)}
+.dash-reminder-dot.today{background:var(--accent)}
+.dash-reminder-dot.future{background:var(--dim)}
+.dash-entry-mini{padding:6px 0;border-bottom:1px solid var(--border);cursor:pointer;transition:color .1s}
+.dash-entry-mini:hover{color:var(--accent)}
+.dash-entry-mini:last-child{border-bottom:none}
+.dash-entry-mini-title{font-size:13px;font-weight:500}
+.dash-entry-mini-meta{font-size:11px;color:var(--dim);font-family:var(--mono)}
+.dash-wf-item{display:flex;gap:8px;padding:4px 0;font-size:13px}
+.dash-wf-time{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:40px}
+.nb-delete-btn{background:transparent;border:1px solid var(--border2);color:var(--dim);font-family:var(--mono);font-size:10px;padding:3px 8px;cursor:pointer;border-radius:4px;transition:all .15s;letter-spacing:1px;text-transform:uppercase;margin-left:auto}
+.nb-delete-btn:hover{border-color:var(--red);color:var(--red)}
+/* Dilution calc */
+.dil-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:20px 24px;margin-bottom:16px}
+.dil-card h3{font-family:var(--serif);font-size:17px;font-weight:600;margin-bottom:14px;color:var(--text)}
+.dil-row{display:flex;gap:12px;align-items:flex-end;margin-bottom:12px;flex-wrap:wrap}
+.dil-field{display:flex;flex-direction:column;gap:4px}
+.dil-field label{font-size:11px;letter-spacing:1px;color:var(--muted);font-family:var(--mono)}
+.dil-field input,.dil-field select{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:14px;padding:8px 10px;border-radius:4px;outline:none;width:120px;transition:border-color .15s}
+.dil-field input:focus{border-color:var(--accent)}
+.dil-result{font-family:var(--mono);font-size:16px;color:var(--accent);font-weight:600;padding:8px 0}
+.dil-formula{font-family:var(--mono);font-size:12px;color:var(--muted);padding:4px 0}
+.dil-seq-table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;margin-top:12px}
+.dil-seq-table th{text-align:left;font-size:10px;letter-spacing:1px;color:var(--muted);padding:6px 8px;border-bottom:2px solid var(--border)}
+.dil-seq-table td{padding:6px 8px;border-bottom:1px solid var(--border)}
+.dil-seq-table tr:hover{background:var(--surface2)}
+.dil-seq-table input{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:13px;padding:4px 6px;border-radius:3px;outline:none;width:80px}
+.dil-seq-table input:focus{border-color:var(--accent)}
+
+/* Entry form fields */
+.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.field{display:flex;flex-direction:column;gap:5px}
+.field.full{grid-column:1/-1}
+.field label{font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono)}
+.field textarea,.field input[type=text]{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:13px;padding:8px 10px;border-radius:4px;outline:none;resize:vertical;transition:border-color .15s}
+.field textarea{min-height:80px;line-height:1.6}
+.field textarea:focus,.field input:focus{border-color:var(--accent)}
+.save-row{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}
+
+/* Protocol cards */
+.protocol-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s}
+.protocol-card:hover{border-color:var(--border2)}
+.protocol-card.open{border-color:var(--accent)}
+.protocol-header{display:flex;align-items:flex-start;gap:10px;padding:14px 16px;cursor:pointer}
+.protocol-title{font-family:var(--serif);font-size:16px;font-weight:600;color:var(--text);flex:1}
+.protocol-url{font-size:11px;color:var(--blue);font-family:var(--mono);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.protocol-body{display:none;border-top:1px solid var(--border);padding:16px}
+.protocol-card.open .protocol-body{display:block}
+.steps-text{font-size:13px;line-height:1.8;color:var(--text);white-space:pre-wrap;font-family:var(--serif)}
+.protocol-notes{background:var(--tag-bg);border:1px solid var(--border);border-radius:4px;padding:10px 12px;font-size:13px;color:var(--text);line-height:1.6;margin-top:12px;font-style:italic}
+
+/* Tags */
+.tags{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.tag{font-size:11px;padding:2px 8px;background:var(--tag-bg);color:var(--tag-color);border:1px solid #c5dace;border-radius:10px;font-family:var(--mono)}
+.tag-del{background:none;border:none;color:var(--dim);cursor:pointer;font-size:12px;padding:0;margin-left:3px;line-height:1}
+.tag-del:hover{color:var(--red)}
+
+/* Add form */
+.add-form{background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:18px;margin-bottom:16px;display:none}
+.add-form.visible{display:block}
+.add-form h3{font-family:var(--serif);font-size:16px;margin-bottom:14px;color:var(--text)}
+
+/* URL paste input */
+.url-bar{display:flex;gap:8px;margin-bottom:20px}
+.url-bar input{flex:1;background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--mono);font-size:13px;padding:9px 12px;border-radius:4px;outline:none;transition:border-color .15s}
+.url-bar input:focus{border-color:var(--accent)}
+.url-bar input::placeholder{color:var(--dim)}
+
+/* Project summaries */
+.summary-card{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:16px;margin-bottom:10px}
+.summary-group{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--accent);margin-bottom:6px}
+.summary-text{font-size:14px;line-height:1.7;color:var(--text);font-family:var(--serif)}
+.next-steps{margin-top:10px;display:flex;flex-direction:column;gap:4px}
+.next-step{display:flex;align-items:flex-start;gap:6px;font-size:13px;color:var(--muted)}
+.next-step::before{content:'→';color:var(--accent);flex-shrink:0;font-family:var(--mono)}
+.summary-updated{font-size:11px;color:var(--dim);font-family:var(--mono);margin-top:8px}
+
+/* Empty */
+.empty{text-align:center;padding:56px 20px;color:var(--muted)}
+.empty big{display:block;font-family:var(--serif);font-size:48px;color:var(--border2);margin-bottom:8px}
+
+/* Toast */
+#toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:var(--bg);padding:9px 16px;font-size:13px;border-radius:4px;opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;pointer-events:none;z-index:999}
+#toast.show{opacity:1;transform:translateY(0)}
+#toast.err{background:var(--red)}
+
+/* Loading spinner */
+.spin{display:inline-block;width:12px;height:12px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.timeline{display:flex;flex-direction:column;gap:0;position:relative}
+.timeline::before{content:'';position:absolute;left:68px;top:0;bottom:0;width:1px;background:var(--border)}
+.timeline-entry{display:flex;gap:16px;padding:8px 0;position:relative}
+.timeline-time{font-family:var(--mono);font-size:11px;color:var(--muted);width:50px;flex-shrink:0;padding-top:6px;text-align:right}
+.timeline-dot{width:10px;height:10px;border-radius:50%;background:var(--border2);border:2px solid var(--bg);flex-shrink:0;margin-top:8px;z-index:1}
+.timeline-dot.task{background:var(--accent);box-shadow:0 0 0 3px rgba(61,107,79,.15)}
+.timeline-dot.note{background:var(--amber)}
+.timeline-body{flex:1;min-width:0}
+.timeline-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 14px;transition:border-color .15s}
+.timeline-card:hover{border-color:var(--border2)}
+.timeline-card.task-card{border-left:3px solid var(--accent)}
+.timeline-card.note-card{border-left:3px solid var(--amber)}
+.timeline-card-group{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:.5px;margin-bottom:3px}
+.timeline-card-text{font-size:14px;color:var(--text);line-height:1.4}
+.timeline-card-text textarea{width:100%;background:transparent;border:none;border-bottom:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:14px;outline:none;resize:none;padding:2px 0;line-height:1.5;caret-color:var(--accent)}
+.timeline-actions{display:flex;gap:5px;margin-top:6px;opacity:0;transition:opacity .15s}
+.timeline-entry:hover .timeline-actions{opacity:1}
+.add-inline{display:flex;gap:8px;padding:8px 0 8px 82px}
+.add-inline input{flex:1;background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--sans);font-size:13px;padding:7px 10px;border-radius:4px;outline:none;transition:border-color .15s}
+.add-inline input:focus{border-color:var(--accent)}
+.add-inline button{padding:7px 14px;background:var(--accent);color:#fff;border:none;border-radius:4px;font-size:13px;cursor:pointer;transition:background .15s;white-space:nowrap}
+.add-inline button:hover{background:var(--accent2)}
+.day-nav{display:flex;align-items:center;gap:10px;margin-bottom:20px}
+.day-nav button{padding:5px 12px;background:transparent;border:1px solid var(--border2);color:var(--muted);font-size:12px;border-radius:4px;cursor:pointer;transition:all .15s}
+.day-nav button:hover{border-color:var(--accent);color:var(--accent)}
+.day-nav .day-label{font-family:var(--serif);font-size:16px;font-weight:600;flex:1;text-align:center}
+.day-summary{background:var(--tag-bg);border:1px solid #c5dace;border-radius:6px;padding:14px 16px;margin-bottom:16px;font-family:var(--serif);font-size:14px;line-height:1.7;color:var(--text);font-style:italic}
+.scratch-area{display:flex;flex-direction:column;gap:14px}
+.scratch-big{width:100%;min-height:120px;background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--sans);font-size:14px;padding:14px;border-radius:6px;outline:none;resize:vertical;line-height:1.7;transition:border-color .15s}
+.scratch-big:focus{border-color:var(--accent)}
+.scratch-quick{display:flex;gap:8px}
+.scratch-quick input{flex:1;background:var(--surface);border:1px solid var(--border2);color:var(--text);font-family:var(--sans);font-size:13px;padding:9px 12px;border-radius:4px;outline:none;transition:border-color .15s}
+.scratch-quick input:focus{border-color:var(--accent)}
+.scratch-quick button{padding:9px 16px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;transition:background .15s;white-space:nowrap}
+.scratch-quick button:hover{background:var(--accent2)}
+.drop-zone{border:2px dashed var(--border2);border-radius:6px;padding:28px;text-align:center;color:var(--muted);font-size:13px;cursor:pointer;transition:all .15s;background:var(--surface)}
+.drop-zone:hover,.drop-zone.dragover{border-color:var(--accent);background:var(--tag-bg);color:var(--accent)}
+.drop-zone input[type=file]{display:none}
+.scratch-list{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.scratch-item{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 14px;display:flex;gap:10px;align-items:flex-start}
+.scratch-item.has-image{border-left:3px solid var(--blue)}
+.scratch-item-content{flex:1;font-size:13px;color:var(--text);line-height:1.5}
+.scratch-item-time{font-family:var(--mono);font-size:11px;color:var(--dim);white-space:nowrap;flex-shrink:0}
+.scratch-thumb{width:60px;height:60px;object-fit:cover;border-radius:4px;border:1px solid var(--border);flex-shrink:0;cursor:pointer}
+.reminder-item{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 16px;display:flex;align-items:flex-start;gap:12px;transition:border-color .15s}
+.reminder-item.done-reminder{opacity:.45}
+.reminder-check{width:18px;height:18px;min-width:18px;border:2px solid var(--border2);border-radius:50%;cursor:pointer;margin-top:1px;transition:all .15s;display:flex;align-items:center;justify-content:center}
+.reminder-check:hover{border-color:var(--accent)}
+.reminder-item.done-reminder .reminder-check{background:var(--accent);border-color:var(--accent);color:#fff}
+.reminder-text{flex:1;font-size:14px;color:var(--text);line-height:1.4}
+.reminder-due{font-family:var(--mono);font-size:11px;margin-top:3px}
+.reminder-due.overdue{color:var(--red)}
+.reminder-due.today{color:var(--accent)}
+.reminder-due.future{color:var(--muted)}
+/* Timeline */
+.tl-project{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-bottom:14px}
+.tl-project-hdr{display:flex;align-items:center;gap:10px;padding:12px 16px;cursor:pointer;transition:background .1s;user-select:none}
+.tl-project-hdr:hover{background:var(--surface2)}
+.tl-project-name{font-family:var(--serif);font-size:16px;font-weight:600;flex:1}
+.tl-project-meta{font-size:11px;color:var(--dim);font-family:var(--mono)}
+.tl-chain-wrap{overflow-x:auto;border-top:1px solid var(--border);padding:16px}
+.tl-chain-wrap svg{display:block}
+.tl-day-node{cursor:pointer}
+.tl-day-rect{fill:var(--surface2);stroke:var(--border);stroke-width:1;rx:4;ry:4;transition:stroke .15s}
+.tl-day-node:hover .tl-day-rect{stroke:var(--accent)}
+.tl-day-node.expanded .tl-day-rect{stroke:var(--accent);stroke-width:1.5}
+.tl-edge{stroke:var(--border2);stroke-width:1.5;fill:none}
+.tl-expanded{border-top:1px solid var(--border);padding:14px 16px}
+.tl-expanded-date{font-family:var(--mono);font-size:11px;color:var(--accent);margin-bottom:8px}
+.tl-expanded-entry{padding:8px 0;border-bottom:1px solid var(--border)}
+.tl-expanded-entry:last-child{border-bottom:none}
+.tl-expanded-title{font-weight:500;font-size:14px;margin-bottom:3px}
+.tl-expanded-notes{font-size:13px;color:var(--muted);line-height:1.6;white-space:pre-wrap;max-height:200px;overflow-y:auto}
+/* Predictions */
+.pred-card{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:14px 16px;margin-bottom:10px;transition:border-color .15s}
+.pred-card:hover{border-color:var(--border2)}
+.pred-group{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--accent);margin-bottom:4px}
+.pred-text{font-size:15px;font-weight:500;color:var(--text);margin-bottom:6px;line-height:1.4}
+.pred-reasoning{font-size:13px;color:var(--muted);font-style:italic;line-height:1.5;margin-bottom:10px}
+.pred-actions{display:flex;gap:8px;align-items:center}
+.pred-edit-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:14px;padding:6px 10px;border-radius:4px;outline:none;width:100%;margin-bottom:8px}
+.pred-edit-input:focus{border-color:var(--accent)}
+/* Import */
+.import-dropzone{border:2px dashed var(--border2);border-radius:8px;padding:48px 24px;text-align:center;color:var(--muted);cursor:pointer;transition:all .15s;background:var(--surface);margin-bottom:20px}
+.import-dropzone:hover,.import-dropzone.dragover{border-color:var(--accent);background:var(--tag-bg);color:var(--accent)}
+.import-dropzone input[type=file]{display:none}
+.import-dropzone big{display:block;font-size:36px;margin-bottom:8px}
+.import-table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:16px}
+.import-table th{text-align:left;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:var(--mono);padding:8px 10px;border-bottom:2px solid var(--border);white-space:nowrap}
+.import-table td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+.import-table tr:hover{background:var(--surface2)}
+.import-table tr.skip-row{opacity:.4}
+.import-title-cell{max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.import-preview{font-size:12px;color:var(--muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.import-type-sel,.import-group-inp{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:12px;padding:4px 6px;border-radius:4px;outline:none;width:100%}
+.import-type-sel:focus,.import-group-inp:focus{border-color:var(--accent)}
+.import-date-inp{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--mono);font-size:12px;padding:4px 6px;border-radius:4px;outline:none;width:110px}
+.import-date-inp:focus{border-color:var(--accent)}
+.import-actions{display:flex;gap:10px;align-items:center}
+.import-count{font-size:13px;color:var(--muted);flex:1}
+.import-count b{color:var(--text)}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+
+/* ── Cloning multi-tab strip ───────────────────────────────────────────── */
+.cl-tab-strip{display:flex;gap:2px;margin:0 0 12px 0;border-bottom:1px solid #d5cec0;flex-wrap:wrap;align-items:flex-end}
+.cl-tab-strip-empty{padding:8px 12px;font-size:12px;font-style:italic;color:#8a7f72;border-bottom:none}
+.cl-tab{display:flex;align-items:center;gap:6px;padding:6px 12px;background:#ece7dd;border:1px solid #d5cec0;border-bottom:none;border-radius:5px 5px 0 0;cursor:pointer;font-size:12.5px;color:#6b6259;max-width:240px;position:relative;top:1px}
+.cl-tab:hover{background:#f0ebe3;color:#4a4139}
+.cl-tab.active{background:#faf8f4;color:#4a4139;font-weight:500;border-bottom:1px solid #faf8f4}
+.cl-tab-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.cl-tab-dirty{color:#b89a3a;font-size:14px;line-height:0}
+.cl-tab-close{flex-shrink:0;width:16px;height:16px;display:flex;align-items:center;justify-content:center;font-size:14px;border-radius:3px;color:#8a7f72;line-height:1}
+.cl-tab-close:hover{background:#d5cec0;color:#4a4139}
