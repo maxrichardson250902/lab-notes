@@ -3485,6 +3485,63 @@ GB_DIR = "/data/gb_files"
 OC_DEFAULT_URL = os.environ.get("OPENCLONING_URL", "http://localhost:8001")
 
 
+# ---------------------------------------------------------------------------
+# .gb backups — copy current file to .backups/{stem}/{timestamp}.gb before any
+# overwrite. Keeps last BACKUP_KEEP per file. Restored via the restore-backup
+# endpoint. Failures are logged and non-fatal — never block the user's save.
+# ---------------------------------------------------------------------------
+BACKUP_DIR = os.path.join(GB_DIR, ".backups")
+BACKUP_KEEP = 3
+
+
+def _backup_gb_file(fpath: str) -> Optional[str]:
+    """If fpath exists, copy it to BACKUP_DIR/{stem}/{timestamp}.gb and prune
+    older backups beyond BACKUP_KEEP. Returns the backup path or None."""
+    if not os.path.isfile(fpath):
+        return None
+    try:
+        import shutil
+        base = os.path.basename(fpath)
+        stem = base[:-3] if base.endswith(".gb") else base
+        bdir = os.path.join(BACKUP_DIR, stem)
+        os.makedirs(bdir, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        bpath = os.path.join(bdir, f"{ts}.gb")
+        if os.path.exists(bpath):
+            ms = datetime.utcnow().strftime("%f")[:3]
+            bpath = os.path.join(bdir, f"{ts}_{ms}.gb")
+        shutil.copy2(fpath, bpath)
+        entries = sorted(
+            (e for e in os.listdir(bdir) if e.endswith(".gb")),
+            reverse=True,
+        )
+        for old in entries[BACKUP_KEEP:]:
+            try:
+                os.remove(os.path.join(bdir, old))
+            except OSError:
+                pass
+        return bpath
+    except Exception as e:
+        print(f"[backup] failed for {fpath}: {e}", flush=True)
+        return None
+
+
+def _list_backups(fpath: str) -> list:
+    """Return list of backup timestamps for fpath, newest first."""
+    if not fpath.endswith(".gb"):
+        return []
+    base = os.path.basename(fpath)
+    stem = base[:-3]
+    bdir = os.path.join(BACKUP_DIR, stem)
+    if not os.path.isdir(bdir):
+        return []
+    entries = sorted(
+        (e for e in os.listdir(bdir) if e.endswith(".gb")),
+        reverse=True,
+    )
+    return [e[:-3] for e in entries]
+
+
 @router.get("/cloning/config")
 def get_config():
     primer_prefix = "MR"
@@ -3757,8 +3814,9 @@ def update_features(seq_type: str, seq_id: int, body: UpdateFeaturesRequest):
         )
         rec.features.append(feat)
 
-    # Write back
+    # Write back (backing up first)
     os.makedirs(GB_DIR, exist_ok=True)
+    _backup_gb_file(fpath)
     output = StringIO()
     _SeqIO.write(rec, output, "genbank")
     with open(fpath, "w") as f:
@@ -3774,7 +3832,14 @@ class ReindexRequest(BaseModel):
 @router.post("/cloning/sequences/{seq_type}/{seq_id}/reindex")
 def reindex_sequence(seq_type: str, seq_id: int, body: ReindexRequest):
     """Reindex a circular sequence — rotate so new_origin becomes position 0.
-    Remaps all feature coordinates and rewrites the .gb file."""
+
+    Iterates every part of every feature's location (handles both plain
+    FeatureLocation and CompoundLocation uniformly: plain locations expose a
+    one-item .parts list). Each part is shifted independently and split if
+    it now straddles the new origin. Parts on the same strand that end up
+    contiguous in the rotated coordinates are merged so we don't leave
+    cosmetic split points behind. Backs up the .gb file before writing.
+    """
     if seq_type not in ("primer", "plasmid", "kitpart", "gblock", "part"):
         raise HTTPException(400, "seq_type must be 'primer', 'plasmid', 'kitpart', 'gblock', or 'part'")
     fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
@@ -3783,7 +3848,7 @@ def reindex_sequence(seq_type: str, seq_id: int, body: ReindexRequest):
 
     from Bio import SeqIO as _SeqIO
     from Bio.Seq import Seq
-    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
     from io import StringIO
 
     records = list(_SeqIO.parse(fpath, "genbank"))
@@ -3799,68 +3864,155 @@ def reindex_sequence(seq_type: str, seq_id: int, body: ReindexRequest):
 
     origin = body.new_origin % slen
     if origin == 0:
-        return parse_genbank(fpath)  # no change needed
+        return parse_genbank(fpath)
 
     # Rotate sequence
-    new_seq = seq_str[origin:] + seq_str[:origin]
-    rec.seq = Seq(new_seq)
+    new_seq_str = seq_str[origin:] + seq_str[:origin]
+    rec.seq = Seq(new_seq_str)
 
-    # Remap features
+    def _shift_part(start, end, strand):
+        """Shift [start, end) by -origin (mod slen). Returns 1 part if it
+        doesn't cross the new origin, 2 parts if it does. Discards
+        zero-length or pathological results."""
+        span = end - start
+        if span <= 0 or span > slen:
+            return []
+        ns = (start - origin) % slen
+        if ns + span <= slen:
+            return [FeatureLocation(ns, ns + span, strand=strand)]
+        first_len = slen - ns
+        out = []
+        if first_len > 0:
+            out.append(FeatureLocation(ns, slen, strand=strand))
+        if span - first_len > 0:
+            out.append(FeatureLocation(0, span - first_len, strand=strand))
+        return out
+
+    def _merge_touching(parts):
+        """Merge parts that touch within the linear coordinate space (not
+        across the origin — the origin-wrap split is meaningful)."""
+        if len(parts) <= 1:
+            return parts
+        out = [parts[0]]
+        for p in parts[1:]:
+            last = out[-1]
+            if last.strand == p.strand and int(last.end) == int(p.start):
+                out[-1] = FeatureLocation(int(last.start), int(p.end), strand=last.strand)
+            else:
+                out.append(p)
+        return out
+
     new_features = []
     for feat in rec.features:
-        start = int(feat.location.start)
-        end = int(feat.location.end)
-        new_start = (start - origin) % slen
-        new_end = (end - origin) % slen
-
-        # Skip source features — we'll regenerate
         if feat.type == "source":
             continue
 
-        # If the feature doesn't wrap origin after reindex, keep it simple
-        if new_start < new_end:
-            new_feat = SeqFeature(
-                FeatureLocation(new_start, new_end, strand=feat.location.strand),
-                type=feat.type,
-                qualifiers=dict(feat.qualifiers),
-            )
-            new_features.append(new_feat)
-        else:
-            # Feature now wraps origin — use CompoundLocation to represent both halves
-            from Bio.SeqFeature import CompoundLocation
-            try:
-                loc = CompoundLocation([
-                    FeatureLocation(new_start, slen, strand=feat.location.strand),
-                    FeatureLocation(0, new_end, strand=feat.location.strand),
-                ])
-                new_feat = SeqFeature(loc, type=feat.type, qualifiers=dict(feat.qualifiers))
-                new_features.append(new_feat)
-            except Exception:
-                # Fallback: split into two separate features if CompoundLocation fails
-                new_features.append(SeqFeature(
-                    FeatureLocation(new_start, slen, strand=feat.location.strand),
-                    type=feat.type, qualifiers=dict(feat.qualifiers),
-                ))
-                new_features.append(SeqFeature(
-                    FeatureLocation(0, new_end, strand=feat.location.strand),
-                    type=feat.type, qualifiers=dict(feat.qualifiers),
-                ))
+        old_parts = list(feat.location.parts)
+        if not old_parts:
+            continue
 
-    # Rebuild feature list with source
+        # Flag previously-corrupted features (two parts touching, >=80% of sequence).
+        # Still rotate them through as-is — we don't have the original coords to
+        # repair, and silent mutation would be worse than a visible warning.
+        is_suspicious = (
+            len(old_parts) == 2
+            and int(old_parts[0].end) == int(old_parts[1].start)
+            and (int(old_parts[0].end) - int(old_parts[0].start)
+                 + int(old_parts[1].end) - int(old_parts[1].start)) >= int(slen * 0.8)
+        )
+        if is_suspicious:
+            label = (feat.qualifiers.get("label", [""])[0]
+                     or feat.qualifiers.get("gene", [""])[0]
+                     or feat.type)
+            print(f"[reindex] WARNING: feature '{label}' on {seq_type}_{seq_id} "
+                  f"has a suspicious CompoundLocation spanning >=80% of the "
+                  f"sequence — likely corrupted by a previous reindex. Carrying "
+                  f"through as-is.", flush=True)
+
+        new_parts = []
+        for p in old_parts:
+            new_parts.extend(_shift_part(int(p.start), int(p.end), feat.location.strand))
+
+        if not new_parts:
+            continue
+
+        # Biological 5'→3' order: ascending start for + strand, descending for -
+        if feat.location.strand == -1:
+            new_parts.sort(key=lambda fl: -int(fl.start))
+        else:
+            new_parts.sort(key=lambda fl: int(fl.start))
+
+        new_parts = _merge_touching(new_parts)
+
+        new_loc = new_parts[0] if len(new_parts) == 1 else CompoundLocation(new_parts)
+        new_features.append(SeqFeature(
+            new_loc, type=feat.type, qualifiers=dict(feat.qualifiers),
+        ))
+
     rec.features = [SeqFeature(
         FeatureLocation(0, slen),
         type="source",
         qualifiers={"mol_type": ["other DNA"], "organism": ["synthetic construct"]},
     )] + new_features
 
-    # Write back
+    # Back up the existing file before overwriting
+    backup_path = _backup_gb_file(fpath)
+
     output = StringIO()
     _SeqIO.write(rec, output, "genbank")
     with open(fpath, "w") as f:
         f.write(output.getvalue())
 
-    # Return freshly parsed data
-    return parse_genbank(fpath)
+    result = parse_genbank(fpath)
+    if backup_path:
+        result["_backup"] = os.path.basename(backup_path)
+    return result
+
+
+class RestoreBackupRequest(BaseModel):
+    timestamp: Optional[str] = None  # ISO timestamp; defaults to most recent
+
+
+@router.get("/cloning/sequences/{seq_type}/{seq_id}/backups")
+def list_backups_endpoint(seq_type: str, seq_id: int):
+    """List available backup timestamps for a .gb file (newest first)."""
+    if seq_type not in ("primer", "plasmid", "kitpart", "gblock", "part"):
+        raise HTTPException(400, "Invalid seq_type")
+    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
+    return {"timestamps": _list_backups(fpath)}
+
+
+@router.post("/cloning/sequences/{seq_type}/{seq_id}/restore-backup")
+def restore_backup(seq_type: str, seq_id: int, body: RestoreBackupRequest):
+    """Restore .gb from backup. Defaults to most recent. Backs up the current
+    state first so a wrong restore is itself reversible."""
+    if seq_type not in ("primer", "plasmid", "kitpart", "gblock", "part"):
+        raise HTTPException(400, "Invalid seq_type")
+    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
+    base = os.path.basename(fpath)
+    stem = base[:-3]
+    bdir = os.path.join(BACKUP_DIR, stem)
+    if not os.path.isdir(bdir):
+        raise HTTPException(404, "No backups exist for this file")
+
+    available = _list_backups(fpath)
+    if not available:
+        raise HTTPException(404, "No backups exist for this file")
+
+    ts = body.timestamp or available[0]
+    if ts not in available:
+        raise HTTPException(404, f"Backup {ts} not found. Available: {available}")
+
+    bpath = os.path.join(bdir, f"{ts}.gb")
+    if not os.path.isfile(bpath):
+        raise HTTPException(404, "Backup file missing on disk")
+
+    _backup_gb_file(fpath)  # back up current state so the restore is reversible
+
+    import shutil
+    shutil.copy2(bpath, fpath)
+
+    return {"ok": True, "restored_from": ts, "remaining_backups": _list_backups(fpath)}
 
 
 # ---------------------------------------------------------------------------
@@ -5429,4 +5581,3 @@ def run_golden_gate_assembly_endpoint(body: RunGoldenGateAssemblyRequest):
         vector=vec,
         enzyme=body.enzyme or "BsaI",
     )
-
