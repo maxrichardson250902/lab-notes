@@ -1359,6 +1359,8 @@ class ReindexRequest(BaseModel):
     prefix: str          # e.g. "MR", "pMR"
     start_num: int = 1
     execute: bool = False  # False = preview, True = apply
+    ids: Optional[list] = None   # If set, restrict to these row IDs (selection mode)
+    mode: str = "sequential"     # "sequential" (close gaps) or "shift" (rename to a contiguous block)
 
 _REINDEX_TABLES = {
     "primers": "primers",
@@ -1376,6 +1378,8 @@ def reindex_names(body: ReindexRequest):
     prefix = body.prefix.strip()
     if not prefix:
         raise HTTPException(400, "prefix is required")
+    if body.mode not in ("sequential", "shift"):
+        raise HTTPException(400, "mode must be 'sequential' or 'shift'")
 
     pattern = f"{prefix}%"
     with get_db() as conn:
@@ -1385,50 +1389,130 @@ def reindex_names(body: ReindexRequest):
         ).fetchall()
 
     if not rows:
-        return {"changes": [], "message": "No items match that prefix."}
+        return {"changes": [], "message": "No items match that prefix.", "total_items": 0}
 
-    # Parse numeric suffix, sort by number
+    # Parse numeric suffix, sort by number. Only pure prefix+number names participate.
     items = []
     for r in rows:
         name = r["name"]
         suffix = name[len(prefix):]
-        # Extract leading digits from suffix
         digits = ""
         for ch in suffix:
             if ch.isdigit():
                 digits += ch
             else:
                 break
-        if digits and suffix == digits:  # only pure prefix+number names
+        if digits and suffix == digits:
             items.append({"id": r["id"], "old_name": name, "old_num": int(digits)})
 
     items.sort(key=lambda x: x["old_num"])
+    total_items = len(items)
 
-    # Build rename plan
+    # If ids supplied, partition into selected (to-rename) and unselected
+    # (must not be clobbered). Items outside the selection still need to be
+    # known so we can detect target-name collisions.
+    if body.ids is not None:
+        id_set = set(int(i) for i in body.ids)
+        selected = [it for it in items if it["id"] in id_set]
+        unselected = [it for it in items if it["id"] not in id_set]
+        if not selected:
+            return {
+                "changes": [], "total_items": total_items,
+                "message": "None of the selected items match this prefix.",
+                "preview": True,
+            }
+    else:
+        selected = items
+        unselected = []
+
+    # Build rename plan.
+    # "sequential": assign start_num, start_num+1, ... to selected items in numeric order.
+    # "shift": same numbering rule, but applied only to selected items (semantically
+    #          identical to sequential when ids is set — kept as two named modes so
+    #          the user's intent is visible in logs / API and so future divergence
+    #          is easy).
     changes = []
     next_num = body.start_num
-    for item in items:
+    new_names_by_id = {}  # id -> new_name (for collision check)
+    for item in selected:
         new_name = f"{prefix}{next_num}"
+        new_names_by_id[item["id"]] = new_name
         if new_name != item["old_name"]:
             changes.append({
                 "id": item["id"],
                 "old_name": item["old_name"],
-                "new_name": new_name
+                "new_name": new_name,
             })
         next_num += 1
 
-    if not body.execute:
-        return {"changes": changes, "total_items": len(items), "preview": True}
+    # Collision detection: a target name must not already belong to an unselected
+    # item. (Targets that collide with other selected items are fine — those names
+    # are being moved too, and we do a two-phase rename below to avoid transient
+    # UNIQUE collisions.)
+    target_names = set(new_names_by_id.values())
+    unselected_names = {it["old_name"]: it["id"] for it in unselected}
+    blocked = []
+    for new_name in target_names:
+        if new_name in unselected_names:
+            # Find which selected item wanted that name
+            for sid, nn in new_names_by_id.items():
+                if nn == new_name:
+                    src = next((it for it in selected if it["id"] == sid), None)
+                    blocked.append({
+                        "target_name": new_name,
+                        "would_rename": src["old_name"] if src else "?",
+                        "occupied_by_id": unselected_names[new_name],
+                    })
+                    break
 
-    # Execute renames
+    if blocked:
+        # Refuse the whole rename — HTTP 409. Frontend reads `detail.blocked`
+        # and renders the per-row breakdown. Same response for preview and
+        # execute (the modal won't show an Apply button when blocked).
+        raise HTTPException(409, detail={
+            "detail": (
+                f"{len(blocked)} target name(s) are already taken by unselected items. "
+                "Pick a different start number, untick the conflicting items, or "
+                "renumber them out of the way first."
+            ),
+            "blocked": blocked,
+            "selected_count": len(selected),
+            "total_items": total_items,
+        })
+
+    if not body.execute:
+        return {
+            "changes": changes,
+            "total_items": total_items,
+            "selected_count": len(selected),
+            "blocked": [],
+            "preview": True,
+            "ok": True,
+        }
+
+    # Execute. Two-phase rename to avoid transient UNIQUE collisions between
+    # selected items mid-rename (if any DB constraint exists on `name`): first
+    # rename every changing row to a temporary unique token, then to its final
+    # name. Tokens use the row id so they're unique.
     renamed = 0
     with get_db() as conn:
+        for c in changes:
+            tmp = f"__reindex_tmp_{c['id']}_{datetime.utcnow().timestamp()}"
+            conn.execute(f"UPDATE {table} SET name=? WHERE id=?", (tmp, c["id"]))
         for c in changes:
             conn.execute(f"UPDATE {table} SET name=? WHERE id=?", (c["new_name"], c["id"]))
             renamed += 1
         conn.commit()
 
-    return {"changes": changes, "renamed": renamed, "preview": False}
+    return {
+        "changes": changes,
+        "renamed": renamed,
+        "total_items": total_items,
+        "selected_count": len(selected),
+        "blocked": [],
+        "preview": False,
+        "ok": True,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
