@@ -438,6 +438,11 @@ function _dnaBulkBar(tab, endpoint) {
   html += '</div>';
 
   html += '<div style="flex:1"></div>';
+  // IDT export — only meaningful for items with sequences (primer/gblock/part)
+  if (tab === 'primers' || tab === 'gblocks' || tab === 'parts') {
+    html += '<button class="btn btn-sm" style="background:#5b7a5e;color:#fff;font-size:.76rem" title="Export selected for IDT order (matches their template)" onclick="_dnaExportIdt(\x27' + tab + '\x27,\x27xlsx\x27)">\u{1F4E5} XLSX</button>';
+    html += '<button class="btn btn-sm" style="background:#5b7a5e;color:#fff;font-size:.76rem" title="Export selected as CSV" onclick="_dnaExportIdt(\x27' + tab + '\x27,\x27csv\x27)">CSV</button>';
+  }
   html += '<button class="btn btn-sm" style="background:#8a7f72;color:#fff;font-size:.76rem" title="Renumber selected items" onclick="_dnaShowReindex(\x27' + tab + '\x27,true)">\u{1F522} Reindex</button>';
   html += '<button class="btn btn-sm" style="background:#c0392b;color:#fff;font-size:.76rem" onclick="_dnaBulkDelete(\x27' + tab + '\x27,\x27' + endpoint + '\x27)">Delete</button>';
   html += '<button class="btn btn-sm" style="font-size:.76rem" onclick="_dnaClearSel(\x27' + tab + '\x27);_dnaRenderTable()">\u00d7 Clear</button>';
@@ -504,6 +509,56 @@ async function _dnaBulkDelete(tab, endpoint) {
   if (errors) toast(errors + ' item(s) failed to delete.', true);
   else toast(ids.length + ' item(s) deleted.');
   _dnaRefresh();
+}
+
+// IDT export — POSTs the selected items to /api/dna/export-idt and triggers
+// a browser download. Tab → backend type singular: primers→primer etc.
+// Currently only supports primer/gblock/part tabs (others have no sequence).
+var _dnaExportTypeMap = { primers: 'primer', gblocks: 'gblock', parts: 'part' };
+
+async function _dnaExportIdt(tab, format) {
+  var backendType = _dnaExportTypeMap[tab];
+  if (!backendType) { toast('Export not supported on this tab.', true); return; }
+  var sel = _dna.selected[tab] || {};
+  var ids = Object.keys(sel).map(Number);
+  if (!ids.length) { toast('Nothing selected.', true); return; }
+
+  var items = ids.map(function(id) { return { type: backendType, id: id }; });
+
+  try {
+    // Use fetch directly — api() typically parses JSON, but we need the raw blob
+    var resp = await fetch('/api/dna/export-idt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: items, format: format }),
+    });
+    if (!resp.ok) {
+      // Try to extract a useful message from the error JSON
+      var msg = 'Export failed (' + resp.status + ')';
+      try { var j = await resp.json(); if (j.detail) msg = j.detail; } catch(_) {}
+      toast(msg, true);
+      return;
+    }
+    var blob = await resp.blob();
+    // Filename comes from Content-Disposition if present, else fall back
+    var fname = 'IDT_order.' + format;
+    var cd = resp.headers.get('Content-Disposition') || '';
+    var m = /filename="([^"]+)"/.exec(cd);
+    if (m) fname = m[1];
+
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function() {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 100);
+    toast('Exported ' + ids.length + ' item(s) to ' + format.toUpperCase() + '.');
+  } catch(e) {
+    toast('Export failed: ' + (e.message || 'Unknown'), true);
+  }
 }
 
 function _dnaCheckboxTh(tab, visibleIds) {
@@ -661,7 +716,6 @@ function _dnaPrimerTable() {
   }
 
   html += _dnaAddPrimerRow();
-  html += '<div style="margin-top:.3rem;text-align:right">' + _dnaReindexButton('primers') + '</div>';
   return html;
 }
 
@@ -851,7 +905,6 @@ function _dnaPlasmidTable() {
   html += '<input id="dna-pl-gly" placeholder="Glycerol" class="dna-input" style="flex:1">';
   html += '<button class="btn btn-sm" onclick="_dnaAddPlasmid()">Add</button>';
   html += '</div>';
-  html += '<div style="margin-top:.3rem;text-align:right">' + _dnaReindexButton('plasmids') + '</div>';
   html += _dnaProjectDatalist();
   return html;
 }
@@ -950,7 +1003,7 @@ function _dnaGblockTable() {
     html += '</tbody></table></div>';
   }
 
-  html += '<div style="margin-top:.6rem;display:flex;justify-content:space-between;align-items:center"><button class="btn btn-sm" onclick="_dnaShowGblockForm()">\u002B Add gBlock</button>' + _dnaReindexButton('gblocks') + '</div>';
+  html += '<div style="margin-top:.6rem"><button class="btn btn-sm" onclick="_dnaShowGblockForm()">\u002B Add gBlock</button></div>';
   return html;
 }
 
@@ -1112,7 +1165,7 @@ function _dnaKitPartTable() {
     html += '</tbody></table></div>';
   }
 
-  html += '<div style="margin-top:.6rem;display:flex;justify-content:space-between;align-items:center"><button class="btn btn-sm" onclick="_dnaShowKitPartForm()">\u002B Add Kit Part</button>' + _dnaReindexButton('kitParts') + '</div>';
+  html += '<div style="margin-top:.6rem"><button class="btn btn-sm" onclick="_dnaShowKitPartForm()">\u002B Add Kit Part</button></div>';
   return html;
 }
 
@@ -1250,7 +1303,7 @@ function _dnaPartsTable() {
     html += '</tbody></table></div>';
   }
 
-  html += '<div style="margin-top:.6rem;display:flex;justify-content:space-between;align-items:center"><button class="btn btn-sm" onclick="_dnaShowPartForm()">\u002B Add Part</button>' + _dnaReindexButton('parts') + '</div>';
+  html += '<div style="margin-top:.6rem"><button class="btn btn-sm" onclick="_dnaShowPartForm()">\u002B Add Part</button></div>';
   return html;
 }
 
