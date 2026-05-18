@@ -438,6 +438,7 @@ function _dnaBulkBar(tab, endpoint) {
   html += '</div>';
 
   html += '<div style="flex:1"></div>';
+  html += '<button class="btn btn-sm" style="background:#8a7f72;color:#fff;font-size:.76rem" title="Renumber selected items" onclick="_dnaShowReindex(\x27' + tab + '\x27,true)">\u{1F522} Reindex</button>';
   html += '<button class="btn btn-sm" style="background:#c0392b;color:#fff;font-size:.76rem" onclick="_dnaBulkDelete(\x27' + tab + '\x27,\x27' + endpoint + '\x27)">Delete</button>';
   html += '<button class="btn btn-sm" style="font-size:.76rem" onclick="_dnaClearSel(\x27' + tab + '\x27);_dnaRenderTable()">\u00d7 Clear</button>';
   html += '</div>';
@@ -1780,23 +1781,66 @@ var _dnaReindexEndpoints = {
   primers: 'primers', plasmids: 'plasmids', gblocks: 'gblocks', kitParts: 'kit_parts', parts: 'parts'
 };
 
-function _dnaShowReindex(tab) {
+function _dnaShowReindex(tab, useSelection) {
   var endpoint = _dnaReindexEndpoints[tab] || tab;
   var defaultPrefix = (_dnaReindexDefaults[tab] || function() { return ''; })();
+
+  // If called from the bulk bar, lock to the current selection.
+  // Selection is stored as a {id: true} map under _dna.selected[tab].
+  var selIds = [];
+  if (useSelection) {
+    var selMap = (_dna.selected && _dna.selected[tab]) || {};
+    selIds = Object.keys(selMap).map(Number);
+    if (!selIds.length) {
+      toast('No items selected.');
+      return;
+    }
+  }
+  // Stash for the preview/execute calls — avoids passing a JSON-encoded list
+  // through onclick attributes (escaping nightmare).
+  _dna._reindexCtx = {
+    tab: tab,
+    endpoint: endpoint,
+    ids: selIds,           // empty array = "all matching", non-empty = selection
+    useSelection: !!useSelection,
+  };
 
   var ov = document.getElementById('dna-import-overlay');
   if (!ov) return;
 
-  var html = '<div class="dna-modal" style="max-width:520px">';
+  var titleSuffix = useSelection ? ' (' + selIds.length + ' selected)' : '';
+
+  var html = '<div class="dna-modal" style="max-width:560px">';
   html += '<div style="display:flex;justify-content:space-between;align-items:baseline">';
-  html += '<h3 style="margin:0">Reindex \u2014 Close Naming Gaps</h3>';
+  html += '<h3 style="margin:0">Reindex' + titleSuffix + '</h3>';
   html += '<span class="dna-del" onclick="_dnaCloseOverlay()" style="font-size:1.4rem">\u00d7</span>';
   html += '</div>';
-  html += '<p class="muted" style="font-size:.82rem;margin:.5rem 0">Renumber items matching a prefix to close gaps (e.g. MR1, MR3, MR7 \u2192 MR1, MR2, MR3).</p>';
+
+  if (useSelection) {
+    html += '<p class="muted" style="font-size:.82rem;margin:.5rem 0">Operating on <strong>' + selIds.length + '</strong> selected item(s). Items that don\'t match the prefix below will be ignored.</p>';
+  } else {
+    html += '<p class="muted" style="font-size:.82rem;margin:.5rem 0">Renumber items matching a prefix to close gaps (e.g. MR1, MR3, MR7 \u2192 MR1, MR2, MR3).</p>';
+  }
+
+  // Mode toggle — only shown when working from a selection (sequential-only
+  // makes sense for whole-table renumbering).
+  if (useSelection) {
+    html += '<div style="margin-bottom:.7rem;font-size:.85rem">';
+    html += '<label style="display:flex;align-items:flex-start;gap:.4rem;margin-bottom:.3rem;cursor:pointer">';
+    html += '<input type="radio" name="dna-reindex-mode" value="sequential" checked style="margin-top:.2rem">';
+    html += '<span><strong>Sequential</strong> \u2014 renumber selected items contiguously from <em>start_num</em>, closing gaps among them.</span>';
+    html += '</label>';
+    html += '<label style="display:flex;align-items:flex-start;gap:.4rem;cursor:pointer">';
+    html += '<input type="radio" name="dna-reindex-mode" value="shift" style="margin-top:.2rem">';
+    html += '<span><strong>Shift</strong> \u2014 pack selected items into <em>start_num</em>, <em>start_num+1</em>, \u2026 Unselected items keep their names (refuses if a target slot is taken).</span>';
+    html += '</label>';
+    html += '</div>';
+  }
+
   html += '<div style="display:flex;gap:.6rem;align-items:end;margin-bottom:.8rem">';
   html += '<label class="dna-edit-label">Prefix<input id="dna-reindex-prefix" class="dna-input" value="' + esc(defaultPrefix) + '" style="width:8rem"></label>';
   html += '<label class="dna-edit-label">Start at<input id="dna-reindex-start" class="dna-input" type="number" min="1" value="1" style="width:5rem"></label>';
-  html += '<button class="btn btn-sm" style="background:#5b7a5e;color:#fff" onclick="_dnaReindexPreview(\x27' + endpoint + '\x27)">Preview</button>';
+  html += '<button class="btn btn-sm" style="background:#5b7a5e;color:#fff" onclick="_dnaReindexPreview()">Preview</button>';
   html += '</div>';
   html += '<div id="dna-reindex-preview"></div>';
   html += '</div>';
@@ -1804,59 +1848,141 @@ function _dnaShowReindex(tab) {
   ov.style.display = '';
 }
 
-async function _dnaReindexPreview(endpoint) {
-  var prefix = (document.getElementById('dna-reindex-prefix') || {}).value || '';
+function _dnaReindexReadCtx() {
+  // Pull the inputs + stashed context. Returns null on error.
+  var ctx = _dna._reindexCtx || {};
+  var prefix = ((document.getElementById('dna-reindex-prefix') || {}).value || '').trim();
   var startNum = parseInt((document.getElementById('dna-reindex-start') || {}).value, 10) || 1;
-  if (!prefix.trim()) { toast('Enter a prefix.'); return; }
+  if (!prefix) { toast('Enter a prefix.'); return null; }
+  var modeEl = document.querySelector('input[name="dna-reindex-mode"]:checked');
+  var mode = modeEl ? modeEl.value : 'sequential';
+  return {
+    endpoint: ctx.endpoint,
+    prefix: prefix,
+    start_num: startNum,
+    ids: (ctx.ids && ctx.ids.length) ? ctx.ids : null,
+    mode: mode,
+  };
+}
 
+async function _dnaReindexPreview() {
+  var c = _dnaReindexReadCtx();
+  if (!c) return;
   var el = document.getElementById('dna-reindex-preview');
   if (!el) return;
   el.innerHTML = '<div class="muted" style="padding:.5rem">Loading preview\u2026</div>';
 
+  var body = {
+    table: c.endpoint, prefix: c.prefix, start_num: c.start_num,
+    mode: c.mode, execute: false,
+  };
+  if (c.ids) body.ids = c.ids;
+
   try {
-    var data = await api('POST', '/api/dna/reindex', {
-      table: endpoint, prefix: prefix.trim(), start_num: startNum, execute: false
-    });
-
-    if (!data.changes || data.changes.length === 0) {
-      el.innerHTML = '<div class="muted" style="padding:.5rem">' +
-        (data.total_items ? 'No gaps found \u2014 ' + data.total_items + ' items already sequential.' : 'No items match prefix "' + esc(prefix) + '".') +
-        '</div>';
-      return;
-    }
-
-    var html = '<div style="font-size:.82rem;margin-bottom:.5rem"><strong>' + data.changes.length + '</strong> rename(s) needed out of ' + data.total_items + ' items:</div>';
-    html += '<div style="max-height:250px;overflow-y:auto;border:1px solid #e8e2d8;border-radius:4px">';
-    html += '<table class="dna-table" style="font-size:.82rem"><thead><tr><th>Current</th><th></th><th>New</th></tr></thead><tbody>';
-    data.changes.forEach(function(c) {
-      html += '<tr>';
-      html += '<td><code style="color:#c0392b">' + esc(c.old_name) + '</code></td>';
-      html += '<td style="text-align:center;color:#8a7f72">\u2192</td>';
-      html += '<td><code style="color:#5b7a5e">' + esc(c.new_name) + '</code></td>';
-      html += '</tr>';
-    });
-    html += '</tbody></table></div>';
-    html += '<div style="margin-top:.6rem;display:flex;gap:.4rem">';
-    html += '<button class="btn btn-sm" style="background:#c0392b;color:#fff" onclick="_dnaReindexExecute(\x27' + endpoint + '\x27)">Apply Renames</button>';
-    html += '<button class="btn btn-sm" onclick="_dnaCloseOverlay()">Cancel</button>';
-    html += '</div>';
-    el.innerHTML = html;
+    var data = await api('POST', '/api/dna/reindex', body);
+    _dnaRenderReindexPreview(el, data, c);
   } catch(e) {
-    el.innerHTML = '<div class="muted" style="color:#c0392b;padding:.5rem">Error: ' + esc(e.message || 'Unknown') + '</div>';
+    // Collision case — backend returns HTTP 409 with structured detail.
+    // Different api() implementations surface this slightly differently;
+    // try a few shapes.
+    var detail = (e && (e.detail || e.body || e.response)) || null;
+    if (detail && typeof detail === 'object' && Array.isArray(detail.blocked)) {
+      _dnaRenderReindexBlocked(el, detail, c);
+    } else {
+      el.innerHTML = '<div class="muted" style="color:#c0392b;padding:.5rem">Error: ' + esc(e.message || 'Unknown') + '</div>';
+    }
   }
 }
 
-async function _dnaReindexExecute(endpoint) {
-  var prefix = (document.getElementById('dna-reindex-prefix') || {}).value || '';
-  var startNum = parseInt((document.getElementById('dna-reindex-start') || {}).value, 10) || 1;
+function _dnaRenderReindexPreview(el, data, c) {
+  if (!data.changes || data.changes.length === 0) {
+    var msg;
+    if (data.total_items === 0) {
+      msg = 'No items match prefix "' + esc(c.prefix) + '".';
+    } else if (data.selected_count === 0) {
+      msg = 'None of the selected items match this prefix.';
+    } else {
+      msg = 'No renames needed \u2014 already in target order.';
+    }
+    el.innerHTML = '<div class="muted" style="padding:.5rem">' + msg + '</div>';
+    return;
+  }
+
+  var scopeStr;
+  if (c.ids) {
+    scopeStr = '<strong>' + data.changes.length + '</strong> rename(s) across <strong>' +
+               (data.selected_count || c.ids.length) + '</strong> selected item(s)';
+  } else {
+    scopeStr = '<strong>' + data.changes.length + '</strong> rename(s) needed out of ' +
+               data.total_items + ' items';
+  }
+
+  var html = '<div style="font-size:.82rem;margin-bottom:.5rem">' + scopeStr + ':</div>';
+  html += '<div style="max-height:250px;overflow-y:auto;border:1px solid #e8e2d8;border-radius:4px">';
+  html += '<table class="dna-table" style="font-size:.82rem"><thead><tr><th>Current</th><th></th><th>New</th></tr></thead><tbody>';
+  data.changes.forEach(function(ch) {
+    html += '<tr>';
+    html += '<td><code style="color:#c0392b">' + esc(ch.old_name) + '</code></td>';
+    html += '<td style="text-align:center;color:#8a7f72">\u2192</td>';
+    html += '<td><code style="color:#5b7a5e">' + esc(ch.new_name) + '</code></td>';
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  html += '<div style="margin-top:.6rem;display:flex;gap:.4rem">';
+  html += '<button class="btn btn-sm" style="background:#c0392b;color:#fff" onclick="_dnaReindexExecute()">Apply Renames</button>';
+  html += '<button class="btn btn-sm" onclick="_dnaCloseOverlay()">Cancel</button>';
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function _dnaRenderReindexBlocked(el, detail, c) {
+  var html = '<div style="background:#fdf0e0;border:1px solid #e8c39d;border-radius:4px;padding:.6rem;margin-bottom:.5rem;font-size:.82rem">';
+  html += '<div style="font-weight:600;color:#9a6210;margin-bottom:.3rem">Cannot rename \u2014 ' + detail.blocked.length + ' target slot(s) already taken</div>';
+  html += '<div style="font-size:.78rem;color:#8a7f72;margin-bottom:.4rem">' + esc(detail.detail || '') + '</div>';
+  html += '<table class="dna-table" style="font-size:.78rem"><thead><tr><th>Want to use</th><th>For</th><th>Already held by</th></tr></thead><tbody>';
+  detail.blocked.forEach(function(b) {
+    html += '<tr>';
+    html += '<td><code style="color:#c0392b">' + esc(b.target_name) + '</code></td>';
+    html += '<td><code>' + esc(b.would_rename) + '</code></td>';
+    html += '<td><code style="color:#8a7f72">id ' + b.occupied_by_id + '</code></td>';
+    html += '</tr>';
+  });
+  html += '</tbody></table></div>';
+  html += '<div style="display:flex;gap:.4rem"><button class="btn btn-sm" onclick="_dnaCloseOverlay()">Close</button></div>';
+  el.innerHTML = html;
+}
+
+async function _dnaReindexExecute() {
+  var c = _dnaReindexReadCtx();
+  if (!c) return;
+  var body = {
+    table: c.endpoint, prefix: c.prefix, start_num: c.start_num,
+    mode: c.mode, execute: true,
+  };
+  if (c.ids) body.ids = c.ids;
+
   try {
-    var data = await api('POST', '/api/dna/reindex', {
-      table: endpoint, prefix: prefix.trim(), start_num: startNum, execute: true
-    });
+    var data = await api('POST', '/api/dna/reindex', body);
     toast(data.renamed + ' item(s) renamed.');
+    if (c.ids && _dna.selected && _dna.selected[c.endpoint === 'kit_parts' ? 'kitParts' : c.endpoint]) {
+      // Clear the selection for the affected tab so the bulk bar disappears
+      var tabKey = c.endpoint === 'kit_parts' ? 'kitParts' : c.endpoint;
+      _dna.selected[tabKey] = {};
+    }
     _dnaCloseOverlay();
     _dnaRefresh();
-  } catch(e) { toast('Reindex failed: ' + (e.message || 'Unknown'), true); }
+  } catch(e) {
+    var detail = (e && (e.detail || e.body || e.response)) || null;
+    if (detail && typeof detail === 'object' && Array.isArray(detail.blocked)) {
+      // Race condition — collision appeared between preview and execute.
+      // Re-render the modal preview area with the block message.
+      var el = document.getElementById('dna-reindex-preview');
+      if (el) _dnaRenderReindexBlocked(el, detail, c);
+      else toast('Reindex blocked: ' + detail.blocked.length + ' target slot(s) taken.', true);
+    } else {
+      toast('Reindex failed: ' + (e.message || 'Unknown'), true);
+    }
+  }
 }
 
 function _dnaReindexButton(tab) {
