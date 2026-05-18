@@ -4015,6 +4015,100 @@ def restore_backup(seq_type: str, seq_id: int, body: RestoreBackupRequest):
     return {"ok": True, "restored_from": ts, "remaining_backups": _list_backups(fpath)}
 
 
+@router.post("/cloning/sequences/{seq_type}/{seq_id}/toggle-topology")
+def toggle_topology(seq_type: str, seq_id: int):
+    """Flip the topology of a .gb file (circular ↔ linear).
+
+    Linearising is the dangerous direction: any feature that wraps the
+    origin (CompoundLocation with >1 part, OR a single-part feature that
+    starts at 0 / ends at the sequence length and visually wraps) becomes
+    nonsense on a linear molecule. We refuse rather than silently
+    mangle — the user can reindex to a clean position first, or split
+    the offending features manually in the cloning view.
+
+    Circular → linear: refuse if any feature wraps the origin.
+    Linear → circular: always allowed (no feature surgery needed).
+
+    Backs up the .gb file before writing.
+    """
+    if seq_type not in ("primer", "plasmid", "kitpart", "gblock", "part"):
+        raise HTTPException(400, "seq_type must be 'primer', 'plasmid', 'kitpart', 'gblock', or 'part'")
+    fpath = os.path.join(GB_DIR, f"{seq_type}_{seq_id}.gb")
+    if not os.path.isfile(fpath):
+        raise HTTPException(404, "GenBank file not found")
+
+    from Bio import SeqIO as _SeqIO
+    from Bio.SeqFeature import CompoundLocation
+    from io import StringIO
+
+    records = list(_SeqIO.parse(fpath, "genbank"))
+    if not records:
+        raise HTTPException(400, "No records found in GenBank file")
+    rec = records[0]
+    slen = len(rec.seq)
+    current = rec.annotations.get("topology", "linear")
+    new_topology = "linear" if current == "circular" else "circular"
+
+    # Refuse circular → linear if any feature wraps the origin.
+    # Two patterns count as "wrapping":
+    #   (a) CompoundLocation with >1 part (the explicit join(...) representation)
+    #   (b) A single-part feature whose end exceeds slen — shouldn't happen
+    #       in normal files but we check anyway.
+    if new_topology == "linear":
+        wrapping = []
+        for feat in rec.features:
+            if feat.type == "source":
+                continue
+            parts = list(feat.location.parts)
+            label = (feat.qualifiers.get("label", [""])[0]
+                     or feat.qualifiers.get("gene", [""])[0]
+                     or feat.type)
+            if len(parts) > 1:
+                # Compound — assume any compound on a circular file is an origin-wrap.
+                wrapping.append({
+                    "label": label,
+                    "type": feat.type,
+                    "parts": [{"start": int(p.start), "end": int(p.end)} for p in parts],
+                })
+            else:
+                p = parts[0]
+                if int(p.end) > slen or int(p.start) < 0:
+                    wrapping.append({
+                        "label": label,
+                        "type": feat.type,
+                        "parts": [{"start": int(p.start), "end": int(p.end)}],
+                    })
+
+        if wrapping:
+            raise HTTPException(409, {
+                "error": "Cannot linearise: features wrap the origin",
+                "detail": (
+                    f"{len(wrapping)} feature(s) cross position 0 and would become "
+                    "ambiguous on a linear molecule. Reindex to a position outside "
+                    "every feature first, then try again. Or delete/split the "
+                    "wrapping features in the cloning view."
+                ),
+                "wrapping_features": wrapping,
+            })
+
+    # Back up, then update the topology annotation.
+    # BioPython writes "circular" / "linear" into the LOCUS line from this
+    # annotation, so no other field needs touching.
+    _backup_gb_file(fpath)
+    rec.annotations["topology"] = new_topology
+
+    output = StringIO()
+    _SeqIO.write(rec, output, "genbank")
+    with open(fpath, "w") as f:
+        f.write(output.getvalue())
+
+    return {
+        "ok": True,
+        "previous_topology": current,
+        "new_topology": new_topology,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Sequence analysis endpoints
 # ---------------------------------------------------------------------------
