@@ -1516,6 +1516,209 @@ def reindex_names(body: ReindexRequest):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  IDT EXPORT — matches Template_for_IDT_primer_order.xlsx shape
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Layout (per the user's template):
+#   Primers sheet:  Name | Sequence | Scale | Purification     (25nm / STD defaults)
+#   gBlocks sheet:  Name | Sequence | Length | Notes            (kept separate because
+#                                                                IDT's actual gBlock form
+#                                                                differs from primer form)
+#   Parts sheet:    Name | Sequence | Length | Notes
+#
+# Sequence case is preserved verbatim — lowercase indicates modifications in
+# the user's primer-design conventions and must not be normalised.
+
+class IdtExportItem(BaseModel):
+    type: str   # primer | gblock | part
+    id: int
+
+class IdtExportRequest(BaseModel):
+    items: list   # list of {type, id} dicts
+    format: str = "xlsx"   # "xlsx" or "csv"
+    scale_default: str = "25nm"
+    purification_default: str = "STD"
+
+
+_IDT_TYPE_TABLE = {
+    "primer":  ("primers",  "name", "sequence"),
+    "gblock":  ("gblocks",  "name", "sequence"),
+    "part":    ("parts",    "name", "sequence"),
+}
+
+
+def _fetch_idt_rows(items: list) -> dict:
+    """Group items by type and fetch their name+sequence from the right table.
+    Returns {type: [(name, sequence), ...]} preserving the order they appeared
+    in the request — so the user's row order in the UI carries through to
+    the spreadsheet."""
+    # Bucket request items by type, remembering positional order
+    by_type = {}  # type -> [(order_idx, id), ...]
+    for idx, it in enumerate(items):
+        t = it.get("type")
+        rid = it.get("id")
+        if t not in _IDT_TYPE_TABLE:
+            continue  # silently skip unknown types
+        if rid is None:
+            continue
+        by_type.setdefault(t, []).append((idx, int(rid)))
+
+    out = {}
+    with get_db() as conn:
+        for t, pairs in by_type.items():
+            table, name_col, seq_col = _IDT_TYPE_TABLE[t]
+            ids = [p[1] for p in pairs]
+            # Use IN(...) with explicit placeholders. sqlite caps at ~999 params
+            # by default — fine for any realistic plate-scale order (≤96).
+            qmarks = ",".join("?" * len(ids))
+            rows = conn.execute(
+                f"SELECT id, {name_col} AS name, {seq_col} AS sequence FROM {table} WHERE id IN ({qmarks})",
+                ids
+            ).fetchall()
+            by_id = {r["id"]: r for r in rows}
+            ordered = []
+            for idx, rid in pairs:
+                r = by_id.get(rid)
+                if not r:
+                    continue
+                name = (r["name"] or "").strip()
+                seq = (r["sequence"] or "")  # preserve case
+                if not seq.strip():
+                    continue  # skip items without a sequence
+                ordered.append({"order_idx": idx, "name": name, "sequence": seq})
+            # Sort by original request order
+            ordered.sort(key=lambda x: x["order_idx"])
+            out[t] = [(x["name"], x["sequence"]) for x in ordered]
+    return out
+
+
+def _build_idt_xlsx(rows_by_type: dict, scale: str, purif: str) -> bytes:
+    """Build an .xlsx with one sheet per type. Header row bold, column widths
+    matching the IDT primer template."""
+    if not HAS_OPENPYXL:
+        raise HTTPException(500, "openpyxl not available")
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+
+    wb = Workbook()
+    # Remove the default sheet — we'll add named sheets per type
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    bold = Font(bold=True, name="Calibri", size=11)
+
+    # Define per-type sheet schemas
+    schemas = {
+        "primer": {
+            "title": "Primers",
+            "headers": ["Name", "Sequence", "Scale", "Purification"],
+            "widths": [12.5, 76.8, 10.2, 18.8],   # matched to template
+            "row_from_item": lambda name, seq: [name, seq, scale, purif],
+        },
+        "gblock": {
+            "title": "gBlocks",
+            "headers": ["Name", "Sequence", "Length", "Notes"],
+            "widths": [16, 76.8, 10, 24],
+            "row_from_item": lambda name, seq: [name, seq, len(seq.replace(" ", "").replace("\n", "")), ""],
+        },
+        "part": {
+            "title": "Parts",
+            "headers": ["Name", "Sequence", "Length", "Notes"],
+            "widths": [16, 76.8, 10, 24],
+            "row_from_item": lambda name, seq: [name, seq, len(seq.replace(" ", "").replace("\n", "")), ""],
+        },
+    }
+
+    # Add sheets in a consistent order: primers first, then gblocks, then parts
+    for t in ("primer", "gblock", "part"):
+        rows = rows_by_type.get(t, [])
+        if not rows:
+            continue
+        schema = schemas[t]
+        ws = wb.create_sheet(schema["title"])
+        ws.append(schema["headers"])
+        for c in ws[1]:
+            c.font = bold
+        for col_idx, w in enumerate(schema["widths"], start=1):
+            ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = w
+        for name, seq in rows:
+            ws.append(schema["row_from_item"](name, seq))
+
+    # If nothing was added (edge case: all items had no sequence) keep a
+    # placeholder sheet so the file isn't malformed
+    if not wb.sheetnames:
+        ws = wb.create_sheet("Empty")
+        ws["A1"] = "No items with sequences were exported."
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _build_idt_csv(rows_by_type: dict, scale: str, purif: str) -> str:
+    """Build a CSV. Multi-type exports use '## type' separator lines so the
+    file remains legible. Single-type exports get a plain CSV with no banner."""
+    out = io.StringIO()
+    writer = csv.writer(out)
+    types_present = [t for t in ("primer", "gblock", "part") if rows_by_type.get(t)]
+    multi = len(types_present) > 1
+
+    schemas = {
+        "primer": (["Name", "Sequence", "Scale", "Purification"],
+                   lambda name, seq: [name, seq, scale, purif]),
+        "gblock": (["Name", "Sequence", "Length", "Notes"],
+                   lambda name, seq: [name, seq, len(seq.replace(" ", "").replace("\n", "")), ""]),
+        "part":   (["Name", "Sequence", "Length", "Notes"],
+                   lambda name, seq: [name, seq, len(seq.replace(" ", "").replace("\n", "")), ""]),
+    }
+
+    for t in types_present:
+        headers, row_fn = schemas[t]
+        if multi:
+            writer.writerow([f"## {t}s"])
+        writer.writerow(headers)
+        for name, seq in rows_by_type[t]:
+            writer.writerow(row_fn(name, seq))
+        if multi:
+            writer.writerow([])  # blank separator
+    return out.getvalue()
+
+
+@router.post("/dna/export-idt")
+def export_idt(body: IdtExportRequest):
+    """Export selected primers/gblocks/parts in IDT order-form layout.
+    Items are grouped by type into separate sheets (xlsx) or banner-separated
+    blocks (csv). Sequences preserve case (lowercase = modifications)."""
+    from fastapi.responses import StreamingResponse
+
+    if body.format not in ("xlsx", "csv"):
+        raise HTTPException(400, "format must be 'xlsx' or 'csv'")
+    if not body.items:
+        raise HTTPException(400, "No items provided")
+
+    rows_by_type = _fetch_idt_rows(body.items)
+    total_rows = sum(len(v) for v in rows_by_type.values())
+    if total_rows == 0:
+        raise HTTPException(404, "None of the selected items have a sequence to export")
+
+    ts = datetime.utcnow().strftime("%Y%m%d")
+    if body.format == "xlsx":
+        data = _build_idt_xlsx(rows_by_type, body.scale_default, body.purification_default)
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="IDT_order_{ts}.xlsx"'},
+        )
+    else:
+        text = _build_idt_csv(rows_by_type, body.scale_default, body.purification_default)
+        return StreamingResponse(
+            io.BytesIO(text.encode("utf-8")),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="IDT_order_{ts}.csv"'},
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  DNA LINK SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
 
