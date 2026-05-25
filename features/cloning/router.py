@@ -5469,30 +5469,67 @@ def run_golden_gate_assembly(fragments: list, vector: dict = None,
             piece_cuts.append({"piece_idx": pi, "name": piece["name"], "valid": False, "sites": len(sites)})
             continue
 
-        # The insert region is between the two cuts
-        # For a typical part: [site_fwd]---INSERT---[site_rev]
-        # After cutting: left_sticky + INSERT + right_sticky
-        # Determine which end is left and which is right based on cut positions
+        # The region between the two cuts is the "inside" of the cassette.
+        # For an INSERT, that's the part we KEEP (the actual gene/part).
+        # For a VECTOR (destination vector with stuffer e.g. lacZ between BsaI sites
+        # pointing inward), the inside is the STUFFER we discard, and the backbone
+        # wraps around the circular origin.
+        # Determine which end is left and which is right based on cut positions.
         if cut_left["cut_pos"] > cut_right["cut_pos"]:
             cut_left, cut_right = cut_right, cut_left
 
-        # Extract the insert region between cuts (including sticky ends)
         left_pos = cut_left["cut_pos"]
         right_pos = cut_right["cut_pos"] + oh_len
 
-        left_sticky = seq[left_pos:left_pos + oh_len].upper()
-        right_sticky = seq[right_pos - oh_len:right_pos].upper()
-        insert_seq = seq[left_pos + oh_len:right_pos - oh_len]
+        is_vector = bool(piece.get("is_vector"))
 
-        # Remap annotations onto the insert region
-        insert_anns = _remap_annotations(
-            piece["annotations"],
-            0,  # offset will be set during assembly
-            len(seq),
-            trim_start=left_pos + oh_len,
-            trim_end=right_pos - oh_len,
-            source_name=piece["name"],
-        )
+        if is_vector:
+            # Keep the backbone (outside the cuts, wrapping the origin).
+            # The backbone's "left" sticky end (in assembly order) is the one
+            # that ligates to an insert's right_sticky — i.e., the overhang
+            # exposed at the cut_right position.
+            # The backbone's "right" sticky end ligates to an insert's left_sticky
+            # — the overhang exposed at the cut_left position.
+            # In top-strand convention these are simply swapped vs the insert case.
+            left_sticky = seq[right_pos - oh_len:right_pos].upper()  # e.g. AGGT
+            right_sticky = seq[left_pos:left_pos + oh_len].upper()    # e.g. AATG
+
+            # Backbone body = everything OUTSIDE [left_pos, right_pos), wrapped.
+            # The overhang bases themselves are kept as the sticky ends; the
+            # body (between the overhangs as you walk around the backbone) is:
+            #   seq[right_pos:] + seq[:left_pos]
+            insert_seq = seq[right_pos:] + seq[:left_pos]
+
+            # Remap annotations across the wrap. Two source regions concatenate
+            # into the new piece:
+            #   source [right_pos, len(seq))  →  product [0, len(seq) - right_pos)
+            #   source [0, left_pos)          →  product [len(seq) - right_pos, ...)
+            tail_anns = _remap_annotations(
+                piece["annotations"], 0, len(seq),
+                trim_start=right_pos, trim_end=len(seq),
+                source_name=piece["name"],
+            )
+            head_offset = len(seq) - right_pos
+            head_anns = _remap_annotations(
+                piece["annotations"], head_offset, len(seq),
+                trim_start=0, trim_end=left_pos,
+                source_name=piece["name"],
+            )
+            insert_anns = tail_anns + head_anns
+        else:
+            # Standard insert: keep the region BETWEEN the cuts.
+            left_sticky = seq[left_pos:left_pos + oh_len].upper()
+            right_sticky = seq[right_pos - oh_len:right_pos].upper()
+            insert_seq = seq[left_pos + oh_len:right_pos - oh_len]
+
+            insert_anns = _remap_annotations(
+                piece["annotations"],
+                0,  # offset will be set during assembly
+                len(seq),
+                trim_start=left_pos + oh_len,
+                trim_end=right_pos - oh_len,
+                source_name=piece["name"],
+            )
 
         piece_cuts.append({
             "piece_idx": pi,
@@ -5504,7 +5541,7 @@ def run_golden_gate_assembly(fragments: list, vector: dict = None,
             "insert_seq": insert_seq,
             "insert_anns": insert_anns,
             "insert_len": len(insert_seq),
-            "is_vector": piece.get("is_vector", False),
+            "is_vector": is_vector,
         })
 
     # Check for palindromic overhangs
