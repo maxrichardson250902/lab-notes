@@ -3012,22 +3012,38 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
                 else:
                     downstream = vec_seq[cut3_end:] + vec_seq[:max(0, downstream_len - (len(vec_seq) - cut3_end))]
 
-                # Check for stop codons in the reading frame aligned with the overhang
+                # Frame calculation across the overhang.
+                # The insert is assumed to end on a codon boundary. The overhang
+                # contributes (overhang_len) bases between the last insert codon and
+                # the downstream vector sequence. (overhang_len % 3) of those bases
+                # complete a partial codon together with the first
+                # ((3 - overhang_len % 3) % 3) bases of downstream — so the next
+                # complete codon in `downstream` starts at that offset.
+                #   overhang_len = 3 → downstream_frame = 0 (overhang is one whole codon)
+                #   overhang_len = 4 → downstream_frame = 2 (T carries over, joins with first 2 ds bases)
+                #   overhang_len = 5 → downstream_frame = 1
                 oh_len_val = enz["overhang_len"]
-                # Frame 0 = the reading frame that would be in-frame with the insert
-                # (overhang is part of the CDS, so frame starts at position 0 of downstream)
+                downstream_frame = (3 - oh_len_val % 3) % 3
+
+                # First in-frame stop codon in downstream (scanning from the correct frame)
                 stop_pos_in_frame = None
-                for ci in range(0, min(len(downstream) - 2, downstream_len), 3):
+                for ci in range(downstream_frame, len(downstream) - 2, 3):
                     codon = downstream[ci:ci + 3]
                     if codon in _STOP_CODON_SET:
                         stop_pos_in_frame = ci
                         break
 
-                # Known C-terminal tag patterns
+                # Known C-terminal tag patterns. For the tag to be USABLE as a
+                # C-terminal fusion, the tag motif must itself start at an
+                # in-frame position relative to the assembled junction.
                 detected_tags = []
+                tags_in_frame = []  # subset of detected_tags whose start is in-frame
                 for tag_name, tag_seq in KNOWN_TAG_SEQS.items():
-                    if tag_seq in downstream[:100]:
+                    tag_pos = downstream[:100].find(tag_seq)
+                    if tag_pos >= 0:
                         detected_tags.append(tag_name)
+                        if (tag_pos - downstream_frame) % 3 == 0:
+                            tags_in_frame.append(tag_name)
 
                 # Also check upstream of 5' site for N-terminal tags
                 cut5_start = cuts_sorted[0]["cut_pos"]
@@ -3042,6 +3058,9 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
                         detected_ntags.append(tag_name)
 
                 has_downstream_stop = stop_pos_in_frame is not None
+                # frame_ok means: a detected C-terminal tag is in-frame given this overhang offset
+                # (if no tags detected, we can't make a strong claim either way)
+                frame_ok = bool(tags_in_frame) if detected_tags else (oh_len_val % 3 == 0)
                 vec_tag_info = {
                     "precut": True,
                     "left_overhang": vec_left_oh,
@@ -3049,21 +3068,27 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
                     "downstream_stop_pos": stop_pos_in_frame,
                     "has_downstream_stop": has_downstream_stop,
                     "c_terminal_tags": detected_tags,
+                    "c_terminal_tags_in_frame": tags_in_frame,
                     "n_terminal_tags": detected_ntags,
-                    "frame_ok": oh_len_val % 3 == 0,
+                    "frame_ok": frame_ok,
                     "overhang_len": oh_len_val,
+                    "downstream_frame": downstream_frame,
                 }
 
                 if detected_tags:
                     tag_str = ", ".join(detected_tags)
                     warnings.append(f"Vector has C-terminal tag(s): {tag_str}")
-                    if has_downstream_stop and stop_pos_in_frame > 0:
-                        # Stop codon found after tag — readthrough will work if in-frame
-                        if oh_len_val % 3 != 0:
-                            warnings.append(
-                                f"⚠ {enzyme} overhang ({oh_len_val}bp) is not divisible by 3 — "
-                                f"C-terminal tag may be out of frame. Consider using a different enzyme or adjusting the overhang."
-                            )
+                    # Only warn about frame if the tag is NOT actually in-frame.
+                    # MoClo CD-syntax vectors (AATG/AGGT) are designed so the 4-bp
+                    # overhang's offset is absorbed by the vector linker, putting
+                    # the tag in-frame at downstream_frame = 2. Don't scare the
+                    # user when the design is already correct.
+                    out_of_frame_tags = [t for t in detected_tags if t not in tags_in_frame]
+                    if out_of_frame_tags:
+                        warnings.append(
+                            f"⚠ C-terminal tag(s) {', '.join(out_of_frame_tags)} are NOT in-frame given "
+                            f"the {enzyme} overhang ({oh_len_val}bp) — check the vector design"
+                        )
                     if not has_downstream_stop:
                         warnings.append(
                             f"⚠ No in-frame stop codon found downstream of insert site — "
@@ -3197,14 +3222,20 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
         })
 
     # ── Frame check for tag readthrough ──
+    # If the vector is pre-cut and we've already analysed frame against the
+    # detected C-terminal tag (vec_tag_info["frame_ok"]), trust that result.
+    # Otherwise fall back to the naive "is overhang divisible by 3" check —
+    # in that case we can only say frame *might* shift, not that it definitely will.
     oh_len = enz["overhang_len"]
-    for b in bins:
-        for f in b["fragments"]:
-            if f.get("remove_stop") or f.get("remove_start"):
-                if oh_len % 3 != 0:
+    frame_known_ok = bool(vec_tag_info and vec_tag_info.get("frame_ok"))
+    if not frame_known_ok and oh_len % 3 != 0:
+        for b in bins:
+            for f in b["fragments"]:
+                if f.get("remove_stop") or f.get("remove_start"):
                     warnings.append(
                         f"⚠ '{f['name']}': {enzyme} overhang length ({oh_len}bp) is not divisible by 3 — "
-                        f"tag fusion may be out of frame"
+                        f"check that the destination vector's linker absorbs this offset (MoClo-style CD "
+                        f"vectors do; ad-hoc designs may not)"
                     )
 
     # ── Vector primers (if provided and NOT pre-cut)
@@ -3226,10 +3257,7 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
         all_primers.append(vec_primers["rev"])
     elif vec_precut:
         warnings.append(f"No vector primers needed — '{vector.get('name', 'vector')}' is ready to cut with {enzyme}")
-
-        vec_primers = {"fwd": vec_fwd, "rev": vec_rev}
-        all_primers.append(vec_primers["fwd"])
-        all_primers.append(vec_primers["rev"])
+        # No vec_primers to add — the vector is digested directly, not PCR-amplified.
 
     # ── Combinatorial stats
     combo_count = 1
