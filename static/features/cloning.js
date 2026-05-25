@@ -1995,7 +1995,15 @@ function _pdSetMode(m) {
 
 // ── Custom
 function _pdCustomSet(field, val) {
-  if (field === 'direction') { _cl.pd.custom.direction = val; _clRender(); setTimeout(function() { _clRenderSeqViz(); }, 50); return; }
+  // Discrete toggles (button clicks) need an immediate full re-render so the
+  // selected state in the UI reflects the new value. Text inputs use a debounced
+  // SeqViz-only refresh to avoid stealing focus mid-typing.
+  if (field === 'direction' || field === 'tailOrientation') {
+    _cl.pd.custom[field] = val;
+    _clRender();
+    setTimeout(function() { _clRenderSeqViz(); }, 50);
+    return;
+  }
   _cl.pd.custom[field] = val;
   clearTimeout(window._pdCustomTimer);
   window._pdCustomTimer = setTimeout(function() { _clRenderSeqViz(); }, 300);
