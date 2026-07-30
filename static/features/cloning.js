@@ -2414,7 +2414,7 @@ function _pdShowAddPrimerModal(seq, useDesc) {
 
   h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;">';
   h += '<div><label style="' + lbl + '">Project</label>';
-  h += '<input id="cl-apm-project" style="' + inp + '" placeholder="Optional" /></div>';
+  h += '<input id="cl-apm-project" list="global-projects" style="' + inp + '" placeholder="Optional" /></div>';
   h += '<div><label style="' + lbl + '">Box #</label>';
   h += '<input id="cl-apm-box" style="' + inp + '" placeholder="Optional" /></div>';
   h += '</div>';

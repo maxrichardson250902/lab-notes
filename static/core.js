@@ -85,6 +85,10 @@ async function boot() {
     S.view = S.settings.default_view;
   }
   buildSidebarNav();
+  /* Populate the shared global-projects datalist before any view renders,
+     so project-typing inputs across the app (Workflow, DNA, Circuits,
+     Cloning, etc.) all autocomplete against the same unified list. */
+  await _refreshGlobalProjects();
   await load();
   /* Initial view render. load() deliberately doesn't call loadView() because
      it's also used for periodic refresh of sidebar counts — a periodic render
@@ -101,6 +105,64 @@ async function boot() {
      popup appears before the user has any UI context. */
   setTimeout(checkStaleRuns, 0);
 }
+
+
+/* ── Global projects registry ────────────────────────────────────────────────
+   One shared datalist (`<datalist id="global-projects">`) that any project-
+   typing `<input>` can bind to via `list="global-projects"`. Populated on
+   boot from `/api/projects`, which itself unions:
+     - entries.group_name
+     - workflow_entries.group_name
+     - reminders.group_name
+     - pipelines.name
+     - data-groups attrs in day_documents
+     - primers/plasmids/gblocks/kit_parts/parts .project
+   plus any explicitly-registered projects in the `projects` table.
+
+   To keep the list fresh after a new project name is typed anywhere, call
+   `registerProject(name)` — it POSTs to /api/projects and re-populates the
+   datalist. Fire-and-forget; failures are silent. */
+window._globalProjects       = [];  // [{name, hue, color_override, day_count, ...}]
+window._globalSubcategories  = {};  // {project: [subcategory, ...]}
+
+async function _refreshGlobalProjects() {
+  try {
+    const d = await api('GET', '/api/projects');
+    window._globalProjects      = d.projects || [];
+    window._globalSubcategories = d.subcategories || {};
+    _rebuildGlobalProjectsDatalist();
+  } catch (e) { /* silent */ }
+}
+
+function _rebuildGlobalProjectsDatalist() {
+  let dl = document.getElementById('global-projects');
+  if (!dl) {
+    dl = document.createElement('datalist');
+    dl.id = 'global-projects';
+    document.body.appendChild(dl);
+  }
+  const opts = (window._globalProjects || []).map(function(p) {
+    return '<option value="' + esc(p.name) + '"></option>';
+  }).join('');
+  dl.innerHTML = opts;
+}
+
+async function registerProject(name) {
+  /* Opt-in: call after any view saves a project name so it appears in the
+     shared list immediately (instead of waiting for the next boot). Safe to
+     call with existing names — the endpoint is idempotent (INSERT OR IGNORE). */
+  name = (name || '').trim();
+  if (!name) return;
+  const exists = (window._globalProjects || []).some(function(p) { return p.name === name; });
+  if (exists) return;
+  try {
+    await api('POST', '/api/projects', { name: name });
+    await _refreshGlobalProjects();
+  } catch (e) { /* silent */ }
+}
+
+window._refreshGlobalProjects = _refreshGlobalProjects;
+window.registerProject        = registerProject;
 
 /* ── Settings load / apply ────────────────────────────────────────────────
    `loadSettings` fetches from the backend and merges into S.settings.
@@ -493,6 +555,12 @@ async function loadView() {
   const meta = _viewMeta[S.view] || {};
   const wideByNotebookCase = (S.view === 'notebook' && S.nbBook);
   el.classList.toggle('wide', !!(meta.wide || wideByNotebookCase));
+
+  /* Keep the shared global-projects datalist fresh on every view switch,
+     so a name typed in (say) DNA is immediately available in Workflow's
+     Groups picker when the user switches over. Fire-and-forget — a stale
+     list is a mild UX annoyance, not a bug. */
+  _refreshGlobalProjects();
 
   const renderer = _views[S.view];
   if (renderer) {

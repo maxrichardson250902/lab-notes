@@ -5,6 +5,280 @@ var _wfSubgroupMap = {};       // {group: {subgroup: true}}
 var _wfProcessJobId = null;    // active process-day job ID
 var _wfPollTimer = null;       // polling interval handle
 
+/* ── Read/Write mode state ────────────────────────────────────────────────
+   Write mode is the existing single-day editor. Read mode is a scrolling
+   book of past days (newest at top), 30-day windows, print-to-PDF as backup.
+   Switching modes calls loadView() which re-runs renderWorkflow, which
+   branches on _workflowMode at the top. */
+var _workflowMode = 'write';   // 'write' | 'read'
+var _readWindowEnd = new Date().toISOString().slice(0, 10);  // ISO date; newest day in the window
+var _readWindowDays = 30;      // window size
+
+/* ── Active project selector ────────────────────────────────────────────────
+   Sticky dropdown at the top of Write mode. When set, every newly-created
+   empty block (Enter at end of a block, or first empty <p> at doc start) gets
+   `data-groups="<project>"` automatically. Existing blocks are never touched
+   — user's rule: "existing blocks should stay as they were, new blocks
+   should be the new project until changed".
+   Persisted in localStorage so it survives page reload / mode switch. */
+var _wfActiveProject = null;         // string project name, or null = untagged
+var _wfKnownProjects = [];           // [{name, day_count}, ...] from /api/workflow/projects
+
+function _wfGetActiveProject() {
+  if (_wfActiveProject !== null) return _wfActiveProject;
+  try { _wfActiveProject = localStorage.getItem('wf-active-project') || ''; }
+  catch (e) { _wfActiveProject = ''; }
+  return _wfActiveProject;
+}
+
+function _wfSetActiveProject(name) {
+  _wfActiveProject = (name || '').trim();
+  try { localStorage.setItem('wf-active-project', _wfActiveProject); } catch (e) {}
+  // Repaint the button label without a full re-render
+  var btn = document.getElementById('wf-active-project-btn');
+  if (btn) btn.innerHTML = _wfActiveProjectBtnLabel();
+}
+
+function _wfActiveProjectBtnLabel() {
+  var p = _wfGetActiveProject();
+  if (!p) return '&#127991; No project &#9662;';
+  return '&#127991; ' + esc(p) + ' &#9662;';
+}
+
+async function _wfLoadKnownProjects() {
+  try {
+    var d = await api('GET', '/api/projects');
+    _wfKnownProjects = d.projects || [];
+    _wfInjectProjectColorCss();
+  } catch (e) { _wfKnownProjects = []; }
+}
+
+
+function _wfProjectHue(name) {
+  /* djb2 string hash → 0..359 hue. MUST match the server's _hash_hue so a
+     block rendered server-side (PDFs) picks the same colour as the browser. */
+  var h = 5381;
+  for (var i = 0; i < name.length; i++) {
+    h = (h * 33 + name.charCodeAt(i)) >>> 0;  // keep as unsigned 32-bit
+  }
+  return h % 360;
+}
+
+
+function _wfInjectProjectColorCss() {
+  /* Generate one CSS block per project with per-project HSL colours and
+     append it to <head>. Called after loading projects, before rendering
+     blocks. Uses attribute selectors covering all four positions
+     (exact / first / last / middle) since data-groups is comma-separated
+     — a substring match would false-positive across similar project names
+     like `pMR15` and `MR15`. */
+  var styleEl = document.getElementById('wf-project-colors');
+  if (!styleEl) {
+    styleEl = document.createElement('style');
+    styleEl.id = 'wf-project-colors';
+    document.head.appendChild(styleEl);
+  }
+  var rules = [];
+  _wfKnownProjects.forEach(function(p) {
+    if (!p.name) return;
+    var nameEsc = p.name.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    var selectors = [
+      '[data-groups="' + nameEsc + '"]',
+      '[data-groups^="' + nameEsc + ',"]',
+      '[data-groups$=",' + nameEsc + '"]',
+      '[data-groups*=",' + nameEsc + ',"]',
+    ].join(', ');
+    var primary, tint, pillBg, pillFg, pillBorder;
+    if (p.color_override) {
+      /* Explicit override: use it directly for the border. Tint via a fixed
+         5% alpha derivation. Pill uses the override tinted lighter. */
+      primary = p.color_override;
+      tint    = p.color_override + '10';  /* naïve alpha via hex — works for #RRGGBB */
+      pillBg  = p.color_override + '22';
+      pillFg  = p.color_override;
+      pillBorder = p.color_override;
+    } else {
+      var hue = (p.hue != null) ? p.hue : _wfProjectHue(p.name);
+      primary    = 'hsl('  + hue + ', 42%, 42%)';
+      tint       = 'hsla(' + hue + ', 42%, 42%, 0.06)';
+      pillBg     = 'hsl('  + hue + ', 45%, 90%)';
+      pillFg     = 'hsl('  + hue + ', 55%, 25%)';
+      pillBorder = 'hsl('  + hue + ', 42%, 55%)';
+    }
+    rules.push(
+      selectors + ' {' +
+        ' --wf-tag-primary: ' + primary + ';' +
+        ' --wf-tag-tint: '    + tint    + ';' +
+        ' --wf-tag-pill-bg: ' + pillBg  + ';' +
+        ' --wf-tag-pill-fg: ' + pillFg  + ';' +
+        ' --wf-tag-pill-border: ' + pillBorder + ';' +
+      ' }'
+    );
+  });
+  styleEl.textContent = rules.join('\n');
+}
+
+function _wfOpenProjectPicker(anchorEl) {
+  // Close any existing picker
+  var existing = document.getElementById('wf-proj-pop');
+  if (existing) { existing.remove(); return; }
+
+  var pop = document.createElement('div');
+  pop.id = 'wf-proj-pop';
+  pop.className = 'wf-proj-pop';
+  var r = anchorEl.getBoundingClientRect();
+  pop.style.position = 'absolute';
+  pop.style.top = (window.scrollY + r.bottom + 4) + 'px';
+  pop.style.left = (window.scrollX + r.left) + 'px';
+  pop.style.zIndex = 1200;
+
+  var current = _wfGetActiveProject();
+  var h = '<div class="wf-proj-head">Auto-tag new blocks with:</div>';
+  h += '<div class="wf-proj-list">';
+  h += '<div class="wf-proj-item' + (current === '' ? ' wf-proj-selected' : '') + '" data-name="">' +
+       '<span style="color:#8a7f72">&mdash; None (leave blocks untagged) &mdash;</span></div>';
+  _wfKnownProjects.forEach(function(p) {
+    var selCls = (p.name === current) ? ' wf-proj-selected' : '';
+    var color;
+    if (p.color_override) {
+      color = p.color_override;
+    } else {
+      var hue = (p.hue != null) ? p.hue : _wfProjectHue(p.name);
+      color = 'hsl(' + hue + ', 42%, 55%)';
+    }
+    /* Compute a hex value the native <input type="color"> can accept when
+       the user opens the picker on an auto-coloured project. */
+    var initialHex;
+    if (p.color_override) {
+      initialHex = p.color_override;
+    } else {
+      var hue = (p.hue != null) ? p.hue : _wfProjectHue(p.name);
+      initialHex = _wfHslToHex(hue, 42, 55);
+    }
+    h += '<div class="wf-proj-item' + selCls + '" data-name="' + esc(p.name) + '">' +
+         '<label class="wf-proj-swatch-wrap" style="background:' + color + '" ' +
+                'title="Click to change colour for \'' + esc(p.name).replace(/'/g, "&#39;") + '\'" ' +
+                'onclick="event.stopPropagation()">' +
+           '<input type="color" value="' + esc(initialHex) + '" class="wf-proj-swatch-input" ' +
+                  'onchange="_wfProjectSetColor(\'' + esc(p.name).replace(/'/g, "\\'") + '\', this.value)">' +
+         '</label>' +
+         '<span class="wf-proj-name">' + esc(p.name) + '</span>' +
+         '<span class="wf-proj-count">' + (p.day_count || 0) + ' day' + (p.day_count === 1 ? '' : 's') + '</span>' +
+         '</div>';
+  });
+  h += '</div>';
+  h += '<div class="wf-proj-new">' +
+    '<input type="text" id="wf-proj-new-input" placeholder="+ New project&hellip;" ' +
+      'onkeydown="if(event.key===\'Enter\'){event.preventDefault();_wfProjectPickerAddNew();}">' +
+    '<button class="wf-tool-btn" onclick="_wfProjectPickerAddNew()">Add</button>' +
+    '</div>';
+  pop.innerHTML = h;
+  document.body.appendChild(pop);
+
+  pop.querySelectorAll('.wf-proj-item').forEach(function(item) {
+    item.addEventListener('click', function() {
+      _wfSetActiveProject(this.dataset.name);
+      pop.remove();
+      document.removeEventListener('mousedown', outside, { capture: true });
+    });
+  });
+
+  function outside(e) {
+    if (pop.contains(e.target) || anchorEl.contains(e.target)) return;
+    pop.remove();
+    document.removeEventListener('mousedown', outside, { capture: true });
+  }
+  setTimeout(function() {
+    document.addEventListener('mousedown', outside, { capture: true });
+  }, 0);
+}
+
+function _wfProjectPickerAddNew() {
+  var inp = document.getElementById('wf-proj-new-input');
+  if (!inp) return;
+  var name = inp.value.trim();
+  if (!name) return;
+  /* Register with the projects backend so it becomes globally visible in
+     other views (notebook, etc.) and gets a stable colour. Best-effort —
+     fall through to local list if the API is down. */
+  api('POST', '/api/projects', { name: name })
+    .catch(function(e) { console.warn('projects POST failed:', e); })
+    .finally(function() {
+      var already = _wfKnownProjects.some(function(p) { return p.name === name; });
+      if (!already) {
+        _wfKnownProjects.push({ name: name, day_count: 0, entry_count: 0,
+                                 hue: _wfProjectHue(name), color_override: null });
+      }
+      _wfInjectProjectColorCss();
+      _wfSetActiveProject(name);
+      var pop = document.getElementById('wf-proj-pop');
+      if (pop) pop.remove();
+    });
+}
+
+function _wfHslToHex(h, s, l) {
+  /* HSL → hex, matching _projMgrHueToRgbHex in projects.js so <input type="color">
+     can be pre-filled correctly when opening the swatch on an auto-coloured
+     project. Kept small: no error handling — inputs come from our own hash. */
+  s = s / 100; l = l / 100;
+  var c = (1 - Math.abs(2 * l - 1)) * s;
+  var x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  var m = l - c / 2;
+  var r, g, b;
+  if (h < 60)      { r = c; g = x; b = 0; }
+  else if (h < 120){ r = x; g = c; b = 0; }
+  else if (h < 180){ r = 0; g = c; b = x; }
+  else if (h < 240){ r = 0; g = x; b = c; }
+  else if (h < 300){ r = x; g = 0; b = c; }
+  else             { r = c; g = 0; b = x; }
+  function hh(v) { return ('0' + Math.round((v + m) * 255).toString(16)).slice(-2); }
+  return '#' + hh(r) + hh(g) + hh(b);
+}
+
+
+async function _wfProjectSetColor(name, hex) {
+  /* Called from the inline colour picker in the workflow project selector.
+     Writes the override to /api/projects/{name}, then refreshes local
+     caches so the pill / border colours update immediately without a
+     page reload. Silent-fail — a broken save just leaves the picker
+     open and the old colour visible. */
+  try {
+    await api('PUT', '/api/projects/' + encodeURIComponent(name),
+              { color_override: hex });
+    await _wfLoadKnownProjects();
+    if (typeof _refreshGlobalProjects === 'function') await _refreshGlobalProjects();
+    /* Reopen the popover if it was closed by any auto-hide during the fetch */
+    var pop = document.getElementById('wf-proj-pop');
+    if (pop) pop.remove();
+  } catch (e) { console.warn('colour save failed:', e); }
+}
+
+
+function _wfSwitchMode(mode) {
+  if (mode !== 'write' && mode !== 'read') return;
+  _workflowMode = mode;
+  if (mode === 'read') {
+    // Snap the read window to end at whatever day the user was viewing
+    _readWindowEnd = _workflowDate;
+  } else {
+    // Coming back to Write mode — sync the editor to the window's end date
+    _workflowDate = _readWindowEnd;
+  }
+  loadView();
+}
+
+function _wfShiftReadWindow(delta) {
+  /* delta = number of days to shift. Positive = newer, negative = older.
+     Capped at today for the newer end. */
+  var dt = new Date(_readWindowEnd + 'T12:00:00');
+  dt.setDate(dt.getDate() + delta);
+  var today = new Date().toISOString().slice(0, 10);
+  var iso = dt.toISOString().slice(0, 10);
+  if (iso > today) iso = today;
+  _readWindowEnd = iso;
+  loadView();
+}
+
 async function _loadWfNotebookGroups() {
   try {
     var data = await api('GET', '/api/entries');
@@ -24,17 +298,36 @@ async function _loadWfNotebookGroups() {
 }
 
 async function renderWorkflow(el) {
+  if (_workflowMode === 'read') {
+    return _wfRenderReadMode(el);
+  }
   var data    = await api('GET', '/api/workflow/' + _workflowDate);
   var entries = data.entries || [];
   var today   = new Date().toISOString().slice(0, 10);
   await _loadWfNotebookGroups();
+  await _wfLoadKnownProjects();
 
   var html = '<div class="day-nav">' +
     '<button onclick="shiftDay(-1)">&#8592; Prev</button>' +
-    '<div class="day-label">' + formatDate(_workflowDate) + '</div>' +
+    '<div class="day-label"><button class="wf-date-btn" onclick="_wfOpenCalendar(this, \'write\')" title="Jump to a date">' + formatDate(_workflowDate) + ' &#9662;</button></div>' +
     (_workflowDate < today
       ? '<button onclick="shiftDay(1)">Next &#8594;</button>'
       : '<button disabled style="opacity:.3">Next &#8594;</button>') +
+    '<button class="btn" onclick="_wfSwitchMode(\'read\')" title="Switch to Read mode (scrolling book of past days)" style="margin-left:10px">&#128218; Read mode</button>' +
+    /* Active project selector — sticky dropdown; every NEW empty block gets
+       auto-tagged with the selected project. Existing blocks are unchanged. */
+    '<button class="btn wf-active-project-btn" id="wf-active-project-btn" ' +
+      'onclick="_wfOpenProjectPicker(this)" ' +
+      'title="Auto-tag new blocks with this project. Change any time; existing blocks stay tagged as they were." ' +
+      'style="margin-left:6px">' + _wfActiveProjectBtnLabel() + '</button>' +
+    /* Redact mode toggle — only shown when editing a past day. On today's
+       page, no track-changes and no redact concept. */
+    (_wfIsPastDay()
+      ? '<button class="btn wf-redact-btn" id="wf-redact-btn" ' +
+          'onclick="_wfToggleRedactMode()" ' +
+          'title="Track-changes is ON by default for past days: deletions become strikethrough (Word-style). Toggle redact mode to make deletions permanent instead (for IP-sensitive content that should not appear in the audit trail)." ' +
+          'style="margin-left:6px">' + _wfRedactBtnLabel() + '</button>'
+      : '') +
     /* Short date for the button — full date in the title attribute. Two formats
        to keep the button compact: today shows "today", any other day shows
        "6 May" style. */
@@ -157,6 +450,11 @@ async function renderWorkflow(el) {
     docEl.addEventListener('keydown', _wfDocKeydownExtras);
     docEl.addEventListener('click', _wfRefreshCurrentBlock);
     docEl.addEventListener('keyup', _wfRefreshCurrentBlock);
+    /* If redact mode was toggled on before this render (e.g., user was on
+       an older day, clicked Redact ON, then navigated to another past day),
+       restore the visual indicator. Reset the flag if we're now on today. */
+    if (!_wfIsPastDay()) _wfRedactMode = false;
+    if (_wfRedactMode && _wfIsPastDay()) docEl.classList.add('wf-redact-active');
     _wfLoadDoc();
     _wfRefreshActiveRuns();
     /* Listen for cross-tab run state changes (localStorage events fire only in
@@ -205,15 +503,117 @@ function _wfInjectDocStyles() {
     '.wf-doc-toolbar { display:flex; gap:4px; align-items:center; flex-wrap:wrap; padding:6px 0 4px 0; margin-top:4px; border-top:1px solid #ece7dd; }',
     '.wf-tool-btn-primary { background:#5b7a5e !important; color:#fff !important; border-color:#5b7a5e !important; }',
     '#wf-doc .wf-block, #wf-doc p[data-groups], #wf-doc table[data-groups], #wf-doc ul[data-groups], #wf-doc ol[data-groups] { padding-left:8px; border-left:3px solid transparent; transition:border-color .15s; }',
-    '#wf-doc [data-groups] { border-left-color:#7a9e7e; background:rgba(122,158,126,0.04); }',
+    '#wf-doc [data-groups] { border-left-color: var(--wf-tag-primary, #7a9e7e); background: var(--wf-tag-tint, rgba(122,158,126,0.04)); position:relative; margin-top:14px; }',
     '#wf-doc .wf-task-done { border-left-color:#b89a3a; background:rgba(184,154,58,0.06); }',
     '#wf-doc .wf-protocol { border-left-color:#5b7aa0; background:rgba(91,122,160,0.06); }',
+    /* Project-tag pill — floats just above the top-right edge of each tagged block.
+       Pure CSS via ::after so it doesn't live in the DOM (contenteditable-safe,
+       doesn't get copied out when the user selects and copies block text).
+       Colours pulled from CSS custom properties set by _wfInjectProjectColorCss,
+       with green fallback for untagged / unknown projects. */
+    '#wf-doc [data-groups]::after { content: attr(data-groups); position:absolute; top:-9px; right:6px; font-family:"SF Mono",Monaco,Consolas,monospace; font-size:10px; line-height:1; color: var(--wf-tag-pill-fg, #3a5a3d); background: var(--wf-tag-pill-bg, #e8f0e8); border:1px solid var(--wf-tag-pill-border, #7a9e7e); padding:2px 8px 3px 8px; border-radius:9px; pointer-events:none; z-index:1; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }',
     '#wf-doc .wf-current-block { box-shadow: -3px 0 0 0 #5b7a5e inset; }',
     '.wf-time { display:inline-block; font-family:"SF Mono",Monaco,Consolas,monospace; font-size:.8em; padding:1px 6px; background:#f0ebe3; border-radius:3px; color:#8a7f72; user-select:none; margin-right:4px; }',
     '.wf-group-chip { display:inline-block; padding:2px 8px; background:#e8f0e8; color:#3a5a3d; border:1px solid #b5ccb5; border-radius:10px; font-size:11px; margin:2px 3px 2px 0; cursor:pointer; }',
     '.wf-group-chip.active { background:#5b7a5e; color:#fff; border-color:#5b7a5e; }',
     '.wf-tag-modal { position:fixed; inset:0; z-index:1100; background:rgba(60,52,42,.35); display:flex; align-items:center; justify-content:center; }',
     '.wf-tag-modal-inner { background:#faf8f4; border:1px solid #d5cec0; border-radius:8px; width:420px; max-width:92vw; padding:14px 16px; }',
+
+    /* ── Date button (opens calendar picker) ─────────────────────────────── */
+    '.wf-date-btn { background:transparent; border:1px solid transparent; padding:2px 8px; border-radius:4px; font:inherit; color:inherit; cursor:pointer; }',
+    '.wf-date-btn:hover { background:#f0ebe3; border-color:#d5cec0; }',
+
+    /* ── Active project selector button + popover ────────────────────────── */
+    '.wf-active-project-btn { background:#e8f0e8; border:1px solid #b5ccb5; color:#4a4139; }',
+    '.wf-active-project-btn:hover { background:#d8e5d8; }',
+    /* ── Redact-mode button (only on past days) ──────────────────────────── */
+    '.wf-redact-btn { background:#f5f0e8; border:1px solid #d5c8b0; color:#4a4139; }',
+    '.wf-redact-btn:hover { background:#efe8d8; }',
+    /* Editor gets a red-tinged border when redact mode is active, so the user
+       can\'t forget they\'re about to make permanent deletions. */
+    '#wf-doc.wf-redact-active { border:2px solid #c0392b; background:rgba(192,57,43,0.02); }',
+    '#wf-doc.wf-redact-active::before { content: "REDACT MODE \u2014 deletions are permanent"; position:sticky; top:0; display:block; background:#c0392b; color:#fff; padding:2px 8px; font-size:11px; font-family:"SF Mono",Monaco,Consolas,monospace; letter-spacing:.05em; text-align:center; z-index:10; margin:-8px -8px 8px -8px; }',
+    /* Track-changes strikethrough in the editor. Uses a slightly muted colour
+       to match the print CSS + read-mode rendering. */
+    '#wf-doc del, #wf-doc s { color:#8a7f72; text-decoration:line-through; text-decoration-thickness:1px; }',
+    '.wf-read-day-body del, .wf-read-day-body s { color:#8a7f72; text-decoration:line-through; text-decoration-thickness:1px; }',
+    '.wf-proj-pop { background:#faf8f4; border:1px solid #d5cec0; border-radius:6px; padding:8px 0 6px 0; box-shadow:0 4px 18px rgba(60,52,42,.15); width:280px; max-height:400px; overflow-y:auto; font-size:13px; }',
+    '.wf-proj-head { padding:2px 12px 8px 12px; font-size:11px; color:#8a7f72; font-variant:small-caps; letter-spacing:.05em; border-bottom:1px solid #ece7dd; }',
+    '.wf-proj-list { padding:4px 0; }',
+    '.wf-proj-item { display:flex; align-items:center; gap:8px; padding:5px 12px; cursor:pointer; }',
+    '.wf-proj-item:hover { background:#f0ebe3; }',
+    '.wf-proj-selected { background:#d8e5d8; }',
+    '.wf-proj-selected:hover { background:#c8d8c8; }',
+    '.wf-proj-swatch { display:inline-block; width:10px; height:10px; border-radius:50%; border:1px solid rgba(0,0,0,0.15); flex-shrink:0; }',
+    /* Interactive colour swatch: <label> is the visible circle; the invisible
+       <input type="color"> inside it captures the click and opens the native
+       picker. Matches static swatch dimensions but adds cursor + hover-ring. */
+    '.wf-proj-swatch-wrap { display:inline-block; width:12px; height:12px; border-radius:50%; border:1px solid rgba(0,0,0,0.15); flex-shrink:0; cursor:pointer; position:relative; transition:box-shadow .1s; }',
+    '.wf-proj-swatch-wrap:hover { box-shadow: 0 0 0 2px rgba(122,158,126,0.35); }',
+    '.wf-proj-swatch-input { position:absolute; inset:0; opacity:0; width:100%; height:100%; cursor:pointer; padding:0; border:none; }',
+    '.wf-proj-name { color:#4a4139; flex:1; }',
+    '.wf-proj-count { font-size:11px; color:#8a7f72; }',
+    '.wf-proj-new { display:flex; gap:4px; padding:8px 12px 4px 12px; border-top:1px solid #ece7dd; margin-top:4px; }',
+    '.wf-proj-new input { flex:1; padding:4px 8px; border:1px solid #d5cec0; border-radius:3px; font-family:inherit; font-size:12px; }',
+
+    /* ── Calendar picker popover ─────────────────────────────────────────── */
+    '.wf-cal-pop { background:#faf8f4; border:1px solid #d5cec0; border-radius:6px; padding:10px 12px; box-shadow:0 4px 18px rgba(60,52,42,.15); font-size:12.5px; width:260px; }',
+    '.wf-cal-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }',
+    '.wf-cal-title { font-weight:600; color:#4a4139; }',
+    '.wf-cal-nav { background:transparent; border:none; padding:2px 8px; cursor:pointer; color:#5b7a5e; font-size:14px; border-radius:3px; }',
+    '.wf-cal-nav:hover { background:#e8f0e8; }',
+    '.wf-cal-dow { display:grid; grid-template-columns:repeat(7,1fr); gap:2px; margin-bottom:4px; font-size:10px; color:#8a7f72; text-align:center; font-variant:small-caps; }',
+    '.wf-cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:2px; }',
+    '.wf-cal-day, .wf-cal-blank { aspect-ratio:1; display:flex; align-items:center; justify-content:center; font-size:12px; border-radius:3px; position:relative; }',
+    '.wf-cal-day { cursor:pointer; color:#4a4139; }',
+    '.wf-cal-day:hover { background:#e8f0e8; }',
+    '.wf-cal-today { border:1px solid #5b7a5e; font-weight:600; }',
+    '.wf-cal-selected { background:#5b7a5e; color:#fff; }',
+    '.wf-cal-selected:hover { background:#4a6b4d; }',
+    '.wf-cal-populated::after { content:""; position:absolute; bottom:3px; left:50%; transform:translateX(-50%); width:4px; height:4px; border-radius:50%; background:#b89a3a; }',
+    '.wf-cal-selected.wf-cal-populated::after { background:#faf8f4; }',
+    '.wf-cal-future { color:#c0b8a8; cursor:default; }',
+    '.wf-cal-future:hover { background:transparent; }',
+    '.wf-cal-legend { margin-top:8px; padding-top:8px; border-top:1px solid #ece7dd; font-size:10px; color:#8a7f72; display:flex; align-items:center; gap:2px; flex-wrap:wrap; }',
+    '.wf-cal-dot { display:inline-block; width:4px; height:4px; border-radius:50%; background:#b89a3a; margin-right:2px; }',
+    '.wf-cal-today-mark { display:inline-block; width:10px; height:10px; border:1px solid #5b7a5e; border-radius:2px; margin-right:2px; vertical-align:middle; }',
+
+    /* ── Read mode (scrolling book of past days) ─────────────────────────── */
+    '.wf-read-nav { align-items:center; }',
+    '.wf-read-book { max-width:820px; margin:12px auto; }',
+    '.wf-read-day { background:var(--surface,#faf8f4); border:1px solid var(--border,#d5cec0); border-radius:6px; padding:14px 18px; margin-bottom:16px; }',
+    '.wf-read-day-h { display:flex; align-items:baseline; gap:10px; margin-bottom:10px; padding-bottom:8px; border-bottom:1px solid #ece7dd; }',
+    '.wf-read-day-h h2 { margin:0; font-size:15px; color:#4a4139; font-weight:600; }',
+    '.wf-read-day-iso { font-family:"SF Mono",Monaco,Consolas,monospace; font-size:11px; color:#8a7f72; }',
+    '.wf-read-src-tag { font-size:9.5px; color:#8a7f72; background:#f0ebe3; padding:1px 6px; border-radius:2px; font-variant:small-caps; letter-spacing:.05em; margin-left:auto; }',
+    '.wf-read-day-body { font-size:13.5px; line-height:1.55; color:#4a4139; }',
+    '.wf-read-day-body img { max-width:100%; height:auto; border-radius:3px; }',
+    '.wf-read-day-body table { border-collapse:collapse; margin:6px 0; }',
+    '.wf-read-day-body td, .wf-read-day-body th { border:1px solid #d5cec0; padding:3px 8px; }',
+    /* Reuse the same block coloring rules from the editor for consistency */
+    '.wf-read-day-body [data-groups] { padding-left:8px; border-left:3px solid var(--wf-tag-primary, #7a9e7e); background: var(--wf-tag-tint, rgba(122,158,126,0.04)); position:relative; margin-top:14px; }',
+    '.wf-read-day-body .wf-task-done { border-left:3px solid #b89a3a; background:rgba(184,154,58,0.06); padding-left:8px; }',
+    '.wf-read-day-body .wf-protocol { border-left:3px solid #5b7aa0; background:rgba(91,122,160,0.06); padding-left:8px; }',
+    /* Project pill in Read mode / Notebook — identical to Workflow view so
+       what you see in editing is what you see in review + PDF. */
+    '.wf-read-day-body [data-groups]::after { content: attr(data-groups); position:absolute; top:-9px; right:6px; font-family:"SF Mono",Monaco,Consolas,monospace; font-size:10px; line-height:1; color: var(--wf-tag-pill-fg, #3a5a3d); background: var(--wf-tag-pill-bg, #e8f0e8); border:1px solid var(--wf-tag-pill-border, #7a9e7e); padding:2px 8px 3px 8px; border-radius:9px; pointer-events:none; z-index:1; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }',
+
+    /* ── Print styles ─────────────────────────────────────────────────────
+       When Read mode is printed (or window.print() invoked from anywhere),
+       hide chrome and put each day on its own page. Applies globally — a
+       Write mode print won\'t look great but that\'s not the intended flow. */
+    '@media print {',
+    '  body { background:#fff !important; }',
+    '  .day-nav, .wf-read-nav, #wf-read-status, .wf-doc-toolbar, .wf-doc-side, .btn, button { display:none !important; }',
+    '  .wf-read-book { max-width:none; margin:0; }',
+    '  .wf-read-day { border:none; padding:0; margin:0 0 20mm 0; page-break-after:always; box-shadow:none; }',
+    '  .wf-read-day:last-child { page-break-after:auto; }',
+    '  .wf-read-day-h { border-bottom:1px solid #999; }',
+    '  .wf-read-day-body img { max-width:100% !important; page-break-inside:avoid; }',
+    '  .wf-read-day-body table { page-break-inside:avoid; }',
+    '  .wf-read-src-tag { display:none !important; }',
+    '  .wf-cal-pop { display:none !important; }',
+    '}',
   ].join('\n');
   document.head.appendChild(s);
 }
@@ -269,7 +669,134 @@ function wfInsertTimeChip() {
 }
 
 /* Doc-specific keydown: Ctrl+T (time), Ctrl+G (tag picker), Enter auto-time-chip */
+/* ── Track changes on past-day edits ────────────────────────────────────────
+   When editing a workflow day older than today, Backspace/Delete are
+   intercepted: instead of removing text, the affected content is wrapped in
+   <del> so the original writing stays visible with strikethrough. Insertions
+   are plain — the "not-struck" text IS the new content.
+   Redact mode toggles this off for the current session — while active,
+   deletions work normally (permanent). Used for IP-sensitive content the
+   user doesn't want in an audit trail.
+   Editing today's page is never tracked (redact mode is irrelevant then). */
+var _wfRedactMode = false;
+
+function _wfIsPastDay() {
+  var today = new Date().toISOString().slice(0, 10);
+  return _workflowDate < today;
+}
+
+function _wfIsTrackingActive() {
+  return _wfIsPastDay() && !_wfRedactMode;
+}
+
+function _wfToggleRedactMode() {
+  if (!_wfIsPastDay()) {
+    toast('Redact mode only applies when editing past days');
+    return;
+  }
+  _wfRedactMode = !_wfRedactMode;
+  var btn = document.getElementById('wf-redact-btn');
+  if (btn) btn.innerHTML = _wfRedactBtnLabel();
+  var doc = document.getElementById('wf-doc');
+  if (doc) doc.classList.toggle('wf-redact-active', _wfRedactMode);
+  toast(_wfRedactMode
+    ? 'Redact mode ON — deletions will be permanent'
+    : 'Redact mode OFF — deletions will be tracked as strikethrough');
+}
+
+function _wfRedactBtnLabel() {
+  if (!_wfIsPastDay()) return '';   /* button hidden on today's page */
+  return _wfRedactMode
+    ? '<span style="color:#c0392b">\u{1F513} Redact mode: ON</span>'
+    : '\u{1F512} Redact mode: OFF';
+}
+
+
+function _wfWrapRangeAsDeleted(range) {
+  /* Wrap the range's selected content in a <del> element. Handles the common
+     case where the range is inside a single block; multi-block ranges get
+     approximated (wrap each contained element separately if needed).
+     Returns the <del> element so caller can position caret after it. */
+  var contents = range.extractContents();
+  var del = document.createElement('del');
+  del.appendChild(contents);
+  range.insertNode(del);
+  /* Place caret after the <del> */
+  var sel = window.getSelection();
+  var newRange = document.createRange();
+  newRange.setStartAfter(del);
+  newRange.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(newRange);
+  return del;
+}
+
+
+function _wfHandleTrackedDelete(direction) {
+  /* direction: 'backward' (Backspace) or 'forward' (Delete).
+     If selection is non-empty, wrap the whole selection in <del>.
+     If empty, extend by one character in `direction` and wrap.
+     Skips over content already inside <del> (avoids double-wrapping). */
+  var sel = window.getSelection();
+  if (!sel.rangeCount) return false;
+  var range = sel.getRangeAt(0);
+
+  /* If caret is already inside a <del>, let default behaviour happen — user
+     is likely trying to remove already-struck content, which is fine. */
+  var ancestor = range.startContainer.parentElement;
+  while (ancestor && ancestor.tagName !== 'DEL' && ancestor.id !== 'wf-doc') {
+    ancestor = ancestor.parentElement;
+  }
+  if (ancestor && ancestor.tagName === 'DEL') return false;
+
+  if (!range.collapsed) {
+    _wfWrapRangeAsDeleted(range);
+    return true;
+  }
+
+  /* Empty selection — extend by one char and wrap.
+     modify() is a WebKit/Blink API that grows the selection by a unit.
+     Fallback: manual range extension for the current text node. */
+  if (typeof sel.modify === 'function') {
+    sel.modify('extend', direction === 'backward' ? 'backward' : 'forward', 'character');
+    var r2 = sel.getRangeAt(0);
+    if (!r2.collapsed) {
+      _wfWrapRangeAsDeleted(r2);
+      return true;
+    }
+    return false;
+  }
+
+  /* Fallback: same-text-node char step */
+  var node = range.startContainer;
+  var off  = range.startOffset;
+  if (node.nodeType !== Node.TEXT_NODE) return false;
+  if (direction === 'backward') {
+    if (off <= 0) return false;
+    range.setStart(node, off - 1);
+    range.setEnd(node, off);
+  } else {
+    if (off >= (node.textContent || '').length) return false;
+    range.setStart(node, off);
+    range.setEnd(node, off + 1);
+  }
+  _wfWrapRangeAsDeleted(range);
+  return true;
+}
+
+
 function _wfDocKeydownExtras(e) {
+  /* Track-changes interception FIRST — must run before Ctrl+T / Enter etc.
+     Only Backspace/Delete are affected. Only active for past days when
+     redact mode is OFF. */
+  if (_wfIsTrackingActive() && (e.key === 'Backspace' || e.key === 'Delete')) {
+    var handled = _wfHandleTrackedDelete(e.key === 'Backspace' ? 'backward' : 'forward');
+    if (handled) {
+      e.preventDefault();
+      if (window._wfDocApi) _wfDocDebouncedSave();
+      return;
+    }
+  }
   if ((e.ctrlKey || e.metaKey) && (e.key === 't' || e.key === 'T')) {
     e.preventDefault(); wfInsertTimeChip(); return;
   }
@@ -289,16 +816,76 @@ function _wfDocKeydownExtras(e) {
         block = block.parentNode;
       }
       if (!block || block.id === 'wf-doc') return;
+
+      /* ── Auto-tag with active project ────────────────────────────────────
+         Runs FIRST — independent of the time-chip logic below. Only tags
+         "empty" blocks so mid-block Enter splits (where the second half has
+         inherited text) don't get their tags overridden.
+         Empty = no user text, tolerating a browser-inserted <br> and any
+         already-existing time chip. */
+      var activeProj = _wfGetActiveProject();
+      if (activeProj) {
+        var text = (block.textContent || '').trim();
+        // Strip any existing time-chip text before deciding empty-ness
+        var chipEls = block.querySelectorAll('.wf-time');
+        for (var ci = 0; ci < chipEls.length; ci++) {
+          text = text.replace(chipEls[ci].textContent, '').trim();
+        }
+        if (text === '') {
+          block.setAttribute('data-groups', activeProj);
+          if (window._wfDocApi) _wfDocDebouncedSave();
+        }
+      }
+
       if (block.querySelector && block.querySelector('.wf-time')) return;
+
+      /* ── 15-min gap check ────────────────────────────────────────────
+         Skip insertion if any existing chip in the doc has a time within
+         15 minutes of now. Stops rapid typing from stamping every line.
+         Uses the max-time-value across all chips so ordering doesn't matter. */
+      var docRoot = document.getElementById('wf-doc');
       var now = new Date();
+      var nowMin = now.getHours() * 60 + now.getMinutes();
+      if (docRoot) {
+        var chips = docRoot.querySelectorAll('.wf-time');
+        var maxMin = -1;
+        for (var i = 0; i < chips.length; i++) {
+          var m = chips[i].textContent.trim().match(/^(\d{1,2}):(\d{2})$/);
+          if (m) {
+            var v = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+            if (v > maxMin) maxMin = v;
+          }
+        }
+        if (maxMin >= 0) {
+          var diff = nowMin - maxMin;
+          if (diff < 0) diff += 24 * 60;  /* crossed midnight */
+          if (diff < 15) return;
+        }
+      }
+
       var hh = String(now.getHours()).padStart(2, '0');
       var mm = String(now.getMinutes()).padStart(2, '0');
       var chip = document.createElement('span');
       chip.className = 'wf-time';
       chip.contentEditable = 'false';
       chip.textContent = hh + ':' + mm;
+      var spaceNode = document.createTextNode(' ');
       block.insertBefore(chip, block.firstChild);
-      block.insertBefore(document.createTextNode(' '), chip.nextSibling);
+      block.insertBefore(spaceNode, chip.nextSibling);
+
+      /* ── Cursor fix ───────────────────────────────────────────────────
+         Previously the caret stayed at position 0 (before the chip) so the
+         next character typed went BEFORE the timestamp. Move caret to
+         after the trailing space so typing continues normally after the chip. */
+      try {
+        var range = document.createRange();
+        range.setStartAfter(spaceNode);
+        range.collapse(true);
+        var newSel = window.getSelection();
+        newSel.removeAllRanges();
+        newSel.addRange(range);
+      } catch (ex) { /* selection API can be flaky mid-input; chip inserted regardless */ }
+
       if (window._wfDocApi) _wfDocDebouncedSave();
     }, 0);
   }
@@ -490,7 +1077,7 @@ async function wfOpenTagPicker() {
       '<div style="font-size:11.5px;color:#8a7f72;margin-bottom:8px">Click to toggle. Multiple allowed.</div>' +
       '<div id="wf-tag-chips" style="min-height:40px;padding:6px;background:#fff;border:1px solid #e0d9cd;border-radius:4px;margin-bottom:10px">' + chipsHtml + '</div>' +
       '<div style="display:flex;gap:6px;margin-bottom:10px">' +
-        '<input id="wf-tag-new" type="text" list="wf-tag-suggestions" placeholder="New group name\u2026" ' +
+        '<input id="wf-tag-new" type="text" list="global-projects" placeholder="New group name\u2026" ' +
           'style="flex:1;padding:5px 8px;border:1px solid #d5cec0;border-radius:4px;font-family:inherit" ' +
           'onkeydown="if(event.key===\'Enter\'){event.preventDefault();wfAddNewTag();}">' +
         /* datalist provides native browser autocomplete — uses candidate names
@@ -1076,3 +1663,240 @@ function _wfJumpToProtocol(title) {
 registerView('workflow', renderWorkflow, {wide:true});
 window.processWorkflowDay = processWorkflowDay;
 window.wfResetProcessDay  = wfResetProcessDay;
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+   READ MODE — scrolling book of past days
+   ────────────────────────────────────────────────────────────────────────
+   Not an editor. Renders a 30-day window of day content, newest at top.
+   Populated by GET /api/workflow/documents/range which prefers day_documents
+   but falls back to synthesising from workflow_entries.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+async function _wfRenderReadMode(el) {
+  var today = new Date().toISOString().slice(0, 10);
+  var end = _readWindowEnd;
+  var days = _readWindowDays;
+  // Compute window start for the label
+  var startDt = new Date(end + 'T12:00:00');
+  startDt.setDate(startDt.getDate() - (days - 1));
+  var start = startDt.toISOString().slice(0, 10);
+
+  // Newer button caps at today
+  var canGoNewer = end < today;
+
+  var html = '<div class="day-nav wf-read-nav">' +
+    '<button onclick="_wfShiftReadWindow(-' + days + ')" title="Older 30 days">&#8592; Older</button>' +
+    '<div class="day-label"><button class="wf-date-btn" onclick="_wfOpenCalendar(this, \'read\')" title="Jump to a date (window will end on that date)">' +
+      formatDate(start) + ' &ndash; ' + formatDate(end) + ' &#9662;</button></div>' +
+    (canGoNewer
+      ? '<button onclick="_wfShiftReadWindow(' + days + ')" title="Newer 30 days">Newer &#8594;</button>'
+      : '<button disabled style="opacity:.3">Newer &#8594;</button>') +
+    '<button class="btn" onclick="_wfSwitchMode(\'write\')" title="Switch back to Write mode (edit today\'s notes)" style="margin-left:10px">&#9998; Write mode</button>' +
+    '<button class="btn" onclick="_wfPrintPdf()" title="Print this 30-day window to PDF (save from your browser\'s print dialog)" style="margin-left:6px">&#128424; Print PDF</button>' +
+    '</div>';
+
+  html += '<div id="wf-read-status" style="font-size:12px;color:#8a7f72;margin:6px 2px">Loading&hellip;</div>';
+  html += '<div id="wf-read-book" class="wf-read-book"></div>';
+
+  el.innerHTML = html;
+  _wfInjectDocStyles();
+
+  var resp;
+  try {
+    resp = await api('GET', '/api/workflow/documents/range?end=' + encodeURIComponent(end) + '&days=' + days);
+  } catch (ex) {
+    document.getElementById('wf-read-status').textContent = 'Failed to load: ' + (ex.message || ex);
+    return;
+  }
+
+  var docs = resp.documents || [];
+  var status = document.getElementById('wf-read-status');
+  if (docs.length === 0) {
+    status.innerHTML = 'No content in this 30-day window (' + esc(start) + ' &ndash; ' + esc(end) + '). ' +
+      'Try an earlier window with the Older button.';
+    return;
+  }
+  status.innerHTML = docs.length + ' day' + (docs.length === 1 ? '' : 's') + ' with content &middot; window ' + esc(start) + ' &ndash; ' + esc(end);
+
+  var book = document.getElementById('wf-read-book');
+  var pages = docs.map(function(d) {
+    var srcTag = d.source === 'synth_workflow_entries'
+      ? '<span class="wf-read-src-tag" title="Synthesised from workflow_entries (day_document not created yet)">legacy</span>'
+      : '';
+    return '<article class="wf-read-day">' +
+      '<header class="wf-read-day-h">' +
+        '<h2>' + esc(formatDate(d.date)) + '</h2>' +
+        '<span class="wf-read-day-iso">' + esc(d.date) + '</span>' +
+        srcTag +
+      '</header>' +
+      '<div class="wf-read-day-body">' + (d.content || '') + '</div>' +
+    '</article>';
+  });
+  book.innerHTML = pages.join('');
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+   CALENDAR PICKER — month view, dots for days with content, click to jump
+   ────────────────────────────────────────────────────────────────────────
+   Used by both Write and Read modes. Anchored to the button that opened it,
+   fetches populated dates for the visible month via the dates-with-content
+   endpoint, and calls _workflowDate (write) or _readWindowEnd (read) on pick.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+var _wfCalState = { anchor: null, mode: null, viewYear: 0, viewMonth: 0, populated: {} };
+
+async function _wfOpenCalendar(anchorEl, mode) {
+  // Close any existing calendar
+  _wfCloseCalendar();
+  var startingDate = mode === 'read' ? _readWindowEnd : _workflowDate;
+  var dt = new Date(startingDate + 'T12:00:00');
+  _wfCalState.anchor = anchorEl;
+  _wfCalState.mode = mode;
+  _wfCalState.viewYear = dt.getFullYear();
+  _wfCalState.viewMonth = dt.getMonth();  // 0-11
+
+  var pop = document.createElement('div');
+  pop.id = 'wf-calendar-pop';
+  pop.className = 'wf-cal-pop';
+  document.body.appendChild(pop);
+  _wfCalPositionPop(anchorEl, pop);
+
+  await _wfCalRender();
+
+  // Close on outside click / Escape
+  setTimeout(function() {
+    document.addEventListener('mousedown', _wfCalOutsideClick, { capture: true });
+    document.addEventListener('keydown', _wfCalKeydown);
+  }, 0);
+}
+
+function _wfCloseCalendar() {
+  var pop = document.getElementById('wf-calendar-pop');
+  if (pop) pop.remove();
+  document.removeEventListener('mousedown', _wfCalOutsideClick, { capture: true });
+  document.removeEventListener('keydown', _wfCalKeydown);
+  _wfCalState.anchor = null;
+}
+
+function _wfCalOutsideClick(e) {
+  var pop = document.getElementById('wf-calendar-pop');
+  if (!pop) return;
+  if (pop.contains(e.target)) return;
+  if (_wfCalState.anchor && _wfCalState.anchor.contains(e.target)) return;
+  _wfCloseCalendar();
+}
+
+function _wfCalKeydown(e) {
+  if (e.key === 'Escape') _wfCloseCalendar();
+}
+
+function _wfCalPositionPop(anchor, pop) {
+  var r = anchor.getBoundingClientRect();
+  pop.style.position = 'absolute';
+  pop.style.top = (window.scrollY + r.bottom + 4) + 'px';
+  pop.style.left = (window.scrollX + r.left) + 'px';
+  pop.style.zIndex = 1200;
+}
+
+async function _wfCalRender() {
+  var pop = document.getElementById('wf-calendar-pop');
+  if (!pop) return;
+  var y = _wfCalState.viewYear;
+  var m = _wfCalState.viewMonth;
+  var firstOfMonth = new Date(y, m, 1);
+  var lastOfMonth = new Date(y, m + 1, 0);
+  var monthStart = firstOfMonth.toISOString().slice(0, 10);
+  var monthEnd = lastOfMonth.toISOString().slice(0, 10);
+
+  // Fetch populated dates for this month
+  var populated = {};
+  try {
+    var resp = await api('GET', '/api/workflow/documents/dates-with-content?start=' + monthStart + '&end=' + monthEnd);
+    (resp.dates || []).forEach(function(d) { populated[d] = true; });
+  } catch(ex) { /* silent — dots just won't show */ }
+  _wfCalState.populated = populated;
+
+  var today = new Date().toISOString().slice(0, 10);
+  var selectedDate = _wfCalState.mode === 'read' ? _readWindowEnd : _workflowDate;
+
+  var monthNames = ['January','February','March','April','May','June',
+                    'July','August','September','October','November','December'];
+
+  var h = '<div class="wf-cal-head">' +
+    '<button class="wf-cal-nav" onclick="_wfCalShiftMonth(-1)" title="Previous month">&#8592;</button>' +
+    '<div class="wf-cal-title">' + monthNames[m] + ' ' + y + '</div>' +
+    '<button class="wf-cal-nav" onclick="_wfCalShiftMonth(1)" title="Next month">&#8594;</button>' +
+    '</div>';
+  h += '<div class="wf-cal-dow">';
+  ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].forEach(function(d) { h += '<div>' + d + '</div>'; });
+  h += '</div>';
+  h += '<div class="wf-cal-grid">';
+  // Grid starts on Monday. JS getDay(): Sun=0..Sat=6. Convert to Mon=0..Sun=6.
+  var firstDow = (firstOfMonth.getDay() + 6) % 7;
+  // Leading blanks
+  for (var i = 0; i < firstDow; i++) h += '<div class="wf-cal-blank"></div>';
+  // Days
+  for (var d = 1; d <= lastOfMonth.getDate(); d++) {
+    var iso = y + '-' + String(m+1).padStart(2,'0') + '-' + String(d).padStart(2,'0');
+    var cls = 'wf-cal-day';
+    if (iso === today) cls += ' wf-cal-today';
+    if (iso === selectedDate) cls += ' wf-cal-selected';
+    if (populated[iso]) cls += ' wf-cal-populated';
+    if (iso > today) cls += ' wf-cal-future';
+    var clickAttr = iso > today ? '' : ' onclick="_wfCalPickDate(\'' + iso + '\')"';
+    h += '<div class="' + cls + '"' + clickAttr + '>' + d + '</div>';
+  }
+  h += '</div>';
+  h += '<div class="wf-cal-legend">' +
+    '<span class="wf-cal-dot"></span> has content &nbsp;·&nbsp; ' +
+    '<span class="wf-cal-today-mark"></span> today' +
+    '</div>';
+  pop.innerHTML = h;
+}
+
+function _wfCalShiftMonth(delta) {
+  var y = _wfCalState.viewYear;
+  var m = _wfCalState.viewMonth + delta;
+  while (m < 0)  { m += 12; y -= 1; }
+  while (m > 11) { m -= 12; y += 1; }
+  _wfCalState.viewYear = y;
+  _wfCalState.viewMonth = m;
+  _wfCalRender();
+}
+
+function _wfCalPickDate(iso) {
+  var mode = _wfCalState.mode;
+  _wfCloseCalendar();
+  if (mode === 'read') {
+    _readWindowEnd = iso;
+  } else {
+    _workflowDate = iso;
+  }
+  loadView();
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+   PRINT to PDF — uses the browser's print dialog
+   ════════════════════════════════════════════════════════════════════════ */
+
+function _wfPrintPdf() {
+  // Just calls window.print(). Print CSS (added in _wfInjectDocStyles) hides
+  // nav/status/toolbar/sidebar and starts each day on a new page.
+  window.print();
+}
+
+
+/* Expose read-mode entrypoints for inline handlers */
+window._wfSwitchMode          = _wfSwitchMode;
+window._wfShiftReadWindow     = _wfShiftReadWindow;
+window._wfOpenCalendar        = _wfOpenCalendar;
+window._wfCalShiftMonth       = _wfCalShiftMonth;
+window._wfCalPickDate         = _wfCalPickDate;
+window._wfPrintPdf            = _wfPrintPdf;
+window._wfOpenProjectPicker   = _wfOpenProjectPicker;
+window._wfProjectPickerAddNew = _wfProjectPickerAddNew;
+window._wfProjectSetColor     = _wfProjectSetColor;
+window._wfToggleRedactMode    = _wfToggleRedactMode;

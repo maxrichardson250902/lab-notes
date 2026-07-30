@@ -251,8 +251,13 @@ async function _dnaLoadAll() {
   try { _dna.boxes = (await api('GET', '/api/boxes')).items || []; } catch(e) { _dna.boxes = []; }
   try { _dna.settings = await api('GET', '/api/dna/settings'); } catch(e) {}
   try {
-    var projData = await api('GET', '/api/dna/projects');
-    _dna.projects = projData.projects || [];
+    /* Draw project names from the global registry (unions across every source
+       in the app — Workflow tags, Notebook groups, DNA tables, etc.) so the
+       DNA picker autocompletes against the same list as everywhere else.
+       Subcategories are still DNA-domain-specific and come from the same
+       /api/projects response (server folds them in). */
+    var projData = await api('GET', '/api/projects');
+    _dna.projects = (projData.projects || []).map(function(p) { return p.name; });
     _dna.subcategories = projData.subcategories || {};
   } catch(e) { _dna.projects = []; _dna.subcategories = {}; }
   _dnaBuildRegex();
@@ -724,7 +729,7 @@ function _dnaAddPrimerRow() {
   html += '<input id="dna-p-name" placeholder="Primer name" class="dna-input" style="flex:2">';
   html += '<input id="dna-p-seq" placeholder="Sequence" class="dna-input" style="flex:3">';
   html += '<input id="dna-p-use" placeholder="Use" class="dna-input" style="flex:2">';
-  html += '<input id="dna-p-project" placeholder="Project" class="dna-input" style="flex:1" list="dna-proj-list">';
+  html += '<input id="dna-p-project" placeholder="Project" class="dna-input" style="flex:1" list="global-projects">';
   html += '<input id="dna-p-box" placeholder="Box #" class="dna-input" style="flex:1">';
   html += '<button class="btn btn-sm" onclick="_dnaAddPrimer()">Add</button>';
   html += '</div>';
@@ -900,7 +905,7 @@ function _dnaPlasmidTable() {
   html += '<div class="dna-add-row">';
   html += '<input id="dna-pl-name" placeholder="Plasmid name" class="dna-input" style="flex:2">';
   html += '<input id="dna-pl-use" placeholder="Use" class="dna-input" style="flex:2">';
-  html += '<input id="dna-pl-project" placeholder="Project" class="dna-input" style="flex:1" list="dna-proj-list">';
+  html += '<input id="dna-pl-project" placeholder="Project" class="dna-input" style="flex:1" list="global-projects">';
   html += '<input id="dna-pl-box" placeholder="Box location" class="dna-input" style="flex:1">';
   html += '<input id="dna-pl-gly" placeholder="Glycerol" class="dna-input" style="flex:1">';
   html += '<button class="btn btn-sm" onclick="_dnaAddPlasmid()">Add</button>';
@@ -1027,7 +1032,7 @@ function _dnaShowGblockForm() {
   html += '<textarea id="dna-gb-seq" class="dna-seq-textarea" placeholder="Paste DNA sequence\u2026" rows="4"></textarea>';
   html += '<div style="display:flex;gap:.5rem;flex-wrap:wrap">';
   html += '<input id="dna-gb-use" class="dna-input" placeholder="Use" style="flex:2">';
-  html += '<input id="dna-gb-project" class="dna-input" placeholder="Project" style="flex:1" list="dna-proj-list">';
+  html += '<input id="dna-gb-project" class="dna-input" placeholder="Project" style="flex:1" list="global-projects">';
   html += '</div>';
   html += '<div style="display:flex;gap:.5rem;flex-wrap:wrap">';
   html += '<input id="dna-gb-supplier" class="dna-input" placeholder="Supplier" value="IDT" style="flex:1">';
@@ -1201,7 +1206,7 @@ function _dnaShowKitPartForm() {
   html += '</div>';
   html += '<input id="dna-kp-desc" class="dna-input" placeholder="Description">';
   html += '<div style="display:flex;gap:.5rem;flex-wrap:wrap">';
-  html += '<input id="dna-kp-project" class="dna-input" placeholder="Project" style="flex:1" list="dna-proj-list">';
+  html += '<input id="dna-kp-project" class="dna-input" placeholder="Project" style="flex:1" list="global-projects">';
   html += '<input id="dna-kp-resist" class="dna-input" placeholder="Resistance (e.g. Amp)" style="flex:1">';
   html += '</div>';
   html += '<div style="display:flex;gap:.5rem;flex-wrap:wrap">';
@@ -1327,7 +1332,7 @@ function _dnaShowPartForm() {
   html += '<input id="dna-pt-desc" class="dna-input" placeholder="Description">';
   html += '<textarea id="dna-pt-seq" class="dna-seq-textarea" placeholder="Paste DNA sequence\u2026" rows="3"></textarea>';
   html += '<div style="display:flex;gap:.5rem;flex-wrap:wrap">';
-  html += '<input id="dna-pt-project" class="dna-input" placeholder="Project" style="flex:1" list="dna-proj-list">';
+  html += '<input id="dna-pt-project" class="dna-input" placeholder="Project" style="flex:1" list="global-projects">';
   html += '<input id="dna-pt-sub" class="dna-input" placeholder="Subcategory" style="flex:1" list="dna-sub-list">';
   html += '</div>';
   html += '<div style="display:flex;gap:.5rem;flex-wrap:wrap">';

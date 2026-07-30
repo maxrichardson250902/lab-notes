@@ -41,7 +41,7 @@ async function renderReminders(el) {
     '<div class="field-grid">' +
       '<div class="field full"><label>Reminder text</label><input type="text" id="rem-text" placeholder="What to remember..." spellcheck="false"/></div>' +
       '<div class="field"><label>Due date (optional)</label><input type="date" id="rem-date" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/></div>' +
-      '<div class="field"><label>Project (optional)</label><input type="text" id="rem-group" list="rem-groups-dl" placeholder="e.g. NorV, Pol I..." style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/>' +
+      '<div class="field"><label>Project (optional)</label><input type="text" id="rem-group" list="global-projects" placeholder="e.g. NorV, Pol I..." style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/>' +
         '<datalist id="rem-groups-dl">' + groupOpts + '</datalist></div>' +
     '</div>' +
     '<div class="save-row"><button class="btn" onclick="closeReminderForm()">Cancel</button><button class="btn primary" onclick="submitReminder()">Add reminder</button></div>' +
@@ -215,7 +215,7 @@ function showEditReminderModal(r) {
     '<div class="field-grid">' +
       '<div class="field full"><label>Text</label><input type="text" id="edit-rem-text" value="' + safeText + '" spellcheck="false"/></div>' +
       '<div class="field"><label>Due date</label><input type="date" id="edit-rem-date" value="' + (r.due_date || '') + '" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/></div>' +
-      '<div class="field"><label>Project</label><input type="text" id="edit-rem-group" list="edit-groups-dl" value="' + safeGroup + '" placeholder="Optional" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/>' +
+      '<div class="field"><label>Project</label><input type="text" id="edit-rem-group" list="global-projects" value="' + safeGroup + '" placeholder="Optional" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/>' +
         '<datalist id="edit-groups-dl">' + groupOpts + '</datalist></div>' +
     '</div>' +
     '<div class="save-row">' +

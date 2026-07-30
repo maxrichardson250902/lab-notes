@@ -1785,20 +1785,6 @@ function _wfInjectStyles() {
     /* Floating "Delete table" button — sits above the active table in the editor */
     '.wf-del-table-btn { display:none; position:fixed; z-index:500; padding:3px 10px; font-size:11.5px; color:#c0392b; background:#fff; border:1px solid #e8b4b0; border-radius:4px; cursor:pointer; font-family:inherit; box-shadow:0 1px 4px rgba(0,0,0,.08); }',
     '.wf-del-table-btn:hover { background:#fdecea; border-color:#c0392b; }',
-    /* ── Inline sketch widget ── */
-    '.wf-sketch { display:block; border:1px solid #d5cec0; border-radius:6px; background:#fff; margin:8px 0; max-width:100%; overflow:hidden; }',
-    '.wf-sketch-tools { display:flex; align-items:center; gap:6px; padding:5px 8px; background:#f4f0ea; border-bottom:1px solid #e0d9cd; flex-wrap:wrap; }',
-    '.wf-sk-swatch { width:20px; height:20px; border-radius:50%; border:2px solid #fff; box-shadow:0 0 0 1px #c0b8b0; cursor:pointer; padding:0; }',
-    '.wf-sk-swatch.active { box-shadow:0 0 0 2px #4a4139; }',
-    '.wf-sk-tool { padding:3px 9px; background:#fff; border:1px solid #d5cec0; border-radius:4px; cursor:pointer; font-size:12px; color:#6a6058; font-family:inherit; }',
-    '.wf-sk-tool:hover { background:#f0ebe3; }',
-    '.wf-sk-tool.active { background:#e8f0e8; border-color:#5b7a5e; color:#3d5e3f; font-weight:600; }',
-    '.wf-sk-tool.primary { background:#5b7a5e; color:#fff; border-color:#5b7a5e; }',
-    '.wf-sk-tool.primary:hover { background:#4d684f; }',
-    '.wf-sk-canvas { display:block; width:100%; touch-action:none; background:#fff; cursor:crosshair; }',
-    '.wf-sk-hint { font-size:11px; color:#a59c90; margin-left:auto; }',
-    /* Rendered sketch image (read-only and in-editor flattened state) keeps a subtle frame */
-    '.wf-sketch-img { border:1px solid #e0d9cd; border-radius:6px; cursor:pointer; }',
   ].join('\n');
   document.head.appendChild(s);
 }
@@ -1956,327 +1942,7 @@ function _wfInstallGelClickHandler() {
   });
 }
 
-/* ── Inline sketch widget ───────────────────────────────────────────────────
-   A drawable canvas embedded in the document flow. Stores vector strokes so it
-   can be reopened and edited; on "Done" it rasterises to PNG (uploaded to the
-   shared wf_images store) and the strokes are saved server-side, then the live
-   widget is swapped for a plain <img data-sketch-id> that survives sanitization.
-
-   Input model (Pointer Events):
-     • pen            → draw, line width scaled by pressure
-     • pen + eraser   → erase (Samsung S-Pen side button reports either
-                        pointerType 'eraser' OR buttons bit 32 / bit 2,
-                        depending on One UI / browser — we detect all, plus a
-                        manual eraser toggle as a guaranteed fallback)
-     • touch (finger) → ignored for ink (palm rejection) so you can rest a hand
-     • mouse          → draws (desktop authoring)                              */
-
-var _wfSketchSeq = 0;
-var _wfSketchReg = {};   // domId -> state
-
-var WF_SK_COLORS = ['#222222', '#c0392b', '#2c5aa0'];   // black, red, blue
-
-function _wfNewSketchId() {
-  /* uuid-ish; matches the style of server uuids closely enough for a key */
-  return 'sk' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
-}
-
-/* Build the live widget DOM (tools + canvas) for a given sketch id. */
-function _wfBuildSketchWidget(sketchId, w, h) {
-  var domId = 'wfsk-' + (++_wfSketchSeq);
-  var wrap = document.createElement('span');   // span so it sits inline-block in contenteditable
-  wrap.className = 'wf-sketch';
-  wrap.setAttribute('contenteditable', 'false');
-  wrap.setAttribute('data-sketch-id', sketchId);
-  wrap.id = domId;
-
-  var swatches = WF_SK_COLORS.map(function(c, i) {
-    return '<button type="button" class="wf-sk-swatch' + (i === 0 ? ' active' : '') +
-           '" style="background:' + c + '" data-color="' + c + '" title="Pen colour"></button>';
-  }).join('');
-
-  wrap.innerHTML =
-    '<div class="wf-sketch-tools">' +
-      swatches +
-      '<button type="button" class="wf-sk-tool" data-act="pen" title="Pen">&#9998;</button>' +
-      '<button type="button" class="wf-sk-tool" data-act="erase" title="Eraser (or use pen button)">Eraser</button>' +
-      '<button type="button" class="wf-sk-tool" data-act="undo" title="Undo last stroke">Undo</button>' +
-      '<button type="button" class="wf-sk-tool" data-act="clear" title="Clear all">Clear</button>' +
-      '<span class="wf-sk-hint">Pen draws \u00b7 finger ignored</span>' +
-      '<button type="button" class="wf-sk-tool primary" data-act="done" title="Save sketch">Done</button>' +
-    '</div>' +
-    '<canvas class="wf-sk-canvas" width="' + w + '" height="' + h + '"></canvas>';
-  return { wrap: wrap, domId: domId };
-}
-
-/* Initialise drawing behaviour on a widget already in the DOM. `onDone` is
-   called with (sketchId) once the sketch has been flattened+saved and the
-   widget replaced by an <img>. `strokes` optionally seeds an existing sketch. */
-function _wfInitSketch(domId, sketchId, onDone, seedStrokes) {
-  var wrap = document.getElementById(domId);
-  if (!wrap) return;
-  var canvas = wrap.querySelector('.wf-sk-canvas');
-  var ctx = canvas.getContext('2d');
-
-  var state = {
-    sketchId: sketchId,
-    strokes: (seedStrokes && seedStrokes.length) ? seedStrokes.slice() : [],
-    color: WF_SK_COLORS[0],
-    tool: 'pen',            // 'pen' | 'erase'
-    drawing: false,
-    cur: null,              // current stroke being built
-    onDone: onDone,
-    w: canvas.width,
-    h: canvas.height,
-  };
-  _wfSketchReg[domId] = state;
-
-  /* Crisp rendering on HiDPI / tablet screens: scale the backing store by DPR
-     but keep CSS size driven by the layout width. */
-  function fitBackingStore() {
-    var dpr = window.devicePixelRatio || 1;
-    var cssW = canvas.clientWidth || state.w;
-    var cssH = state.h;
-    canvas.width = Math.round(cssW * dpr);
-    canvas.height = Math.round(cssH * dpr);
-    state.w = cssW; state.h = cssH;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    redraw();
-  }
-
-  function pt(e) {
-    var r = canvas.getBoundingClientRect();
-    return {
-      x: (e.clientX - r.left),
-      y: (e.clientY - r.top),
-      p: (typeof e.pressure === 'number' && e.pressure > 0) ? e.pressure : 0.5,
-    };
-  }
-
-  /* Decide what an incoming pointer should do. Returns 'draw' | 'erase' | null. */
-  function classify(e) {
-    if (e.pointerType === 'touch') return null;        // palm rejection
-    if (e.pointerType === 'eraser') return 'erase';    // some pens report this
-    // Samsung S-Pen side button: barrel (bit 2) or eraser (bit 32) in .buttons
-    if (e.buttons & 32 || e.buttons & 2) return 'erase';
-    return state.tool === 'erase' ? 'erase' : 'draw';
-  }
-
-  function strokeStyleFor(stroke) {
-    if (stroke.erase) {
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.strokeStyle = 'rgba(0,0,0,1)';
-      ctx.lineWidth = 18;
-    } else {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.strokeStyle = stroke.color;
-      ctx.lineWidth = stroke.width || 2;
-    }
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-  }
-
-  function drawStroke(stroke) {
-    var pts = stroke.points;
-    if (!pts || pts.length === 0) return;
-    strokeStyleFor(stroke);
-    ctx.beginPath();
-    if (pts.length === 1) {
-      // a dot
-      ctx.arc(pts[0].x, pts[0].y, (stroke.width || 2) / 2, 0, Math.PI * 2);
-      ctx.fillStyle = stroke.erase ? 'rgba(0,0,0,1)' : stroke.color;
-      ctx.fill();
-      ctx.globalCompositeOperation = 'source-over';
-      return;
-    }
-    ctx.moveTo(pts[0].x, pts[0].y);
-    for (var i = 1; i < pts.length; i++) {
-      // pressure modulates width on pen strokes; approximate by averaging
-      ctx.lineTo(pts[i].x, pts[i].y);
-    }
-    ctx.stroke();
-    ctx.globalCompositeOperation = 'source-over';
-  }
-
-  function redraw() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    for (var i = 0; i < state.strokes.length; i++) drawStroke(state.strokes[i]);
-  }
-
-  function onDown(e) {
-    var mode = classify(e);
-    if (!mode) return;                 // ignored (finger)
-    e.preventDefault();
-    canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
-    state.drawing = true;
-    var w = mode === 'draw' ? (1 + Math.round((pt(e).p) * 4)) : 18;
-    state.cur = { color: state.color, width: w, erase: mode === 'erase', points: [pt(e)] };
-  }
-  function onMove(e) {
-    if (!state.drawing || !state.cur) return;
-    e.preventDefault();
-    // coalesced events give smoother lines on fast pen movement
-    var evs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
-    for (var i = 0; i < evs.length; i++) state.cur.points.push(pt(evs[i]));
-    // incremental draw of just the new segment for responsiveness
-    redraw();
-    drawStroke(state.cur);
-  }
-  function onUp(e) {
-    if (!state.drawing) return;
-    e.preventDefault();
-    state.drawing = false;
-    if (state.cur && state.cur.points.length) state.strokes.push(state.cur);
-    state.cur = null;
-    redraw();
-  }
-
-  canvas.addEventListener('pointerdown', onDown);
-  canvas.addEventListener('pointermove', onMove);
-  canvas.addEventListener('pointerup', onUp);
-  canvas.addEventListener('pointercancel', onUp);
-  canvas.addEventListener('pointerleave', function(e){ if (state.drawing) onUp(e); });
-
-  /* Tool row */
-  wrap.querySelector('.wf-sketch-tools').addEventListener('click', function(e) {
-    var sw = e.target.closest('.wf-sk-swatch');
-    if (sw) {
-      state.color = sw.getAttribute('data-color');
-      state.tool = 'pen';
-      wrap.querySelectorAll('.wf-sk-swatch').forEach(function(b){ b.classList.toggle('active', b === sw); });
-      _wfSkSetToolActive(wrap, 'pen');
-      return;
-    }
-    var btn = e.target.closest('.wf-sk-tool');
-    if (!btn) return;
-    var act = btn.getAttribute('data-act');
-    if (act === 'pen')   { state.tool = 'pen';   _wfSkSetToolActive(wrap, 'pen'); }
-    else if (act === 'erase') { state.tool = 'erase'; _wfSkSetToolActive(wrap, 'erase'); }
-    else if (act === 'undo')  { state.strokes.pop(); redraw(); }
-    else if (act === 'clear') { state.strokes = []; redraw(); }
-    else if (act === 'done')  { _wfFinishSketch(domId); }
-  });
-
-  // Fit after layout settles, and on resize.
-  setTimeout(fitBackingStore, 0);
-  if (window.ResizeObserver) {
-    var ro = new ResizeObserver(function(){ fitBackingStore(); });
-    ro.observe(canvas);
-    state._ro = ro;
-  }
-  redraw();
-}
-
-function _wfSkSetToolActive(wrap, tool) {
-  wrap.querySelectorAll('.wf-sk-tool').forEach(function(b){
-    var a = b.getAttribute('data-act');
-    if (a === 'pen' || a === 'erase') b.classList.toggle('active', a === tool);
-  });
-}
-
-/* Render the canvas to a white-background PNG blob (canvas itself is
-   transparent where un-drawn; lab notes read better on white). */
-function _wfSketchToBlob(canvas) {
-  return new Promise(function(resolve) {
-    var out = document.createElement('canvas');
-    out.width = canvas.width; out.height = canvas.height;
-    var octx = out.getContext('2d');
-    octx.fillStyle = '#ffffff';
-    octx.fillRect(0, 0, out.width, out.height);
-    octx.drawImage(canvas, 0, 0);
-    out.toBlob(function(b){ resolve(b); }, 'image/png');
-  });
-}
-
-/* Done: flatten → upload PNG → save strokes → replace widget with <img>. */
-async function _wfFinishSketch(domId) {
-  var wrap = document.getElementById(domId);
-  var state = _wfSketchReg[domId];
-  if (!wrap || !state) return;
-  var canvas = wrap.querySelector('.wf-sk-canvas');
-  var doneBtn = wrap.querySelector('.wf-sk-tool.primary');
-  if (doneBtn) { doneBtn.textContent = 'Saving\u2026'; doneBtn.disabled = true; }
-
-  try {
-    if (!state.strokes.length) {
-      // empty sketch — just remove the widget
-      wrap.remove();
-      if (state._ro) state._ro.disconnect();
-      delete _wfSketchReg[domId];
-      return;
-    }
-    var blob = await _wfSketchToBlob(canvas);
-    var file = new File([blob], state.sketchId + '.png', { type: 'image/png' });
-    var up = await _wfUploadImage(file);                          // { filename, url }
-    // persist strokes keyed by sketchId
-    await fetch('/api/workflow/sketch', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        sketch_id: state.sketchId, strokes: state.strokes,
-        width: state.w, height: state.h,
-      }),
-    });
-    // swap live widget for a static, editable-on-click image
-    var img = document.createElement('img');
-    img.className = 'wf-sketch-img';
-    img.src = up.url;
-    img.alt = 'sketch';
-    img.setAttribute('data-sketch-id', state.sketchId);
-    wrap.replaceWith(img);
-    if (state._ro) state._ro.disconnect();
-    delete _wfSketchReg[domId];
-    if (state.onDone) state.onDone(state.sketchId);
-  } catch (e) {
-    if (typeof toast === 'function') toast('Sketch save failed: ' + e.message, true);
-    if (doneBtn) { doneBtn.textContent = 'Done'; doneBtn.disabled = false; }
-  }
-}
-
-/* Reopen a flattened sketch <img> for editing: fetch its strokes, replace the
-   <img> with a live widget seeded from them. */
-async function _wfReopenSketch(img, editorApi) {
-  var sketchId = img.getAttribute('data-sketch-id');
-  if (!sketchId) return;
-  var w = 800, h = 400, seed = [];
-  try {
-    var data = await fetch('/api/workflow/sketch/' + encodeURIComponent(sketchId)).then(function(r){
-      if (!r.ok) throw new Error('no strokes'); return r.json();
-    });
-    seed = data.strokes || [];
-    w = data.width || w; h = data.height || h;
-  } catch (e) {
-    if (typeof toast === 'function') toast('This image has no editable strokes.', true);
-    return;
-  }
-  var built = _wfBuildSketchWidget(sketchId, w, h);
-  img.replaceWith(built.wrap);
-  _wfInitSketch(built.domId, sketchId, function(){
-    if (editorApi && editorApi._markDirty) editorApi._markDirty();
-  }, seed);
-}
-
-window._wfReopenSketch = _wfReopenSketch;
-
-/* Flatten every open (live) sketch widget inside `root` to a saved <img>.
-   Returns true if any were flattened (so the caller re-reads the HTML).
-   Used by the save path so an un-"Done" sketch isn't lost to the sanitizer. */
-window._wfFlattenOpenSketches = async function(root) {
-  if (!root) return false;
-  var widgets = root.querySelectorAll('.wf-sketch[data-sketch-id]');
-  if (!widgets.length) return false;
-  var any = false;
-  for (var i = 0; i < widgets.length; i++) {
-    var domId = widgets[i].id;
-    if (domId && _wfSketchReg[domId]) {
-      await _wfFinishSketch(domId);
-      any = true;
-    }
-  }
-  return any;
-};
-
-
+/* ── Public: attach editor to an element ──────────────────────────────────── */
 
 window.wfEditorAttach = function(el, opts) {
   _wfInjectStyles();
@@ -2558,15 +2224,6 @@ window.wfEditorAttach = function(el, opts) {
   /* ── Input event for text typing → mark dirty ── */
   el.addEventListener('input', markDirty);
 
-  /* ── Click a flattened sketch image → reopen it for editing ── */
-  el.addEventListener('click', function(e) {
-    var img = e.target.closest && e.target.closest('img.wf-sketch-img');
-    if (!img || !img.getAttribute('data-sketch-id')) return;
-    if (!el.isContentEditable) return;       // only reopen while editing
-    e.preventDefault();
-    _wfReopenSketch(img, { _markDirty: markDirty });
-  });
-
   /* ── Blur ── */
   if (opts.onBlur) el.addEventListener('blur', function() { opts.onBlur(el.innerHTML); });
 
@@ -2610,24 +2267,6 @@ window.wfEditorAttach = function(el, opts) {
         focus: function() { el.focus(); },
       });
     },
-    insertSketch: function() {
-      el.focus();
-      var sketchId = _wfNewSketchId();
-      var built = _wfBuildSketchWidget(sketchId, 800, 360);
-      // Insert the widget at the caret, followed by a paragraph so the caret
-      // can escape below the (non-editable) sketch.
-      _wfInsertHtmlAtCaret('<p><br></p>');
-      var sel = window.getSelection();
-      if (sel && sel.rangeCount) {
-        var range = sel.getRangeAt(0);
-        range.insertNode(built.wrap);
-      } else {
-        el.appendChild(built.wrap);
-      }
-      _wfInitSketch(built.domId, sketchId, function(){ markDirty(); });
-      markDirty();
-    },
-    _markDirty: markDirty,
   };
 };
 
@@ -18748,12 +18387,6 @@ function drawAlignedTrace(alignment, spanStart, spanEnd, colW, trackH, viewW, sc
   var peaks = td.peaks;
   var bases = td.bases || '';
   var trimStart = td.trim_start || 0;
-  // qi in the alignment counts from 0 at the start of the aligned region.
-  // The peak index in the original AB1 = trimStart (skip trimmed prefix)
-  //                                    + query_start (skip unaligned prefix of trimmed read)
-  //                                    + qi.
-  var queryStart = alignment.query_start || 0;
-  var qBaseOffset = trimStart + queryStart;
   var refMap = buildRefToQuery(alignment.aligned_ref, alignment.aligned_query, alignment.ref_start);
 
   // Visible column range (with buffer of a few columns for smooth edges)
@@ -18780,7 +18413,7 @@ function drawAlignedTrace(alignment, spanStart, spanEnd, colW, trackH, viewW, sc
   var allMapped = [];
   for (var c = 0; c < colToQi.length; c++) {
     var qi = colToQi[c];
-    var peakIdx = qi + qBaseOffset;
+    var peakIdx = qi + trimStart;
     if (qi >= 0 && peakIdx >= 0 && peakIdx < peaks.length) {
       allMapped.push({ col: c, qi: qi, peakIdx: peakIdx, peak: peaks[peakIdx] });
     }
@@ -24077,7 +23710,11 @@ function _projMgrInjectStyles() {
 
 
 registerView('projects', renderProjects);
-registerNav('projects', { name: 'projects', label: 'Projects', icon: '\ud83c\udfa8', section: '' });
+/* Label deliberately NOT "Projects" — index.html has a hard-coded
+   <div class="nav-section">Projects</div> further down the sidebar for the
+   group filter shortcuts. Using "Project settings" here keeps the two
+   distinct so users don't see "Projects" twice in the sidebar. */
+registerNav('projects', { name: 'projects', label: 'Project settings', icon: '\ud83c\udfa8', section: '' });
 
 window._projMgrToggleEdit = _projMgrToggleEdit;
 window._projMgrSave       = _projMgrSave;

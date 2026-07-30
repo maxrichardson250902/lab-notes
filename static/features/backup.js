@@ -54,6 +54,7 @@ function buildBackupUI(settings, backups) {
     /* ── tabs ── */
     '<div class="bk-tabs">' +
       '<button class="bk-tab bk-tab-active" data-tab="history">History</button>' +
+      '<button class="bk-tab" data-tab="pdfs">PDFs</button>' +
       '<button class="bk-tab" data-tab="schedule">Schedule</button>' +
       '<button class="bk-tab" data-tab="gdrive">Google Drive</button>' +
       '<button class="bk-tab" data-tab="smb">Network Share</button>' +
@@ -62,6 +63,7 @@ function buildBackupUI(settings, backups) {
     /* ── tab panels ── */
     '<div class="bk-panels">' +
       _panelHistory(backups) +
+      _panelPdfs() +
       _panelSchedule(settings) +
       _panelGdrive(settings) +
       _panelSmb(settings) +
@@ -93,6 +95,54 @@ function _statCard(label, value, iconCls, state) {
     '<div class="bk-stat-value">' + esc(value) + '</div>' +
   '</div>';
 }
+
+function _panelPdfs() {
+  return '<div class="bk-panel" id="bk-panel-pdfs">' +
+    '<div class="bk-panel-header" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">' +
+      '<div>' +
+        '<div style="font-weight:600;color:#4a4139">Printable notebook (30-day chunks)</div>' +
+        '<div style="font-size:12px;color:#8a7f72;margin-top:2px">' +
+          'Auto-regenerated on every backup and synced to Drive under <code style="background:#f0ebe3;padding:1px 4px;border-radius:2px">pdfs/</code>. ' +
+          'You can also regenerate manually here.' +
+        '</div>' +
+      '</div>' +
+      '<button class="bk-btn-primary" id="bk-regen-pdfs">↻ Regenerate all PDFs</button>' +
+    '</div>' +
+    '<div id="bk-pdf-status" style="font-size:12px;color:#8a7f72;margin-bottom:8px"></div>' +
+    '<div id="bk-pdf-list"><div class="bk-empty">Click the PDFs tab to load…</div></div>' +
+  '</div>';
+}
+
+
+async function _bkLoadPdfs() {
+  var listEl = document.getElementById('bk-pdf-list');
+  if (!listEl) return;
+  listEl.innerHTML = '<div class="bk-empty">Loading…</div>';
+  try {
+    var d = await api('GET', '/api/backup/pdfs');
+    var pdfs = d.pdfs || [];
+    if (!pdfs.length) {
+      listEl.innerHTML = '<div class="bk-empty">No PDFs yet. Run a backup or click Regenerate to create them.</div>';
+      return;
+    }
+    var rows = '<table class="bk-table"><thead><tr>' +
+      '<th>Filename</th><th>Size</th><th>Generated</th><th></th>' +
+      '</tr></thead><tbody>';
+    pdfs.forEach(function(p) {
+      rows += '<tr>' +
+        '<td class="bk-cell-file"><span class="bk-filename">' + esc(p.filename) + '</span></td>' +
+        '<td class="bk-cell-size">' + _fmtBytes(p.size_bytes) + '</td>' +
+        '<td class="bk-cell-when">' + relTime(p.modified) + '</td>' +
+        '<td class="bk-cell-actions"><a class="bk-act bk-act-dl" href="/api/backup/pdfs/' + encodeURIComponent(p.filename) + '" title="Download" download>↓</a></td>' +
+      '</tr>';
+    });
+    rows += '</tbody></table>';
+    listEl.innerHTML = rows;
+  } catch (e) {
+    listEl.innerHTML = '<div class="bk-empty">Failed to load: ' + esc(e.message || String(e)) + '</div>';
+  }
+}
+
 
 function _panelHistory(backups) {
   var rows = '';
@@ -274,8 +324,36 @@ function attachBackupHandlers(el, settings, backups) {
       tab.classList.add('bk-tab-active');
       var panel = el.querySelector('#bk-panel-' + tab.dataset.tab);
       if (panel) panel.classList.add('bk-panel-active');
+      /* Lazy-load PDF list on first activation — /pdfs stats the whole dir,
+         no point paying that cost until the user opens the tab. */
+      if (tab.dataset.tab === 'pdfs') _bkLoadPdfs();
     });
   });
+
+  /* Regenerate PDFs button — full history walk-back can take a while, so we
+     disable the button + show status while it runs. */
+  var regenBtn = el.querySelector('#bk-regen-pdfs');
+  if (regenBtn) {
+    regenBtn.addEventListener('click', async function() {
+      var statusEl = el.querySelector('#bk-pdf-status');
+      regenBtn.disabled = true;
+      var origLabel = regenBtn.textContent;
+      regenBtn.textContent = 'Generating…';
+      statusEl.textContent = '⏳ Rendering PDFs (this can take a minute for long histories)…';
+      try {
+        var r = await api('POST', '/api/backup/generate-pdfs', {});
+        var msg = '✓ Generated ' + r.count + ' PDF chunk' + (r.count === 1 ? '' : 's');
+        if (r.errors && r.errors.length) msg += ' · ' + r.errors.length + ' error(s): ' + r.errors.join('; ');
+        statusEl.textContent = msg;
+        _bkLoadPdfs();
+      } catch (e) {
+        statusEl.textContent = '✗ ' + (e.message || 'Regeneration failed');
+      } finally {
+        regenBtn.disabled = false;
+        regenBtn.textContent = origLabel;
+      }
+    });
+  }
 
   /* Run modal */
   var runOverlay = el.querySelector('#bk-run-overlay');

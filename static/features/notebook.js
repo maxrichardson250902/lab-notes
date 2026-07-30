@@ -164,146 +164,126 @@ async function renderNotebook(el){
 }
 
 async function renderNotebookBook(el){
-  var data=await api('GET','/api/entries?group='+encodeURIComponent(S.nbBook)+'&limit=500');
-  var entries=data.entries||[];
+  /* Notebook book view — reads from workflow blocks (verbatim), grouped by
+     date. Not an editor; edits happen in the Workflow view. This replaces
+     the previous LLM-summary-based view. Any legacy `entries` rows for this
+     group are still in the DB but not shown here. */
+  /* Reuse the workflow's block styling (data-groups colours, wf-time chips,
+     task-done / protocol accents). No-op if already injected. */
+  if (typeof _wfInjectDocStyles === 'function') _wfInjectDocStyles();
+  /* Also load projects registry + inject per-project colour CSS so pills
+     match Workflow view exactly. */
+  if (typeof _wfLoadKnownProjects === 'function') { try { await _wfLoadKnownProjects(); } catch(e){} }
 
-  var byDate={};
-  entries.forEach(function(e){byDate[e.date]=byDate[e.date]||[];byDate[e.date].push(e);});
-  var dates=Object.keys(byDate).sort().reverse();
-  if(!S.nbPage&&dates.length) S.nbPage=dates[0];
-
-  var html='<div class="nb-layout">';
-
-  // Page list sidebar
-  html+='<div class="nb-page-list">';
-  html+='<div class="nb-page-list-hdr">'+
-    '<button id="nb-back-btn">&#8592;</button>'+
-    '<span class="nb-page-list-title">'+esc(S.nbBook)+'</span>'+
-    '<button class="nb-delete-btn" id="nb-del-book-btn">DELETE</button>'+
-  '</div>';
-
-  dates.forEach(function(date){
-    var dayEntries=byDate[date];
-    var active=S.nbPage===date;
-    var titles=dayEntries.map(function(e){return e.title;}).join(', ');
-    html+='<div class="nb-page-item'+(active?' active':'')+'" data-date="'+esc(date)+'">'+
-      '<div class="nb-page-date">'+esc(date)+'</div>'+
-      '<div class="nb-page-titles">'+esc(titles)+'</div>'+
-      '<div class="nb-page-count">'+dayEntries.length+' entr'+(dayEntries.length===1?'y':'ies')+'</div>'+
-    '</div>';
-  });
-
-  if(!dates.length){
-    html+='<div style="padding:20px 16px;color:var(--muted);font-size:13px;font-style:italic">No entries yet</div>';
+  var group = S.nbBook;
+  var resp;
+  try {
+    resp = await api('GET', '/api/workflow/blocks-by-group?group=' + encodeURIComponent(group));
+  } catch (e) {
+    el.innerHTML = '<div style="padding:20px;color:var(--red)">Failed to load: ' + esc(e.message || String(e)) + '</div>';
+    return;
   }
-  html+='</div>';
+  var days = (resp && resp.days) || [];
+  if (!S.nbPage && days.length) S.nbPage = days[0].date;
 
-  // Editor pane
-  html+='<div class="nb-editor">';
-  if(S.nbPage&&byDate[S.nbPage]){
-    var pageEntries=byDate[S.nbPage];
-    var dt=new Date(S.nbPage+'T00:00:00');
-    html+='<div class="nb-editor-date">'+dt.toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})+'</div>';
-    html+='<div class="nb-editor-weekday">'+dt.toLocaleDateString('en-GB',{weekday:'long'})+' &middot; '+pageEntries.length+' entr'+(pageEntries.length===1?'y':'ies')+'</div>';
+  var html = '<div class="nb-layout">';
 
-    pageEntries.forEach(function(e){
-      html+='<div class="nb-entry" id="nbe-'+e.id+'">'+
-        '<div style="display:flex;gap:8px;align-items:center;margin-bottom:4px;flex-wrap:wrap">'+
-          '<input type="text" id="nt-'+e.id+'" value="'+esc(e.title)+'" style="flex:1;min-width:200px;font-family:var(--serif);font-size:17px;font-weight:600;background:transparent;border:none;border-bottom:1px solid transparent;color:var(--text);padding:2px 0;outline:none" onfocus="this.style.borderBottomColor=\'var(--accent)\'" onblur="this.style.borderBottomColor=\'transparent\'"/>'+
-          '<input type="date" id="nd-'+e.id+'" value="'+esc(e.date)+'" style="background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:11px;padding:4px 6px;border-radius:3px;outline:none;width:130px"/>'+
-        '</div>'+
-        '<div style="display:flex;gap:6px;align-items:center;margin-bottom:12px">'+
-          '<input type="text" id="ng-'+e.id+'" value="'+esc(e.group_name)+'" placeholder="group" style="background:var(--surface2);border:1px solid var(--border);color:var(--accent);font-family:var(--mono);font-size:11px;padding:3px 6px;border-radius:3px;outline:none;width:100px"/>'+
-          '<span style="color:var(--dim)">/</span>'+
-          '<input type="text" id="ns-'+e.id+'" value="'+esc(e.subgroup)+'" placeholder="subgroup" style="background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:11px;padding:3px 6px;border-radius:3px;outline:none;width:100px"/>'+
-          (e.summary?'<span style="font-size:11px;color:var(--dim);font-style:italic;margin-left:auto;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(e.summary)+'</span>':'')+
-        '</div>'+
-        '<div class="nb-field-label">Notes</div>'+
-        '<textarea class="big" id="en-'+e.id+'" placeholder="What was done, observations, details...">'+esc(e.notes)+'</textarea>'+
-        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">'+
-          '<div>'+
-            '<div class="nb-field-label">Results</div>'+
-            '<textarea id="er-'+e.id+'" placeholder="Outcomes, data, measurements...">'+esc(e.results)+'</textarea>'+
-          '</div>'+
-          '<div>'+
-            '<div class="nb-field-label">Yields / Purity</div>'+
-            '<textarea id="ey-'+e.id+'" placeholder="e.g. 2.4 mg/mL, >95% pure...">'+esc(e.yields)+'</textarea>'+
-          '</div>'+
-        '</div>'+
-        '<div class="nb-field-label">Issues / Troubleshooting</div>'+
-        '<textarea id="ei-'+e.id+'" placeholder="What went wrong? What to try next...">'+esc(e.issues)+'</textarea>'+
-        '<div class="nb-field-label">Images</div>'+
-        '<div id="nb-imgs-'+e.id+'" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px"></div>'+
-        '<div style="margin-bottom:8px">'+
-          '<label class="btn" style="cursor:pointer;display:inline-block">'+
-            '+ Add image <input type="file" accept="image/*" style="display:none" data-entry="'+e.id+'" id="nb-img-inp-'+e.id+'"/>'+
-          '</label>'+
-        '</div>'+
-        '<div id="nb-gels-'+e.id+'" style="margin-bottom:8px"></div>'+
-        '<div class="nb-entry-actions">'+
-          '<button class="btn primary" onclick="saveEntryFull('+e.id+')">Save all</button>'+
-          '<button class="btn" onclick="summariseEntry('+e.id+')">&#128161; Summarise</button>'+
-          '<button class="btn" onclick="deleteEntry('+e.id+')" style="color:var(--red);margin-left:auto">Delete entry</button>'+
-        '</div>'+
+  /* ── Sidebar: dates with block counts ──────────────────────────── */
+  html += '<div class="nb-page-list">';
+  html += '<div class="nb-page-list-hdr">' +
+    '<button id="nb-back-btn" title="Back to projects">&#8592;</button>' +
+    '<span class="nb-page-list-title">' + esc(group) + '</span>' +
+    '<button class="nb-delete-btn" id="nb-del-book-btn" title="Delete legacy entries (workflow blocks unaffected)">DELETE</button>' +
+  '</div>';
+  if (!days.length) {
+    html += '<div style="padding:20px 16px;color:var(--muted);font-size:13px;font-style:italic">No blocks tagged with this project yet.<br><br>Tag blocks in Workflow view by setting the active project, or click Groups on a specific block.</div>';
+  } else {
+    days.forEach(function(d) {
+      var active = (S.nbPage === d.date);
+      var count = d.blocks.length;
+      var preview = _nbBlockPreview(d.blocks[0]) || '';
+      html += '<div class="nb-page-item' + (active ? ' active' : '') + '" data-date="' + esc(d.date) + '">' +
+        '<div class="nb-page-date">' + esc(d.date) + '</div>' +
+        '<div class="nb-page-titles">' + esc(preview.slice(0, 80)) + '</div>' +
+        '<div class="nb-page-count">' + count + ' block' + (count === 1 ? '' : 's') + '</div>' +
       '</div>';
     });
-  } else {
-    html+='<div class="nb-empty-page">Select a day from the page list, or create a new entry.</div>';
   }
-  html+='</div>';
-  html+='</div>';
+  html += '</div>';
 
-  el.innerHTML=html;
+  /* ── Main pane: selected day's blocks ───────────────────────────── */
+  html += '<div class="nb-editor">';
+  var selectedDay = days.find(function(d) { return d.date === S.nbPage; });
+  if (selectedDay) {
+    var dt = new Date(selectedDay.date + 'T00:00:00');
+    html += '<div class="nb-editor-date">' + dt.toLocaleDateString('en-GB', {day:'numeric', month:'long', year:'numeric'}) + '</div>';
+    html += '<div class="nb-editor-weekday">' +
+      dt.toLocaleDateString('en-GB', {weekday:'long'}) + ' &middot; ' +
+      selectedDay.blocks.length + ' block' + (selectedDay.blocks.length === 1 ? '' : 's') + ' tagged with ' + esc(group) +
+      ' &middot; <a href="#" class="nb-jump-workflow" data-date="' + esc(selectedDay.date) + '">edit in workflow &rarr;</a>' +
+    '</div>';
+    html += '<div class="nb-blocks wf-read-day-body">';
+    selectedDay.blocks.forEach(function(b) {
+      html += '<div class="nb-block-wrap">' + b + '</div>';
+    });
+    html += '</div>';
+  } else if (days.length) {
+    html += '<div class="nb-empty-page">Select a day from the sidebar.</div>';
+  } else {
+    html += '<div class="nb-empty-page">No tagged content yet for this project.</div>';
+  }
+  html += '</div>';
+  html += '</div>';
 
-  // Bind page list clicks and header buttons
-  setTimeout(function(){
-    var backBtn=document.getElementById('nb-back-btn');
-    if(backBtn) backBtn.addEventListener('click',function(){
-      S.nbBook=null;S.nbPage=null;S.filterGroup='';
-      document.getElementById('page-title').textContent='Notebook';
+  el.innerHTML = html;
+
+  /* ── Wiring ─────────────────────────────────────────────────────── */
+  setTimeout(function() {
+    var backBtn = document.getElementById('nb-back-btn');
+    if (backBtn) backBtn.addEventListener('click', function() {
+      S.nbBook = null; S.nbPage = null; S.filterGroup = '';
+      document.getElementById('page-title').textContent = 'Notebook';
       loadView();
     });
-    var delBtn=document.getElementById('nb-del-book-btn');
-    if(delBtn) delBtn.addEventListener('click',function(){
-      var bookName=S.nbBook;
-      if(!confirm('Delete the entire "'+bookName+'" book?\nThis will remove ALL entries in this project.'))return;
-      if(!confirm('Are you sure? This cannot be undone.\n\nType confirms deletion of all entries in "'+bookName+'".'))return;
-      api('DELETE','/api/entries/group/'+encodeURIComponent(bookName)).then(function(r){
-        toast('Deleted "'+bookName+'" — '+r.count+' entries removed');
-        S.nbBook=null;S.nbPage=null;S.filterGroup='';
-        document.getElementById('page-title').textContent='Notebook';
-        load();
-      }).catch(function(e){toast('Failed: '+e.message,true);});
+
+    var delBtn = document.getElementById('nb-del-book-btn');
+    if (delBtn) delBtn.addEventListener('click', function() {
+      /* This only removes LEGACY `entries` rows for this group (Process Day
+         output). Workflow blocks are NOT touched — deletion of those happens
+         in the workflow editor. */
+      if (!confirm('Delete legacy LLM-summary entries for "' + group + '"?\n\nThis does NOT touch your workflow notes (which are the current source of truth). It only removes leftover entries from Process Day runs.')) return;
+      api('DELETE', '/api/entries/group/' + encodeURIComponent(group)).then(function(r) {
+        toast('Deleted ' + r.count + ' legacy entries. Workflow blocks unaffected.');
+      }).catch(function(e) { toast('Failed: ' + e.message, true); });
     });
-    el.querySelectorAll('.nb-page-item').forEach(function(item){
-      item.addEventListener('click',function(){
-        S.nbPage=this.dataset.date;
+
+    el.querySelectorAll('.nb-page-item').forEach(function(item) {
+      item.addEventListener('click', function() {
+        S.nbPage = this.dataset.date;
         renderNotebookBook(el);
       });
     });
-    // Load images for visible entries
-    if(S.nbPage&&byDate[S.nbPage]){
-      byDate[S.nbPage].forEach(function(e){
-        loadEntryImages(e.id);
-        if(typeof gelRenderLinkedGels==='function') gelRenderLinkedGels('nb-gels-'+e.id,e.id);
-        var inp=document.getElementById('nb-img-inp-'+e.id);
-        if(inp) inp.addEventListener('change',function(ev){
-          if(ev.target.files[0]) uploadEntryImage(e.id,ev.target.files[0]);
-        });
+
+    /* Deep-link into workflow for editing */
+    el.querySelectorAll('.nb-jump-workflow').forEach(function(a) {
+      a.addEventListener('click', function(e) {
+        e.preventDefault();
+        var date = this.dataset.date;
+        if (typeof _workflowDate !== 'undefined') _workflowDate = date;
+        if (typeof setView === 'function') setView('workflow');
       });
-    }
-    /* Search-nav scroll target: clear and act on it after render. */
-    if (S._nbScrollToEntry) {
-      var target = document.getElementById('nbe-' + S._nbScrollToEntry);
-      if (target) {
-        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        target.style.transition = 'box-shadow 1.2s';
-        target.style.boxShadow = '0 0 0 3px #5b7a5e';
-        setTimeout(function() { target.style.boxShadow = 'none'; }, 1800);
-      }
-      S._nbScrollToEntry = null;
-    }
-  },0);
+    });
+  }, 0);
+}
+
+
+function _nbBlockPreview(blockHtml) {
+  /* Yank plain text out of a block for the sidebar preview. Naive strip-tags;
+     good enough for a 1-line preview. */
+  if (!blockHtml) return '';
+  var tmp = document.createElement('div');
+  tmp.innerHTML = blockHtml;
+  return (tmp.textContent || '').trim().replace(/\s+/g, ' ');
 }
 
 async function loadEntryImages(entryId){

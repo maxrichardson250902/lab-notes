@@ -513,7 +513,7 @@ function _cdRenderSaveModal() {
   if (targetKey === 'parts') {
     extraFields = '<div style="display:flex;gap:8px;margin-bottom:8px">'
       + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Project</label>'
-      + '<input id="cd-save-project" type="text" value="' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
+      + '<input id="cd-save-project" list="global-projects" type="text" value="' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
       + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Subcategory</label>'
       + '<input id="cd-save-subcategory" type="text" value="" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
       + '</div>'
@@ -533,7 +533,7 @@ function _cdRenderSaveModal() {
   } else if (targetKey === 'gblocks') {
     extraFields = '<div style="display:flex;gap:8px;margin-bottom:8px">'
       + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Project</label>'
-      + '<input id="cd-save-project" type="text" value="' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
+      + '<input id="cd-save-project" list="global-projects" type="text" value="' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
       + '<div style="flex:1"><label style="font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;color:#8a7f72">Use</label>'
       + '<input id="cd-save-use" type="text" value="Circuit design: ' + esc(_cd.name) + '" style="width:100%;padding:4px 8px;border:1px solid #d5cec0;border-radius:4px;background:#f0ebe3;font-size:.85rem;color:#4a4139;box-sizing:border-box;margin-top:2px" /></div>'
       + '</div>'
