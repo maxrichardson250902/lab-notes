@@ -1,19 +1,13 @@
-"""Protocols feature - protocol library with LLM extraction, manual entry, recipe tables, and run history."""
+"""Protocols feature - protocol library with manual entry, Claude round-trip import,
+recipe tables, and run history."""
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
-import json, re, io, asyncio
-
-# Only one LLM extraction at a time to prevent OOM from concurrent SSH+LLM calls
-_llm_semaphore = asyncio.Semaphore(1)
-
-# Track protocols currently being extracted in background
-_extracting: dict[int, str] = {}   # pid -> stage description
+import json, re, io
 
 from core.database import register_table, register_seed, ensure_column, get_db
-from core.llm import fetch_url_text
-from core.ssh import ensure_pc_online, start_llm, call_llm_3090, enrich_log, elog, detected_os, active_backend
+from core.llm import fetch_url_text  # HTTP scrape helper, not an LLM call
 
 register_table("protocols", """CREATE TABLE IF NOT EXISTS protocols (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,76 +68,45 @@ def _migrate():
 _migrate()
 
 # --------------------------------------------------------------------------- #
-#  LLM helpers
+#  Claude round-trip helpers
+#
+#  Flow: user hits "Copy Claude prompt" on a protocol → clipboard gets the
+#  template + source_text below. User pastes into Claude chat, Claude returns
+#  a delimited block. User pastes that back via "Import from Claude", which
+#  parses steps + recipe tables + notes and updates the protocol.
 # --------------------------------------------------------------------------- #
-_EXTRACT_SYSTEM = (
-    "You are a lab notebook assistant. Extract the procedural steps from the protocol below. "
-    "Return a JSON array of objects, each with a single key 'text'. "
-    "Rules: "
-    "- Include every action step with volumes, temperatures, times, and speeds. "
-    "- Skip steps that only list ingredients or describe how to make a buffer/solution - those are captured separately. "
-    "- Be concise but complete - preserve all numerical values. "
-    "- Return ONLY the JSON array, no markdown fences, no commentary. "
-    'Example: [{"text":"Add 1 uL template DNA to PCR tube"},{"text":"Thermocycle: 98C 30s, 35x(98C 10s/60C 30s/72C 20s/kb), 72C 2min"}]'
-)
 
-# Pass 1: enumerate all tables in the document
-_ENUMERATE_TABLES_SYSTEM = (
-    "You are a lab notebook assistant. Read this protocol and list every distinct reaction mixture, "
-    "buffer, solution, or reagent setup it describes. "
-    "Return ONLY a JSON array of short descriptive names, one per table. "
-    'Example: ["50x TAE buffer", "PCR master mix", "SDS-PAGE running buffer", "Western transfer buffer"] '
-    "If there are no component lists at all, return []. "
-    "JSON array only, no markdown."
-)
+CLAUDE_PROMPT_TEMPLATE = """You are formatting a lab protocol for import into a lab notebook system.
+Read the source protocol below and output ONLY the formatted block, using
+these exact delimiters:
 
-# Pass 2: extract one specific named table
-_EXTRACT_ONE_TABLE_SYSTEM = (
-    "You are a lab notebook assistant. Extract the complete component list for the table named below from this protocol. "
-    "Return a JSON object with: "
-    "  'columns': array of column header strings (use relevant subset of: Component, Stock conc., Volume (uL), Final conc., Weight, Notes) "
-    "  'rows': array of arrays, one per component, matching the columns order. "
-    "Include every component, reagent, and chemical mentioned for this specific table. "
-    "Then output /// on its own line to signal completion. "
-    "Output the JSON object first, then ///, nothing else."
-)
+=== STEPS ===
+Numbered list, one step per line. Keep steps atomic and imperative.
 
-# ── Reparse tables from source text ──────────────────────────────────────────
-_REPARSE_TABLES_SYSTEM = (
-    "You are a lab notebook assistant. The user has a protocol with messy or incorrect reagent tables. "
-    "Given the original source text and the current (possibly broken) tables, produce corrected tables. "
-    "Return a JSON array of table objects. Each has: "
-    "  'name': descriptive table name, "
-    "  'columns': array of column headers, "
-    "  'rows': array of arrays matching column order. "
-    "Fix: misaligned data, wrong columns, missing components, inconsistent units, duplicate rows. "
-    "Preserve all original data — only restructure and correct, don't remove real components. "
-    "Return ONLY the JSON array, no markdown fences."
-)
+=== RECIPES ===
+For each table in the protocol (master mix, thermocycler program, buffer,
+gel loading, etc.), output a level-2 markdown header with the table name
+followed by a standard markdown table. Example:
 
-# ── Protocol review — suggest improvements ───────────────────────────────────
-_REVIEW_SYSTEM = (
-    "You are an expert lab protocol reviewer. Analyse the protocol below and suggest improvements. "
-    "For each suggestion, return a JSON object in an array. Each object has: "
-    "  'type': 'step' | 'table' | 'general', "
-    "  'index': step number (0-based) or table index, or null for general, "
-    "  'field': which part to change — 'text', 'note', 'cell', or 'new_step', "
-    "  'original': the current text (empty string for new additions), "
-    "  'suggested': the improved text, "
-    "  'reason': 1-sentence explanation of why this change helps. "
-    "Focus on: "
-    "- Missing temperatures, times, volumes, or speeds "
-    "- Ambiguous instructions that could cause errors "
-    "- Missing centrifugation speeds or incubation conditions "
-    "- Steps that should be split for clarity "
-    "- Common best practices for this type of protocol "
-    "- Table errors: wrong units, missing reagents, impossible concentrations "
-    "Return 3-10 suggestions, ordered by importance. "
-    "Return ONLY the JSON array, no markdown fences, no commentary."
-)
+## Master Mix
+| Component | Stock conc. | Volume (uL) | Final conc. |
+|-----------|-------------|-------------|-------------|
+| Buffer    | 10x         | 2           | 1x          |
+
+=== NOTES ===
+Any warnings, tips, or context worth preserving. Free text.
+
+Rules:
+- Do not invent volumes, concentrations, temperatures, or times not present
+  in the source. If a value is missing, leave the cell blank or write "?".
+- Do not add commentary before or after the delimited block.
+- If a section has no content, still include the delimiter with nothing under it.
+
+--- SOURCE PROTOCOL ---
+"""
 
 def _clean_source_text(text: str, truncate: int = 0) -> str:
-    """Strip HTML/entities. Pass truncate>0 to limit length for LLM calls."""
+    """Strip HTML/entities. Pass truncate>0 to limit length."""
     if not text:
         return ""
     text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL)
@@ -154,170 +117,107 @@ def _clean_source_text(text: str, truncate: int = 0) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text[:truncate] if truncate else text
 
-def _parse_steps_raw(raw: str) -> str:
-    cleaned = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-    cleaned = re.sub(r"\n?```$", "", cleaned.strip())
-    try:
-        steps = json.loads(cleaned)
-        if isinstance(steps, list):
-            parsed = [{"text": str(s["text"])} for s in steps if "text" in s and str(s["text"]).strip()]
-            if parsed:
-                return json.dumps(parsed)
-    except Exception:
-        pass
+
+def _split_claude_sections(formatted: str) -> dict:
+    """Split a Claude-formatted import block on === DELIMITER === markers.
+    Returns dict with keys 'STEPS', 'RECIPES', 'NOTES' (missing sections → '')."""
+    # Match "=== NAME ===" at the start of a line
+    parts = re.split(r'(?m)^===\s*([A-Z]+)\s*===\s*$', formatted)
+    # re.split with a capturing group produces: [pre, name1, body1, name2, body2, ...]
+    out = {"STEPS": "", "RECIPES": "", "NOTES": ""}
+    for i in range(1, len(parts) - 1, 2):
+        name = parts[i].strip().upper()
+        body = parts[i + 1].strip()
+        if name in out:
+            out[name] = body
+    return out
+
+
+def _parse_steps_block(block: str) -> str:
+    """Turn a numbered/bulleted list of steps into the JSON shape stored in
+    the `steps` column: [{"text": "..."}]."""
     steps = []
-    for line in raw.splitlines():
-        line = re.sub(r"^\d+[\.\)]\s*", "", line.strip())
-        if line and len(line) > 4:
+    for raw in block.splitlines():
+        line = raw.strip()
+        # Strip leading "1.", "1)", "- ", "* ", etc.
+        line = re.sub(r'^(?:\d+[\.\)]|[-*•])\s*', '', line)
+        if line and len(line) > 2:
             steps.append({"text": line})
-    return json.dumps(steps) if steps else json.dumps([])
-
-def _parse_recipe_raw(raw: str):
-    if "///" in raw:
-        raw = raw[:raw.index("///")]
-    cleaned = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-    cleaned = re.sub(r"\n?```$", "", cleaned.strip())
-    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if m:
-        cleaned = m.group()
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, dict) and "columns" in data and "rows" in data:
-            cols = [str(c) for c in data["columns"] if str(c).strip()]
-            rows = []
-            for row in data["rows"]:
-                if isinstance(row, list):
-                    rows.append([str(c) for c in row])
-            if cols:
-                return json.dumps({"columns": cols, "rows": rows})
-    except Exception:
-        pass
-    return None
-
-async def _ensure_3090_ready() -> bool:
-    """Wake the 3090 and start the LLM once. Subsequent calls are near-instant."""
-    loop = asyncio.get_event_loop()
-    def _init():
-        try:
-            elog("Protocol extraction: checking 3090...")
-            if not ensure_pc_online():
-                elog("Protocol extraction: 3090 failed to come online")
-                return False
-            if not start_llm():
-                elog("Protocol extraction: LLM failed to start")
-                return False
-            elog("Protocol extraction: 3090 ready")
-            return True
-        except Exception as e:
-            elog(f"Protocol extraction: init error — {e}")
-            return False
-    return await loop.run_in_executor(None, _init)
-
-async def _call_3090(system: str, prompt: str, max_tokens: int) -> str:
-    """Run a single LLM call on the 3090. Assumes _ensure_3090_ready() was called."""
-    loop = asyncio.get_event_loop()
-    def _call():
-        try:
-            return call_llm_3090(system, prompt, max_tokens=max_tokens) or ""
-        except Exception as e:
-            elog(f"LLM call failed: {e}")
-            return ""
-    async with _llm_semaphore:
-        return await loop.run_in_executor(None, _call)
-
-async def extract_steps(title: str, source_text: str) -> str:
-    clean_text = _clean_source_text(source_text, truncate=5000)
-    prompt = "Protocol: " + title + "\n\nText:\n" + clean_text
-    elog("Extracting steps...")
-    raw = await _call_3090(_EXTRACT_SYSTEM, prompt, max_tokens=2000)
-    if raw:
-        result = _parse_steps_raw(raw)
-        if result != "[]":
-            elog("Steps extracted OK")
-            return result
-    elog("Step extraction returned empty")
-    return json.dumps([])
+    return json.dumps(steps)
 
 
-async def extract_recipe(title: str, source_text: str) -> str:
-    clean_text = _clean_source_text(source_text)
-    # ── Pass 1: enumerate table names ────────────────────────────────────────
-    elog("Enumerating recipe tables...")
-    enum_prompt = "Protocol: " + title + "\n\nText:\n" + clean_text
-    raw_names = await _call_3090(_ENUMERATE_TABLES_SYSTEM, enum_prompt, max_tokens=400)
+def _parse_markdown_table(lines: list) -> Optional[dict]:
+    """Parse a markdown pipe-table into {columns, rows}. Returns None if the
+    lines don't look like a valid table."""
+    # Keep only lines that contain a pipe — Claude sometimes leaves blank
+    # lines between the table and surrounding text
+    rows = [l.strip() for l in lines if '|' in l]
+    if len(rows) < 2:
+        return None
 
-    # parse the table name list
-    table_names = []
-    try:
-        cleaned = re.sub(r"^```[a-z]*\n?", "", raw_names.strip())
-        cleaned = re.sub(r"\n?```$", "", cleaned.strip())
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, list):
-            table_names = [str(n).strip() for n in parsed if str(n).strip()]
-    except Exception:
-        pass
+    def split_row(r):
+        # Strip leading/trailing pipes then split
+        r = r.strip()
+        if r.startswith('|'):
+            r = r[1:]
+        if r.endswith('|'):
+            r = r[:-1]
+        return [c.strip() for c in r.split('|')]
 
-    if not table_names:
-        # fallback: single-table extraction
-        elog("No named tables found, trying single-table extraction...")
-        single_prompt = "Protocol: " + title + "\n\nText:\n" + clean_text
-        raw = await _call_3090(
-            "Extract the reaction/reagent table as JSON {columns:[...], rows:[[...],...]} then ///.",
-            single_prompt, max_tokens=600)
-        result = _parse_recipe_raw(raw)
-        return result if result else json.dumps(DEFAULT_RECIPE)
+    header = split_row(rows[0])
+    # rows[1] is usually the |---|---| separator; skip any row that's just
+    # dashes/colons/pipes/whitespace
+    body_rows = []
+    for r in rows[1:]:
+        if re.fullmatch(r'[\s\-:|]+', r):
+            continue
+        cells = split_row(r)
+        # Pad short rows, trim long ones, so every row matches header width
+        if len(cells) < len(header):
+            cells += [''] * (len(header) - len(cells))
+        elif len(cells) > len(header):
+            cells = cells[:len(header)]
+        body_rows.append(cells)
 
-    # ── Pass 2: extract each table individually ───────────────────────────────
-    elog(f"Found {len(table_names)} table(s), extracting each...")
+    if not header:
+        return None
+    return {"columns": header, "rows": body_rows}
+
+
+def _parse_recipes_block(block: str) -> Optional[str]:
+    """Turn a RECIPES block (multiple '## Name' sections each with a markdown
+    table) into the JSON stored in the `recipe` column.
+
+    Returns single-table shape {name, columns, rows} if only one table,
+    array [{name, columns, rows}, ...] if multiple, or None if empty."""
+    if not block.strip():
+        return None
+
+    # Split on level-2 headers. Anything before the first '## ' is discarded.
+    chunks = re.split(r'(?m)^##\s+(.+?)\s*$', block)
+    # chunks = [preamble, name1, body1, name2, body2, ...]
     tables = []
-    for i, name in enumerate(table_names[:10]):
-        elog(f"Extracting table {i+1}/{min(len(table_names), 10)}: {name}")
-        tbl_prompt = (
-            "Table to extract: " + name + "\n\n"
-            "Protocol: " + title + "\n\nText:\n" + clean_text
-        )
-        raw = await _call_3090(_EXTRACT_ONE_TABLE_SYSTEM, tbl_prompt, max_tokens=1200)
-        result = _parse_recipe_raw(raw)
-        if result:
-            try:
-                tbl = json.loads(result)
-                if tbl.get("rows"):  # only include tables with actual data
-                    tbl["name"] = name
-                    tables.append(tbl)
-            except Exception:
-                pass
+    for i in range(1, len(chunks) - 1, 2):
+        name = chunks[i].strip()
+        body_lines = chunks[i + 1].splitlines()
+        parsed = _parse_markdown_table(body_lines)
+        if parsed and parsed["columns"]:
+            parsed["name"] = name or "Recipe"
+            tables.append(parsed)
+
+    # Fallback: no '## Name' headers, but there might still be a bare markdown
+    # table (Claude occasionally omits the header for single-table protocols)
+    if not tables:
+        parsed = _parse_markdown_table(block.splitlines())
+        if parsed and parsed["columns"]:
+            parsed["name"] = "Recipe"
+            tables.append(parsed)
 
     if not tables:
-        return json.dumps(DEFAULT_RECIPE)
+        return None
     if len(tables) == 1:
-        return json.dumps(tables[0])  # single table — store without array wrapper
-    return json.dumps(tables)  # multi-table array
-
-async def _bg_extract(pid: int, title: str, source_text: str):
-    """Background extraction — saves steps + recipe into the DB when done."""
-    _extracting[pid] = "waking"
-    try:
-        if not await _ensure_3090_ready():
-            elog(f"Background extraction failed for #{pid}: 3090 unavailable")
-            _extracting[pid] = "failed"
-            return
-        _extracting[pid] = "steps"
-        steps = await extract_steps(title, source_text)
-        _extracting[pid] = "tables"
-        recipe = await extract_recipe(title, source_text)
-        with get_db() as conn:
-            conn.execute("UPDATE protocols SET steps=?, recipe=?, updated=? WHERE id=?",
-                         (steps, recipe, datetime.utcnow().isoformat(), pid))
-            conn.commit()
-        elog(f"Background extraction complete for #{pid}")
-        _extracting[pid] = "done"
-    except Exception as e:
-        elog(f"Background extraction error for #{pid}: {e}")
-        _extracting[pid] = "failed"
-    finally:
-        # Clear status after a few seconds so the frontend can read the final state
-        await asyncio.sleep(5)
-        _extracting.pop(pid, None)
+        return json.dumps(tables[0])
+    return json.dumps(tables)
 
 async def _text_from_upload(file: UploadFile) -> str:
     content = await file.read()
@@ -692,8 +592,6 @@ async def create_from_url(body: CreateProtocol):
             (body.title, "url", body.url, source_text, None, json.dumps(DEFAULT_RECIPE), body.notes, json.dumps(body.tags), body.auto_complete, now, now))
         conn.commit()
         proto = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
-    if source_text:
-        asyncio.create_task(_bg_extract(proto["id"], body.title, source_text))
     return proto
 
 @router.post("/protocols/from-paste")
@@ -705,7 +603,6 @@ async def create_from_paste(body: PasteProtocol):
             (body.title, "paste", None, body.text[:50000], None, json.dumps(DEFAULT_RECIPE), body.notes, json.dumps(body.tags), body.auto_complete, now, now))
         conn.commit()
         proto = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
-    asyncio.create_task(_bg_extract(proto["id"], body.title, body.text))
     return proto
 
 @router.post("/protocols/from-file")
@@ -724,7 +621,6 @@ async def create_from_file(
             (title, "file", None, source_text[:50000], None, json.dumps(DEFAULT_RECIPE), notes, tags, auto_complete, now, now))
         conn.commit()
         proto = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
-    asyncio.create_task(_bg_extract(proto["id"], title, source_text))
     return proto
 
 @router.post("/protocols/from-manual")
@@ -766,143 +662,79 @@ def delete_protocol(protocol_id: int):
         conn.commit()
     return {"deleted": protocol_id}
 
-@router.post("/protocols/{protocol_id}/re-extract")
-async def re_extract_steps(protocol_id: int):
+@router.get("/protocols/{protocol_id}/claude-prompt")
+def claude_prompt(protocol_id: int):
+    """Return a ready-to-paste prompt for Claude chat. Frontend clipboards it."""
     with get_db() as conn:
         row = conn.execute("SELECT * FROM protocols WHERE id=?", (protocol_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Not found")
     p = dict(row)
-    source = p.get("source_text") or ""
+    source = _clean_source_text(p.get("source_text") or "")
     if not source:
-        try:
-            existing = json.loads(p.get("steps") or "[]")
-            if existing:
-                source = " ".join(s.get("text","") for s in existing if s.get("text"))
-        except Exception:
-            pass
-    if not source:
-        raise HTTPException(400, "No source text stored - re-import the protocol")
-    asyncio.create_task(_bg_extract(protocol_id, p["title"], source))
-    return {"status": "extracting", "protocol_id": protocol_id}
+        raise HTTPException(400, "No source text stored for this protocol")
+    return {"prompt": CLAUDE_PROMPT_TEMPLATE + source}
 
-@router.post("/protocols/{protocol_id}/reparse-tables")
-async def reparse_tables(protocol_id: int):
-    """Re-send source text to the LLM to regenerate cleaner tables."""
+
+class ImportFromClaude(BaseModel):
+    formatted: str
+
+
+@router.post("/protocols/{protocol_id}/import-from-claude")
+def import_from_claude(protocol_id: int, body: ImportFromClaude):
+    """Parse a Claude-formatted delimited block and overwrite steps + recipe;
+    append the NOTES section to existing notes (separator preserves prior notes).
+    Returns the updated protocol row."""
     with get_db() as conn:
         row = conn.execute("SELECT * FROM protocols WHERE id=?", (protocol_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Not found")
     p = dict(row)
-    source = p.get("source_text") or ""
-    current_tables = p.get("recipe") or ""
-    if not source and not current_tables:
-        raise HTTPException(400, "No source text or tables to reparse")
-    if not await _ensure_3090_ready():
-        raise HTTPException(503, "3090 is unavailable")
 
-    prompt = "Protocol: " + p["title"] + "\n\n"
-    if current_tables:
-        prompt += "Current tables (may have errors):\n" + current_tables + "\n\n"
-    if source:
-        prompt += "Original source text:\n" + _clean_source_text(source, truncate=5000)
+    sections = _split_claude_sections(body.formatted)
+    if not any(sections.values()):
+        raise HTTPException(400,
+            "Could not find any === STEPS ===, === RECIPES ===, or === NOTES === "
+            "delimiters in the pasted text")
 
-    elog(f"Reparsing tables for #{protocol_id}...")
-    raw = await _call_3090(_REPARSE_TABLES_SYSTEM, prompt, max_tokens=2000)
-    if not raw:
-        raise HTTPException(500, "LLM returned empty response")
+    steps_json = _parse_steps_block(sections["STEPS"]) if sections["STEPS"] else None
+    recipe_json = _parse_recipes_block(sections["RECIPES"]) if sections["RECIPES"] else None
 
-    # Try to parse as array of tables
-    cleaned = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-    cleaned = re.sub(r"\n?```$", "", cleaned.strip())
-    try:
-        tables = json.loads(cleaned)
-        if isinstance(tables, list) and len(tables) and isinstance(tables[0], dict):
-            # validate structure
-            valid = []
-            for t in tables:
-                if "columns" in t and "rows" in t:
-                    valid.append({
-                        "name": t.get("name", "Recipe"),
-                        "columns": [str(c) for c in t["columns"]],
-                        "rows": [[str(c) for c in row] for row in t["rows"] if isinstance(row, list)]
-                    })
-            if valid:
-                recipe_json = json.dumps(valid[0]) if len(valid) == 1 else json.dumps(valid)
-                elog(f"Reparsed {len(valid)} table(s) for #{protocol_id}")
-                return {"recipe": recipe_json, "tables_count": len(valid)}
-    except Exception:
-        pass
-    # fallback: try single table parse
-    result = _parse_recipe_raw(raw)
-    if result:
-        return {"recipe": result, "tables_count": 1}
-    raise HTTPException(500, "Could not parse LLM response into valid tables")
+    # Notes: append with a separator so any manual context already there survives.
+    new_notes = p.get("notes") or ""
+    if sections["NOTES"]:
+        addition = sections["NOTES"].strip()
+        if new_notes.strip():
+            new_notes = new_notes.rstrip() + "\n\n---\n\n" + addition
+        else:
+            new_notes = addition
 
-@router.post("/protocols/{protocol_id}/review")
-async def review_protocol(protocol_id: int):
-    """Send the protocol to the LLM for quality review and improvement suggestions."""
+    now = datetime.utcnow().isoformat()
+    final_steps  = steps_json  if steps_json  is not None else p.get("steps")
+    final_recipe = recipe_json if recipe_json is not None else p.get("recipe")
+
     with get_db() as conn:
-        row = conn.execute("SELECT * FROM protocols WHERE id=?", (protocol_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Not found")
-    p = dict(row)
-    if not await _ensure_3090_ready():
-        raise HTTPException(503, "3090 is unavailable")
+        conn.execute(
+            "UPDATE protocols SET steps=?, recipe=?, notes=?, updated=? WHERE id=?",
+            (final_steps, final_recipe, new_notes, now, protocol_id))
+        conn.commit()
+        updated = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (protocol_id,)).fetchone())
 
-    # Build a comprehensive prompt with steps + tables
-    prompt = "Protocol: " + p["title"] + "\n\n"
-    steps_data = []
+    # Report what got parsed so the UI can toast a summary
     try:
-        steps_data = json.loads(p.get("steps") or "[]")
+        step_count = len(json.loads(final_steps or "[]"))
     except Exception:
-        pass
-    if steps_data:
-        prompt += "Steps:\n"
-        for i, s in enumerate(steps_data):
-            text = s.get("text", "") if isinstance(s, dict) else str(s)
-            note = s.get("note", "") if isinstance(s, dict) else ""
-            prompt += f"  {i+1}. {text}"
-            if note:
-                prompt += f" [Note: {note}]"
-            prompt += "\n"
-    recipe = p.get("recipe") or ""
-    if recipe and recipe != json.dumps(DEFAULT_RECIPE):
-        prompt += "\nReaction tables:\n" + recipe + "\n"
-    source = p.get("source_text") or ""
-    if source:
-        prompt += "\nOriginal source (for reference):\n" + _clean_source_text(source, truncate=3000)
-
-    elog(f"Reviewing protocol #{protocol_id}...")
-    raw = await _call_3090(_REVIEW_SYSTEM, prompt, max_tokens=2000)
-    if not raw:
-        raise HTTPException(500, "LLM returned empty response")
-
-    # Parse suggestions
-    cleaned = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-    cleaned = re.sub(r"\n?```$", "", cleaned.strip())
+        step_count = 0
     try:
-        suggestions = json.loads(cleaned)
-        if isinstance(suggestions, list):
-            # validate each suggestion
-            valid = []
-            for s in suggestions:
-                if isinstance(s, dict) and "suggested" in s:
-                    valid.append({
-                        "type": s.get("type", "general"),
-                        "index": s.get("index"),
-                        "field": s.get("field", "text"),
-                        "original": s.get("original", ""),
-                        "suggested": s.get("suggested", ""),
-                        "reason": s.get("reason", ""),
-                    })
-            elog(f"Review complete: {len(valid)} suggestion(s)")
-            return {"suggestions": valid}
+        r = json.loads(final_recipe) if final_recipe else None
+        table_count = len(r) if isinstance(r, list) else (1 if isinstance(r, dict) and r.get("columns") else 0)
     except Exception:
-        pass
-    # fallback: return raw text as a single general suggestion
-    return {"suggestions": [{"type": "general", "index": None, "field": "text",
-                             "original": "", "suggested": raw.strip(), "reason": "LLM review output"}]}
+        table_count = 0
+
+    return {"protocol": updated, "steps_parsed": step_count,
+            "tables_parsed": table_count,
+            "notes_appended": bool(sections["NOTES"].strip())}
+
 
 @router.post("/protocols/{protocol_id}/clone")
 def clone_protocol(protocol_id: int):
@@ -964,18 +796,3 @@ def check_run_expiry():
         if completed:
             conn.commit()
     return {"completed": completed, "checked": len(runs) if 'runs' in dir() else 0}
-
-@router.get("/protocols/{protocol_id}/extraction-status")
-def extraction_status(protocol_id: int):
-    stage = _extracting.get(protocol_id)
-    return {"extracting": stage is not None, "stage": stage}
-
-@router.get("/3090/status")
-def get_3090_status():
-    """Return current 3090 backend state and recent log entries for progress polling."""
-    return {
-        "backend": active_backend,
-        "os": detected_os,
-        "log": enrich_log[-15:],
-        "extracting": dict(_extracting),
-    }

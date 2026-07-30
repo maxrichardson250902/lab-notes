@@ -123,7 +123,6 @@
     '.proto-edit-step.drag-over{border-top:2px solid #5b7a5e}',
     '.proto-edit-step .drag-handle{cursor:grab;color:#c0b8b0;font-size:14px;padding:0 4px;user-select:none;flex-shrink:0}',
     '.proto-edit-step .drag-handle:active{cursor:grabbing}',
-    '.extraction-banner{background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:12px;color:#856404;display:flex;align-items:center;gap:8px}',
     '.proto-timer-btn{display:inline-flex;align-items:center;gap:3px;background:#e8f0e8;color:#5b7a5e;border:1px solid #c8d8c8;border-radius:3px;padding:1px 7px;font-size:11px;cursor:pointer;font-weight:600;vertical-align:middle;margin-left:4px;font-family:inherit}',
     '.proto-timer-btn:hover{background:#d0e4d0}',
     /* review modal */
@@ -161,53 +160,7 @@ var _UNITS = ['uL', 'mL', 'L', 'ng', 'ug', 'mg', 'g', 'nM', 'uM', 'mM', 'M', 'U'
 var _editState = {};
 var _openPanels = [];
 var _activePanel = null;
-var _extractionPollInterval = null;
 var _tagState = {};
-
-// ── extraction polling ────────────────────────────────────────────────────────
-function _startExtractionPoll() {
-  if (_extractionPollInterval) return;
-  _extractionPollInterval = setInterval(_pollExtractions, 2000);
-}
-function _stopExtractionPoll() { if (_extractionPollInterval) { clearInterval(_extractionPollInterval); _extractionPollInterval = null; } }
-
-async function _pollExtractions() {
-  try {
-    var resp = await fetch('/api/3090/status');
-    if (!resp.ok) return;
-    var data = await resp.json();
-    var ext = data.extracting || {};
-    var anyActive = false;
-    (S.protocols || []).forEach(function(p) {
-      var stage = ext[p.id];
-      var banner = document.getElementById('extract-banner-' + p.id);
-      var li = document.getElementById('pli-' + p.id);
-      if (stage && stage !== 'done') {
-        anyActive = true;
-        if (li) _updateListItemBadge(li, stage);
-        if (banner) { banner.innerHTML = '<span class="proto-spinner"></span> ' + _stageLabel(stage); banner.style.display = ''; }
-      } else if (stage === 'done') {
-        _reloadProtocol(p.id);
-      } else {
-        if (li) _updateListItemBadge(li, null);
-        if (banner) banner.style.display = 'none';
-      }
-    });
-    if (!anyActive) _stopExtractionPoll();
-  } catch(e) {}
-}
-
-function _stageLabel(stage) {
-  return { waking: 'Waking 3090...', steps: 'Extracting steps...', tables: 'Extracting tables...', failed: 'Extraction failed' }[stage] || 'Processing...';
-}
-
-function _updateListItemBadge(li, stage) {
-  var badge = li.querySelector('.pli-badge');
-  if (!stage) { if (badge) badge.remove(); return; }
-  if (!badge) { badge = document.createElement('span'); badge.className = 'pli-badge'; var meta = li.querySelector('.pli-meta'); if (meta) meta.appendChild(badge); }
-  badge.className = 'pli-badge' + (stage === 'failed' ? ' no-steps' : ' extracting');
-  badge.textContent = _stageLabel(stage);
-}
 
 async function _reloadProtocol(pid) {
   try {
@@ -693,7 +646,6 @@ async function renderProtocols(el) {
   prev.forEach(function(pid){ if((S.protocols||[]).some(function(p){return p.id===pid;})) protoOpenPanel(pid); });
   if (prevA && _openPanels.indexOf(prevA)>=0) protoSwitchPanel(prevA);
   _loadAndRenderActiveRuns();
-  try { var r=await fetch('/api/3090/status'); if(r.ok){var d=await r.json(); if(d.extracting&&Object.keys(d.extracting).length>0) _startExtractionPoll();} } catch(e){}
 }
 
 function _compactCard(p) {
@@ -714,7 +666,7 @@ function _panelBody(p) {
   var tags=JSON.parse(p.tags||'[]');
   var estTime = _estimateTime(steps);
   var ac = p.auto_complete || 'manual';
-  var h='<div class="extraction-banner" id="extract-banner-'+p.id+'" style="display:none"><span class="proto-spinner"></span> Checking...</div>';
+  var h='';
   // header
   h+='<div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;flex-wrap:wrap"><div style="flex:1;min-width:200px">';
   h+='<div style="font-weight:700;font-size:16px;color:#4a4139;margin-bottom:4px">'+esc(p.title)+'</div>';
@@ -728,9 +680,10 @@ function _panelBody(p) {
   h+='</div><div style="display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0">';
   h+='<button class="btn" style="color:#5b7a5e" onclick="protoOpenRun('+p.id+')">&#9654; Run</button>';
   h+='<button class="btn" onclick="protoEdit('+p.id+')">&#9998; Edit</button>';
-  if(p.source_type!=='manual') h+='<button class="btn" style="color:#5b7a5e" onclick="protoReExtract('+p.id+')">&#10227; Re-extract</button>';
-  h+='<button class="btn" onclick="protoReparseTables('+p.id+')">&#128295; Fix tables</button>';
-  h+='<button class="btn" style="color:#5b7a5e" onclick="protoReview('+p.id+')">&#129302; Review</button>';
+  if(p.source_type!=='manual') {
+    h+='<button class="btn" style="color:#5b7a5e" onclick="protoCopyClaudePrompt('+p.id+')" title="Copy prompt for Claude chat">&#128203; Copy Claude prompt</button>';
+    h+='<button class="btn" onclick="protoImportFromClaude('+p.id+')" title="Paste Claude&#39;s formatted output to update steps + tables">&#128228; Import from Claude</button>';
+  }
   h+='<button class="btn" onclick="protoClone('+p.id+')">&#128464; Clone</button>';
   h+='<button class="btn" style="color:#c0392b" onclick="protoDelete('+p.id+')">&#128465; Delete</button>';
   h+='</div></div>';
@@ -839,24 +792,24 @@ async function protoAddUrl() {
   var url=document.getElementById('proto-url')?.value.trim(), title=document.getElementById('proto-title-url')?.value.trim();
   if(!url){toast('Paste a URL first',true);return;} if(!title){toast('Add a title',true);return;}
   var btn=document.querySelector('#pt-url .btn.primary'); if(btn){btn.textContent='Saving...';btn.disabled=true;}
-  try{await api('POST','/api/protocols',{title:title,url:url,tags:_getTags('import-url')});document.getElementById('proto-url').value='';document.getElementById('proto-title-url').value='';_tagState['import-url']=[];_startExtractionPoll();await loadView();toast('Protocol saved — extracting in background');}
-  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Fetch + Extract';btn.disabled=false;}}
+  try{await api('POST','/api/protocols',{title:title,url:url,tags:_getTags('import-url')});document.getElementById('proto-url').value='';document.getElementById('proto-title-url').value='';_tagState['import-url']=[];await loadView();toast('Protocol saved');}
+  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Fetch + Save';btn.disabled=false;}}
 }
 
 async function protoAddPaste() {
   var title=document.getElementById('proto-title-paste')?.value.trim(), text=document.getElementById('proto-paste-text')?.value.trim();
   if(!title){toast('Add a title',true);return;} if(!text){toast('Paste some text first',true);return;}
   var btn=document.querySelector('#pt-paste .btn.primary'); if(btn){btn.textContent='Saving...';btn.disabled=true;}
-  try{await api('POST','/api/protocols/from-paste',{title:title,text:text,tags:_getTags('import-paste')});document.getElementById('proto-title-paste').value='';document.getElementById('proto-paste-text').value='';_tagState['import-paste']=[];_startExtractionPoll();await loadView();toast('Protocol saved — extracting in background');}
-  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Extract Steps';btn.disabled=false;}}
+  try{await api('POST','/api/protocols/from-paste',{title:title,text:text,tags:_getTags('import-paste')});document.getElementById('proto-title-paste').value='';document.getElementById('proto-paste-text').value='';_tagState['import-paste']=[];await loadView();toast('Protocol saved');}
+  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Save Protocol';btn.disabled=false;}}
 }
 
 async function protoAddFile() {
   var title=document.getElementById('proto-title-file')?.value.trim(), fi=document.getElementById('proto-file'), file=fi?.files[0];
   if(!title){toast('Add a title',true);return;} if(!file){toast('Choose a file first',true);return;}
   var btn=document.querySelector('#pt-file .btn.primary'); if(btn){btn.textContent='Uploading...';btn.disabled=true;}
-  try{var fd=new FormData();fd.append('title',title);fd.append('file',file);fd.append('tags',JSON.stringify(_getTags('import-file')));var resp=await fetch('/api/protocols/from-file',{method:'POST',body:fd});if(!resp.ok)throw new Error(await resp.text());document.getElementById('proto-title-file').value='';fi.value='';_tagState['import-file']=[];_startExtractionPoll();await loadView();toast('Protocol saved — extracting in background');}
-  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Upload + Extract';btn.disabled=false;}}
+  try{var fd=new FormData();fd.append('title',title);fd.append('file',file);fd.append('tags',JSON.stringify(_getTags('import-file')));var resp=await fetch('/api/protocols/from-file',{method:'POST',body:fd});if(!resp.ok)throw new Error(await resp.text());document.getElementById('proto-title-file').value='';fi.value='';_tagState['import-file']=[];await loadView();toast('Protocol saved');}
+  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Upload + Save';btn.disabled=false;}}
 }
 
 async function protoAddManual() {
@@ -871,11 +824,6 @@ async function protoAddManual() {
 }
 
 // ── protocol actions ──────────────────────────────────────────────────────────
-async function protoReExtract(pid) {
-  try{await api('POST','/api/protocols/'+pid+'/re-extract');_startExtractionPoll();var b=document.getElementById('extract-banner-'+pid);if(b){b.innerHTML='<span class="proto-spinner"></span> Starting extraction...';b.style.display='';}toast('Re-extracting in background');}
-  catch(e){toast('Re-extract failed: '+e.message,true);}
-}
-
 async function protoSave(pid) { await api('PUT','/api/protocols/'+pid,{notes:document.getElementById('pn-'+pid)?.value||''}); toast('Saved'); }
 
 async function protoDelete(pid) {
@@ -888,177 +836,65 @@ async function protoClone(pid) {
   catch(e){toast('Clone failed: '+e.message,true);}
 }
 
-async function protoReparseTables(pid) {
-  if(!confirm('Send this protocol back to the LLM to fix/regenerate the tables?')) return;
-  toast('Reparsing tables...');
+// ── Claude round-trip: copy prompt + import formatted output ─────────────────
+async function protoCopyClaudePrompt(pid) {
   try {
-    var data = await api('POST', '/api/protocols/' + pid + '/reparse-tables');
-    if (data.recipe) {
-      // Show in review modal as a single table diff
-      var p = (S.protocols||[]).find(function(x){return x.id===pid;});
-      var oldRecipe = p ? (p.recipe || '') : '';
-      _showTableReparseReview(pid, oldRecipe, data.recipe, data.tables_count);
-    }
-  } catch(e) { toast('Reparse failed: ' + e.message, true); }
-}
-
-function _showTableReparseReview(pid, oldRecipe, newRecipe, count) {
-  var div = document.createElement('div');
-  div.className = 'prv-overlay';
-  div.id = 'prv-overlay';
-  div.innerHTML = '<div class="prv-modal">' +
-    '<div class="prv-header"><h3>&#128295; Table Reparse — ' + count + ' table(s) found</h3>' +
-    '<div style="display:flex;gap:6px"><button class="btn primary" onclick="protoAcceptReparse('+pid+')">Accept new tables</button><button class="btn" onclick="document.getElementById(\'prv-overlay\').remove()">Keep original</button></div></div>' +
-    '<div class="prv-body"><div class="prv-diff">' +
-      '<div class="prv-diff-col"><div class="prv-diff-label">Current tables</div><div class="prv-diff-text" style="max-height:300px;overflow-y:auto">' + _recipePreviewText(oldRecipe) + '</div></div>' +
-      '<div class="prv-diff-col new"><div class="prv-diff-label">Reparsed tables</div><div class="prv-diff-text" style="max-height:300px;overflow-y:auto">' + _recipePreviewText(newRecipe) + '</div></div>' +
-    '</div></div></div>';
-  document.body.appendChild(div);
-  // store for accept
-  div._newRecipe = newRecipe;
-}
-
-function _recipePreviewText(raw) {
-  var tables = _parseRecipeArray(raw);
-  return tables.map(function(t) {
-    var lines = [esc(t.name || 'Recipe')];
-    lines.push(t.columns.map(function(c){return esc(c);}).join(' | '));
-    lines.push(t.columns.map(function(){return '---';}).join(' | '));
-    t.rows.forEach(function(row) {
-      lines.push(t.columns.map(function(_,ci){return esc(row[ci]||'');}).join(' | '));
-    });
-    return lines.join('\n');
-  }).join('\n\n');
-}
-
-async function protoAcceptReparse(pid) {
-  var overlay = document.getElementById('prv-overlay');
-  var newRecipe = overlay ? overlay._newRecipe : null;
-  if (!newRecipe) return;
-  overlay.remove();
-  await api('PUT', '/api/protocols/' + pid, { recipe: newRecipe });
-  var p = (S.protocols||[]).find(function(x){return x.id===pid;});
-  if (p) p.recipe = newRecipe;
-  _recipeState[pid] = JSON.parse(JSON.stringify(_parseRecipeArray(newRecipe)));
-  _reloadProtocol(pid);
-  var panel = document.getElementById('pp-'+pid);
-  if (panel && p) { panel.innerHTML = _panelBody(p); protoLoadRunHistory(pid); }
-  toast('Tables updated');
-}
-
-async function protoReview(pid) {
-  toast('Sending protocol for LLM review...');
-  try {
-    var data = await api('POST', '/api/protocols/' + pid + '/review');
-    if (data.suggestions && data.suggestions.length) {
-      _showReviewModal(pid, data.suggestions);
-    } else {
-      toast('No suggestions — protocol looks good!');
-    }
-  } catch(e) { toast('Review failed: ' + e.message, true); }
-}
-
-var _reviewState = {}; // pid -> {suggestions, accepted: Set, rejected: Set}
-
-function _showReviewModal(pid, suggestions) {
-  _reviewState[pid] = { suggestions: suggestions, accepted: {}, rejected: {} };
-  var div = document.createElement('div');
-  div.className = 'prv-overlay';
-  div.id = 'prv-overlay';
-  div.innerHTML = '<div class="prv-modal">' +
-    '<div class="prv-header"><h3>&#129302; Protocol Review — ' + suggestions.length + ' suggestion(s)</h3>' +
-    '<div style="display:flex;gap:6px"><button class="btn primary" onclick="protoApplyReview('+pid+')">Apply accepted</button><button class="btn" onclick="protoAcceptAllReview('+pid+')">Accept all</button><button class="btn" onclick="document.getElementById(\'prv-overlay\').remove()">Close</button></div></div>' +
-    '<div class="prv-body" id="prv-body-'+pid+'">' + _buildReviewItems(pid) + '</div></div>';
-  document.body.appendChild(div);
-}
-
-function _buildReviewItems(pid) {
-  var rs = _reviewState[pid]; if (!rs) return '';
-  return rs.suggestions.map(function(s, i) {
-    var accepted = rs.accepted[i];
-    var rejected = rs.rejected[i];
-    var cls = accepted ? ' accepted' : (rejected ? ' rejected' : '');
-    var typeBadge = '<span class="prv-badge ' + (s.type||'general') + '">' + esc(s.type||'general') + (s.index != null ? ' #'+(s.index+1) : '') + '</span>';
-    return '<div class="prv-item'+cls+'" id="prv-item-'+pid+'-'+i+'">' +
-      '<div class="prv-item-head">' + typeBadge + '<div class="prv-reason">' + esc(s.reason) + '</div></div>' +
-      '<div class="prv-diff">' +
-        (s.original ? '<div class="prv-diff-col"><div class="prv-diff-label">Before</div><div class="prv-diff-text">' + esc(s.original) + '</div></div>' : '') +
-        '<div class="prv-diff-col new"><div class="prv-diff-label">' + (s.original ? 'After' : 'Add') + '</div><div class="prv-diff-text">' + esc(s.suggested) + '</div></div>' +
-      '</div>' +
-      '<div class="prv-item-actions">' +
-        (accepted ? '<span style="color:#5b7a5e;font-size:12px;font-weight:600">&#10003; Accepted</span>' :
-         rejected ? '<span style="color:#c0392b;font-size:12px">Rejected</span>' :
-         '<button class="btn primary" style="font-size:12px" onclick="protoReviewAccept('+pid+','+i+')">&#10003; Accept</button><button class="btn" style="font-size:12px" onclick="protoReviewReject('+pid+','+i+')">&#10007; Reject</button>') +
-      '</div></div>';
-  }).join('');
-}
-
-function protoReviewAccept(pid, idx) {
-  var rs = _reviewState[pid]; if (!rs) return;
-  rs.accepted[idx] = true; delete rs.rejected[idx];
-  var body = document.getElementById('prv-body-'+pid);
-  if (body) body.innerHTML = _buildReviewItems(pid);
-}
-
-function protoReviewReject(pid, idx) {
-  var rs = _reviewState[pid]; if (!rs) return;
-  rs.rejected[idx] = true; delete rs.accepted[idx];
-  var body = document.getElementById('prv-body-'+pid);
-  if (body) body.innerHTML = _buildReviewItems(pid);
-}
-
-function protoAcceptAllReview(pid) {
-  var rs = _reviewState[pid]; if (!rs) return;
-  rs.suggestions.forEach(function(_, i) { rs.accepted[i] = true; delete rs.rejected[i]; });
-  var body = document.getElementById('prv-body-'+pid);
-  if (body) body.innerHTML = _buildReviewItems(pid);
-}
-
-async function protoApplyReview(pid) {
-  var rs = _reviewState[pid]; if (!rs) return;
-  var p = (S.protocols||[]).find(function(x){return x.id===pid;}); if (!p) return;
-
-  // Apply accepted step suggestions
-  var steps = [];
-  try { steps = JSON.parse(p.steps || '[]'); } catch(e) {}
-  var changed = false;
-
-  rs.suggestions.forEach(function(s, i) {
-    if (!rs.accepted[i]) return;
-    if (s.type === 'step' && s.index != null && s.field === 'text' && steps[s.index]) {
-      steps[s.index].text = s.suggested;
-      changed = true;
-    } else if (s.type === 'step' && s.index != null && s.field === 'note') {
-      if (steps[s.index]) { steps[s.index].note = s.suggested; changed = true; }
-    } else if (s.type === 'step' && s.field === 'new_step') {
-      // insert after the referenced index, or at end
-      var insertAt = (s.index != null && s.index < steps.length) ? s.index + 1 : steps.length;
-      steps.splice(insertAt, 0, { text: s.suggested, note: s.reason });
-      changed = true;
-    }
-    // general suggestions are informational — user applies manually
-  });
-
-  if (changed) {
-    var stepsJson = JSON.stringify(steps);
-    await api('PUT', '/api/protocols/' + pid, { steps: stepsJson });
-    p.steps = stepsJson;
+    var data = await api('GET', '/api/protocols/' + pid + '/claude-prompt');
+    if (!data || !data.prompt) { toast('No prompt returned', true); return; }
+    await navigator.clipboard.writeText(data.prompt);
+    toast('Prompt copied — paste into a Claude chat');
+  } catch(e) {
+    toast('Copy failed: ' + (e.message || e), true);
   }
+}
 
-  document.getElementById('prv-overlay')?.remove();
-  delete _reviewState[pid];
+function protoImportFromClaude(pid) {
+  var div = document.createElement('div');
+  div.className = 'prv-overlay';
+  div.id = 'prv-overlay';
+  div.innerHTML = '<div class="prv-modal">' +
+    '<div class="prv-header"><h3>&#128228; Import from Claude</h3>' +
+    '<div style="display:flex;gap:6px">' +
+      '<button class="btn primary" onclick="protoSubmitClaudeImport('+pid+')">Import</button>' +
+      '<button class="btn" onclick="document.getElementById(\'prv-overlay\').remove()">Cancel</button>' +
+    '</div></div>' +
+    '<div class="prv-body">' +
+      '<div style="font-size:12px;color:#8a7f72;margin-bottom:8px">Paste the entire block Claude returned. Overwrites steps + tables; appends to notes.</div>' +
+      '<textarea id="claude-import-text-'+pid+'" style="width:100%;height:340px;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:12px;padding:10px;border:1px solid #d5cec0;border-radius:6px;background:#faf8f4;color:#4a4139;resize:vertical" placeholder="=== STEPS ===&#10;1. ...&#10;&#10;=== RECIPES ===&#10;## Table name&#10;| col | col |&#10;| --- | --- |&#10;&#10;=== NOTES ===&#10;..."></textarea>' +
+    '</div></div>';
+  document.body.appendChild(div);
+  setTimeout(function() { var t = document.getElementById('claude-import-text-'+pid); if (t) t.focus(); }, 0);
+}
 
-  // refresh panel
-  var panel = document.getElementById('pp-'+pid);
-  if (panel) { panel.innerHTML = _panelBody(p); protoLoadRunHistory(pid); }
-  _reloadProtocol(pid);
-  toast(changed ? 'Review changes applied' : 'No step changes to apply');
+async function protoSubmitClaudeImport(pid) {
+  var textarea = document.getElementById('claude-import-text-'+pid);
+  if (!textarea) return;
+  var formatted = textarea.value || '';
+  if (!formatted.trim()) { toast('Paste the Claude output first', true); return; }
+  try {
+    var data = await api('POST', '/api/protocols/'+pid+'/import-from-claude', { formatted: formatted });
+    document.getElementById('prv-overlay')?.remove();
+    // refresh the row + panel from server response
+    var p = data.protocol;
+    var idx = (S.protocols||[]).findIndex(function(x){return x.id===pid;});
+    if (idx >= 0) S.protocols[idx] = p;
+    _recipeState[pid] = JSON.parse(JSON.stringify(_parseRecipeArray(p.recipe)));
+    var panel = document.getElementById('pp-'+pid);
+    if (panel) { panel.innerHTML = _panelBody(p); protoLoadRunHistory(pid); }
+    var li = document.getElementById('pli-'+pid);
+    if (li) { var w = document.createElement('div'); w.innerHTML = _compactCard(p); li.replaceWith(w.firstChild); }
+    var msg = 'Imported: ' + data.steps_parsed + ' step(s), ' + data.tables_parsed + ' table(s)';
+    if (data.notes_appended) msg += ', notes appended';
+    toast(msg);
+  } catch(e) {
+    toast('Import failed: ' + (e.message || e), true);
+  }
 }
 
 function protoOpenRun(pid) {
   var p=(S.protocols||[]).find(function(x){return x.id===pid;}); if(!p)return;
   var steps=[]; try{var parsed=JSON.parse(p.steps||'[]');if(Array.isArray(parsed)&&parsed.length&&typeof parsed[0].text!=='undefined')steps=parsed;}catch(e){}
-  if(!steps.length){toast('No structured steps yet — extract first',true);return;}
+  if(!steps.length){toast('No structured steps yet — import from Claude or add manually',true);return;}
   if(typeof spLaunchRunDirect==='function') spLaunchRunDirect(p,null);
   else toast('Open the Scratch pad to run protocols',true);
 }
