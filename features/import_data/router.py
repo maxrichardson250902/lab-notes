@@ -761,6 +761,24 @@ def list_gblocks():
         rows = conn.execute("SELECT * FROM gblocks ORDER BY name ASC").fetchall()
     return {"items": [dict(r) for r in rows]}
 
+@router.get("/gblocks/next-name")
+def next_gblock_name(prefix: str = "gMR", count: int = 1):
+    """Return the next sequential name(s) in a prefixed numeric series (e.g. gMR43).
+    Continues past the highest existing number; gaps from deleted IDs are NOT
+    reused. `count` returns that many consecutive names for batch saves."""
+    import re as _re
+    pat = _re.compile(r"^" + _re.escape(prefix) + r"(\d+)$")
+    max_n = 0
+    with get_db() as conn:
+        rows = conn.execute("SELECT name FROM gblocks").fetchall()
+    for r in rows:
+        m = pat.match((dict(r).get("name") or "").strip())
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    start = max_n + 1
+    names = [f"{prefix}{start + i}" for i in range(max(1, count))]
+    return {"prefix": prefix, "highest": max_n, "next": names[0], "names": names}
+
 @router.post("/gblocks")
 def create_gblock(body: CreateGblock):
     now = datetime.utcnow().isoformat()
@@ -1053,7 +1071,8 @@ def create_part(body: CreatePart):
         # Auto-generate .gb from sequence
         gb_file = ""
         if body.sequence and body.sequence.strip():
-            gb_file = _generate_gb_for_part(item_id, body.name, body.sequence)
+            gb_file = _generate_gb_for_part(item_id, body.name, body.sequence,
+                                            part_type=body.part_type, note=body.notes or body.description)
             if gb_file:
                 conn.execute("UPDATE parts SET gb_file=? WHERE id=?", (gb_file, item_id))
                 conn.commit()
@@ -1144,8 +1163,10 @@ def delete_part_gb(item_id: int):
     return {"ok": True}
 
 
-def _generate_gb_for_part(item_id: int, name: str, sequence: str):
-    """Generate a GenBank file for a part, same logic as gblocks."""
+def _generate_gb_for_part(item_id: int, name: str, sequence: str, part_type: str = None, note: str = None):
+    """Generate a GenBank file for a part. If the part is a coding sequence
+    (part_type 'optimised_cds' or sequence looks like a CDS), annotate it as a
+    CDS with its translation so it renders meaningfully in seqViz."""
     if not sequence or not HAS_BIOPYTHON:
         return ""
     clean_seq = re.sub(r'[^ACGTacgtNn]', '', sequence)
@@ -1157,21 +1178,39 @@ def _generate_gb_for_part(item_id: int, name: str, sequence: str):
         from Bio.SeqFeature import SeqFeature, FeatureLocation
         from Bio import SeqIO as _SeqIO
 
+        up = clean_seq.upper()
         rec = SeqRecord(
-            Seq(clean_seq.upper()),
+            Seq(up),
             id=name[:10].replace(" ", "_"),
             name=name[:10].replace(" ", "_"),
             description=name,
             annotations={"molecule_type": "DNA", "topology": "linear"},
         )
         rec.features.append(SeqFeature(
-            FeatureLocation(0, len(clean_seq)), type="source",
+            FeatureLocation(0, len(up)), type="source",
             qualifiers={"mol_type": ["other DNA"], "organism": ["synthetic construct"], "label": [name]},
         ))
-        rec.features.append(SeqFeature(
-            FeatureLocation(0, len(clean_seq)), type="misc_feature",
-            qualifiers={"label": [name], "note": ["assembled part"]},
-        ))
+        is_cds = (part_type == "optimised_cds") or (len(up) >= 3 and len(up) % 3 == 0 and up.startswith("ATG"))
+        if is_cds:
+            quals = {"label": [name], "ApEinfo_fwdcolor": ["#4682B4"]}
+            try:
+                # translate to a stop; trim trailing stop for a clean protein qualifier
+                prot = str(Seq(up).translate(to_stop=False)).rstrip("*")
+                if prot:
+                    quals["translation"] = [prot]
+            except Exception:
+                pass
+            if note:
+                quals["note"] = [note]
+            rec.features.append(SeqFeature(
+                FeatureLocation(0, len(up)), type="CDS", qualifiers=quals,
+            ))
+        else:
+            rec.features.append(SeqFeature(
+                FeatureLocation(0, len(up)), type="misc_feature",
+                qualifiers={"label": [name], "note": [note or "assembled part"],
+                            "ApEinfo_fwdcolor": ["#95A5A6"]},
+            ))
         gb_path = os.path.join(GB_DIR, f"part_{item_id}.gb")
         with open(gb_path, "w") as f:
             _SeqIO.write(rec, f, "genbank")

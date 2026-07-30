@@ -45,6 +45,11 @@ def submit_job(fn, *args, **kwargs):
     Returns a job ID string immediately."""
     _cleanup()
 
+    # Copy kwargs so injecting _progress inside the worker thread doesn't
+    # mutate the dict the caller may still be holding a reference to (and
+    # doesn't race with them if they read/write it after submit_job returns).
+    kwargs = dict(kwargs)
+
     job_id = uuid.uuid4().hex[:12]
     job = {
         "id": job_id,

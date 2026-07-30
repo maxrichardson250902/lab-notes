@@ -35,6 +35,20 @@ DEFAULTS = {
     "sidebar_peek_delay_ms": 150,
     # Debounce for auto-save in editors (workflow doc, scratch). Milliseconds.
     "auto_save_delay_ms": 1500,
+    # ── LLM backend selection ──────────────────────────────────────────────
+    # Which LLM backend the app uses for enrichment, predictions, protocol
+    # extraction, Process Day, etc. "3090" = local GPU (free); "claude" =
+    # Anthropic API (costs money, capped below); "local" = alias for 3090.
+    "llm_backend": "3090",
+    # Which Claude model to use when llm_backend is "claude".
+    "claude_model": "claude-haiku-4-5-20251001",
+    # Daily Anthropic budget you allot overall, in USD. The app may spend at
+    # most app_budget_fraction of this per day; past that it falls back to the
+    # 3090. (The API key itself is an env var, never stored here.)
+    "app_daily_budget_usd": 1.0,
+    # Fraction of app_daily_budget_usd this app is allowed to consume per day.
+    # 0.15 = 15%. When reached, LLM calls fall back to the local 3090.
+    "app_budget_fraction": 0.15,
 }
 
 
@@ -143,3 +157,19 @@ def reset_settings():
     into a weird state via a bad setting."""
     _write_config({})
     return _get_config()
+
+
+@router.get("/llm-spend")
+def llm_spend():
+    """Today's Claude API usage for this app: calls, tokens, cost, and how much
+    of the app's daily ceiling has been consumed. Lets the Settings UI show a
+    little 'used $0.03 / $0.15 today' indicator."""
+    try:
+        from core.claude import spend_today, current_backend, _api_key
+        d = spend_today()
+        d["backend"] = current_backend()
+        d["api_key_present"] = bool(_api_key())
+        return d
+    except Exception as e:
+        return {"error": str(e), "backend": "3090", "api_key_present": False,
+                "calls": 0, "cost_usd": 0.0, "ceiling_usd": 0.0, "fraction_used": 0.0}

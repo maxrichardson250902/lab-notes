@@ -2202,6 +2202,201 @@ def _scan_region_for_tags(seq_region: str, scan_len: int = 150) -> dict:
     return {"tags": detected, "stop_pos": stop_pos}
 
 
+# ── Codon table & assembled-ORF frame-through check ──────────────────────────
+# Replaces the naive `overhang_len % 3 == 0` and `overlap_length % 3 == 0`
+# heuristics, which mis-flag every correctly-designed C-terminal fusion where
+# the overhang / homology arm spans a codon boundary (e.g., AATG/AGGT for BsaI
+# — the T of AGGT joins with the first 2 nt of the downstream vector to complete
+# a codon, so the insert body isn't a whole number of codons on its own).
+
+_CODON_TABLE = {
+    "TTT":"F","TTC":"F","TTA":"L","TTG":"L","CTT":"L","CTC":"L","CTA":"L","CTG":"L",
+    "ATT":"I","ATC":"I","ATA":"I","ATG":"M","GTT":"V","GTC":"V","GTA":"V","GTG":"V",
+    "TCT":"S","TCC":"S","TCA":"S","TCG":"S","CCT":"P","CCC":"P","CCA":"P","CCG":"P",
+    "ACT":"T","ACC":"T","ACA":"T","ACG":"T","GCT":"A","GCC":"A","GCA":"A","GCG":"A",
+    "TAT":"Y","TAC":"Y","TAA":"*","TAG":"*","CAT":"H","CAC":"H","CAA":"Q","CAG":"Q",
+    "AAT":"N","AAC":"N","AAA":"K","AAG":"K","GAT":"D","GAC":"D","GAA":"E","GAG":"E",
+    "TGT":"C","TGC":"C","TGA":"*","TGG":"W","CGT":"R","CGC":"R","CGA":"R","CGG":"R",
+    "AGT":"S","AGC":"S","AGA":"R","AGG":"R","GGT":"G","GGC":"G","GGA":"G","GGG":"G",
+}
+
+# Tag amino-acid sequences — codon-usage-independent, more robust than the
+# DNA-based KNOWN_TAG_SEQS above (which matched only one codon variant).
+KNOWN_TAG_AA = {
+    "His6":    "HHHHHH",
+    "His8":    "HHHHHHHH",
+    "FLAG":    "DYKDDDDK",
+    "HA":      "YPYDVPDYA",
+    "Myc":     "EQKLISEEDL",
+    "Strep":   "WSHPQFEK",
+    "StrepII": "WSHPQFEK",
+    "V5":      "GKPIPNPLLGLDST",
+}
+
+
+def _translate_to_stop(dna: str, start: int) -> tuple:
+    """Translate DNA in frame from `start` until the first stop codon or end.
+    Returns (protein_without_stop, stop_position_or_None). Codons containing N
+    or other non-ACGT translate to 'X'."""
+    prot = []
+    i = start
+    while i + 3 <= len(dna):
+        aa = _CODON_TABLE.get(dna[i:i+3].upper(), "X")
+        if aa == "*":
+            return "".join(prot), i
+        prot.append(aa)
+        i += 3
+    return "".join(prot), None
+
+
+def _check_orf_reads_through(assembled: str, insert_start: int, insert_end: int,
+                             scan_upstream: int = 300) -> dict:
+    """Given an assembled top strand and the [insert_start, insert_end) region
+    within it, determine whether an ORF starting at an ATG at-or-upstream of
+    the insert reads cleanly through the insert to a stop downstream of it.
+
+    Tries every ATG in [insert_start - scan_upstream, insert_start + 3]:
+      - If the ATG's translation reaches a stop AFTER insert_end, it's a
+        candidate (the ORF traverses the insert).
+      - Among candidates, pick the one whose stop is furthest downstream
+        (guards against tag-then-stop reading correctly but a later stop
+        being the "real" one — the furthest-downstream stop is usually the
+        vector-designed stop).
+
+    Returns dict:
+      ok           bool  — a good ORF was found
+      protein      str   — translated protein (no stop)
+      atg_pos      int   — position of chosen ATG, or -1
+      stop_pos     int   — position of the first stop, or -1
+      tags_found   list  — AA-level tags matched in the protein
+      reason       str   — human-readable summary
+    """
+    scan_start = max(0, insert_start - scan_upstream)
+    scan_end = insert_start + 3  # allow ATG within the 5' overhang (e.g., AATG's ATG)
+    best = None
+    fallback_premature = None       # ATG found → translation → stop INSIDE insert
+    fallback_no_stop_reached = None # ATG found → translation ran off window with no stop
+    any_atg_seen = False
+
+    for pos in range(scan_start, scan_end + 1):
+        if assembled[pos:pos+3].upper() != "ATG":
+            continue
+        any_atg_seen = True
+        prot, stop_pos = _translate_to_stop(assembled, pos)
+        if stop_pos is None:
+            # ORF ran off the end of the window without hitting a stop —
+            # usually means the ATG's frame is shifted relative to the
+            # vector's designed stop (i.e., a real frameshift).
+            if fallback_no_stop_reached is None or len(prot) > len(fallback_no_stop_reached["protein"]):
+                fallback_no_stop_reached = {"atg_pos": pos, "protein": prot}
+            continue
+        if stop_pos < insert_end:
+            if fallback_premature is None or stop_pos > fallback_premature["stop_pos"]:
+                fallback_premature = {"atg_pos": pos, "stop_pos": stop_pos, "protein": prot}
+            continue
+        candidate = {"atg_pos": pos, "stop_pos": stop_pos, "protein": prot}
+        if best is None or candidate["stop_pos"] > best["stop_pos"]:
+            best = candidate
+
+    if best is not None:
+        tags = [n for n, aa in KNOWN_TAG_AA.items() if aa in best["protein"]]
+        return {
+            "ok": True,
+            "protein": best["protein"],
+            "atg_pos": best["atg_pos"],
+            "stop_pos": best["stop_pos"],
+            "tags_found": tags,
+            "reason": f"ORF reads through: M + {len(best['protein'])-1} aa then * at position {best['stop_pos']}",
+        }
+    if fallback_premature is not None:
+        tags = [n for n, aa in KNOWN_TAG_AA.items() if aa in fallback_premature["protein"]]
+        return {
+            "ok": False,
+            "protein": fallback_premature["protein"],
+            "atg_pos": fallback_premature["atg_pos"],
+            "stop_pos": fallback_premature["stop_pos"],
+            "tags_found": tags,
+            "reason": f"Premature stop at position {fallback_premature['stop_pos']} inside insert",
+        }
+    if fallback_no_stop_reached is not None:
+        tags = [n for n, aa in KNOWN_TAG_AA.items() if aa in fallback_no_stop_reached["protein"]]
+        return {
+            "ok": False,
+            "protein": fallback_no_stop_reached["protein"],
+            "atg_pos": fallback_no_stop_reached["atg_pos"],
+            "stop_pos": -1,
+            "tags_found": tags,
+            "reason": ("ORF from the 5ʹ ATG runs off the checked window without hitting an in-frame stop — "
+                       "likely a frameshift (insert body length not a multiple of 3, or overhang offset "
+                       "inconsistent with the vector's downstream frame)"),
+        }
+    return {
+        "ok": False, "protein": "", "atg_pos": -1, "stop_pos": -1,
+        "tags_found": [],
+        "reason": ("No ATG found upstream of or within the 5ʹ overhang" if not any_atg_seen
+                   else "No ATG produced a translatable ORF"),
+    }
+
+
+def _build_gg_assembled_topstrand(vec_seq: str, cut5_start: int, cut3_end: int,
+                                  left_overhang: str, right_overhang: str,
+                                  insert_body: str, flanking: int = 300) -> dict:
+    """Build a linear window of the assembled top strand for a Golden Gate
+    assembly with a precut vector.
+
+    Args:
+      vec_seq:        vector top-strand sequence (as written; treated as circular)
+      cut5_start:     position in vec_seq where the 5' overhang starts
+      cut3_end:       position in vec_seq just past the 3' overhang
+      left_overhang:  the 5' overhang bases (e.g. AATG)
+      right_overhang: the 3' overhang bases (e.g. AGGT)
+      insert_body:    the insert region STRICTLY between the overhangs
+      flanking:       how many bp of vector context to include on each side
+
+    Returns {topstrand, insert_start, insert_end} where insert_start/_end
+    bracket [left_overhang + insert_body + right_overhang] in the topstrand.
+    """
+    L = len(vec_seq)
+    if L == 0:
+        return {"topstrand": "", "insert_start": 0, "insert_end": 0}
+
+    up_len = min(flanking, L)
+    if cut5_start - up_len >= 0:
+        upstream = vec_seq[cut5_start - up_len:cut5_start]
+    else:
+        overflow = up_len - cut5_start
+        upstream = vec_seq[L - overflow:] + vec_seq[:cut5_start]
+
+    down_len = min(flanking, L)
+    if cut3_end + down_len <= L:
+        downstream = vec_seq[cut3_end:cut3_end + down_len]
+    else:
+        overflow = (cut3_end + down_len) - L
+        downstream = vec_seq[cut3_end:] + vec_seq[:overflow]
+
+    assembled = upstream + left_overhang + insert_body + right_overhang + downstream
+    insert_start = len(upstream)
+    insert_end = insert_start + len(left_overhang) + len(insert_body) + len(right_overhang)
+    return {"topstrand": assembled, "insert_start": insert_start, "insert_end": insert_end}
+
+
+def _build_gibson_assembled_topstrand(vec_seq: str, insert_seq: str,
+                                      overlap_length: int, flanking: int = 300) -> dict:
+    """Build a linear window across the last-insert / vector-5ʹ junction of a
+    Gibson circular assembly. The homology overlap is present once in the
+    assembled product — we keep it on the insert side and trim it from the
+    vector side.
+    """
+    if len(vec_seq) <= overlap_length:
+        return {"topstrand": "", "insert_start": 0, "insert_end": 0}
+    up_len = min(flanking, len(insert_seq))
+    upstream = insert_seq[-up_len:]
+    down_len = min(flanking, len(vec_seq) - overlap_length)
+    downstream = vec_seq[overlap_length:overlap_length + down_len]
+    assembled = upstream + downstream
+    return {"topstrand": assembled, "insert_start": 0, "insert_end": len(upstream)}
+
+
 def _check_internal_sites(seq: str, site: str, rc_site: str) -> list:
     """Check for internal enzyme recognition sites in a fragment."""
     seq_upper = seq.upper()
@@ -2287,12 +2482,28 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
         ct_tags = ct_scan["tags"]
         nt_tags = nt_scan["tags"]
 
+        # ── Proper frame check: build the assembled top strand across the
+        # last-insert → vector junction and translate. Overlap length has
+        # nothing to do with reading frame — the overlap is homology, present
+        # once in the product regardless of size — so the old
+        # `overlap_length % 3` heuristic false-positive'd on every default
+        # 25 bp design. This does the real thing.
+        frame_orf = None
+        non_vec_seqs = [s for i, s in enumerate(seqs) if i != vec_idx]
+        if non_vec_seqs and len(vec_seq_upper) > overlap_length:
+            last_insert = non_vec_seqs[-1]
+            built = _build_gibson_assembled_topstrand(vec_seq_upper, last_insert, overlap_length)
+            if built["topstrand"]:
+                frame_orf = _check_orf_reads_through(
+                    built["topstrand"], built["insert_start"], built["insert_end"])
+
         vec_tag_info = {
             "c_terminal_tags": ct_tags,
             "n_terminal_tags": nt_tags,
             "has_downstream_stop": ct_scan["stop_pos"] is not None,
             "downstream_stop_pos": ct_scan["stop_pos"],
-            "frame_ok": overlap_length % 3 == 0,
+            "frame_ok": frame_orf["ok"] if frame_orf else None,
+            "orf_check": frame_orf,
             "overlap_length": overlap_length,
         }
 
@@ -2303,11 +2514,11 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
                 warnings.append(f"In-frame stop codon at +{ct_scan['stop_pos']}bp after insert site")
             else:
                 warnings.append(f"⚠ No in-frame stop codon found downstream of insert site — check vector reading frame")
-            if overlap_length % 3 != 0:
-                warnings.append(
-                    f"⚠ Overlap length ({overlap_length}bp) is not divisible by 3 — "
-                    f"C-terminal tag may be out of frame (try {overlap_length - (overlap_length % 3)} or {overlap_length + 3 - (overlap_length % 3)}bp)"
-                )
+            # Only warn about frame if the ORF check actively failed. Absence
+            # of a check (frame_orf is None) is not a warning — we don't have
+            # enough context, and silence beats crying wolf.
+            if frame_orf is not None and not frame_orf["ok"]:
+                warnings.append(f"⚠ Assembled ORF frame check failed: {frame_orf['reason']}")
             # Auto-warn about insert fragments with stop codons
             for i, f in enumerate(fragments):
                 if i == vec_idx:
@@ -2400,13 +2611,12 @@ def design_gibson(fragments: list, circular: bool = True, overlap_length: int = 
         all_primers.append(rev_primer)
 
     # ── Frame check for tag readthrough ──
-    for i, f in enumerate(fragments):
-        if f.get("remove_stop") or f.get("remove_start"):
-            if overlap_length % 3 != 0:
-                warnings.append(
-                    f"⚠ '{f['name']}': overlap length ({overlap_length}bp) is not divisible by 3 — "
-                    f"C-terminal/N-terminal tag may be out of frame (consider {overlap_length - (overlap_length % 3)} or {overlap_length + 3 - (overlap_length % 3)}bp)"
-                )
+    # (Previously this emitted a "overlap length not divisible by 3" warning
+    # per fragment with remove_stop/remove_start set. That check is wrong:
+    # overlap length has no bearing on reading frame — the overlap is
+    # homology, present once in the assembled product regardless of size.
+    # The vec_tag_info["frame_ok"] populated above via the assembled-ORF
+    # check is the real answer. Nothing to do here.)
 
     # Build product sequence (concatenate all fragments)
     product_seq = "".join(seqs)
@@ -3058,9 +3268,59 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
                         detected_ntags.append(tag_name)
 
                 has_downstream_stop = stop_pos_in_frame is not None
-                # frame_ok means: a detected C-terminal tag is in-frame given this overhang offset
-                # (if no tags detected, we can't make a strong claim either way)
-                frame_ok = bool(tags_in_frame) if detected_tags else (oh_len_val % 3 == 0)
+
+                # ── Proper frame check: build the assembled top strand and
+                # translate through it. Uses the first fragment from the first
+                # bin as representative — all fragments in a bin share the
+                # same flanking overhangs, so any body-length-mod-3 or premature-
+                # stop problem present in one shows up here.
+                #
+                # This replaces the previous naive `oh_len_val % 3 == 0`
+                # fallback, which false-positive'd every BsaI (4 bp overhang)
+                # design that used a tag whose DNA sequence didn't exactly
+                # match the hardcoded KNOWN_TAG_SEQS entry.
+                cut5_start = cuts_sorted[0]["cut_pos"]
+                cut3_end = cuts_sorted[1]["cut_pos"] + oh_len_val
+                frame_orf = None
+                if bins and bins[0].get("fragments"):
+                    rep_seq = bins[0]["fragments"][0].get(
+                        "_seq", bins[0]["fragments"][0].get("seq", "")).upper()
+                    # For a multi-bin combinatorial assembly, the "insert body"
+                    # between the vector's overhangs is the concatenation of all
+                    # bins' representative fragments (joined by intermediate
+                    # overhangs). Approximate: just use the first bin's rep for
+                    # single-bin case; for multi-bin, build a composite.
+                    if len(bins) == 1:
+                        body = rep_seq
+                    else:
+                        parts = [bins[0]["fragments"][0].get("_seq", "").upper()]
+                        for k in range(1, len(bins)):
+                            # Intermediate overhangs get assigned later (below),
+                            # so we don't know them here. Use a placeholder that
+                            # preserves length + won't create spurious stops.
+                            parts.append("AAA" * ((oh_len_val + 2) // 3))
+                            parts.append(bins[k]["fragments"][0].get("_seq", "").upper())
+                        body = "".join(parts)
+                    built = _build_gg_assembled_topstrand(
+                        vec_seq, cut5_start, cut3_end,
+                        vec_left_oh, vec_right_oh, body)
+                    if built["topstrand"]:
+                        frame_orf = _check_orf_reads_through(
+                            built["topstrand"], built["insert_start"], built["insert_end"])
+
+                # Compose the definitive frame_ok:
+                #  - If ORF check ran and passed → True (this trumps everything;
+                #    the assembled sequence literally reads through)
+                #  - If ORF check ran and failed → False
+                #  - If ORF check couldn't run (no bins/fragments yet) → fall
+                #    back to the tag-in-frame heuristic
+                if frame_orf is not None:
+                    frame_ok = frame_orf["ok"]
+                elif detected_tags:
+                    frame_ok = bool(tags_in_frame)
+                else:
+                    frame_ok = None  # unknown — don't claim either way
+
                 vec_tag_info = {
                     "precut": True,
                     "left_overhang": vec_left_oh,
@@ -3071,6 +3331,7 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
                     "c_terminal_tags_in_frame": tags_in_frame,
                     "n_terminal_tags": detected_ntags,
                     "frame_ok": frame_ok,
+                    "orf_check": frame_orf,
                     "overhang_len": oh_len_val,
                     "downstream_frame": downstream_frame,
                 }
@@ -3222,21 +3483,20 @@ def design_golden_gate(bins: list = None, fragments: list = None, vector: dict =
         })
 
     # ── Frame check for tag readthrough ──
-    # If the vector is pre-cut and we've already analysed frame against the
-    # detected C-terminal tag (vec_tag_info["frame_ok"]), trust that result.
-    # Otherwise fall back to the naive "is overhang divisible by 3" check —
-    # in that case we can only say frame *might* shift, not that it definitely will.
-    oh_len = enz["overhang_len"]
-    frame_known_ok = bool(vec_tag_info and vec_tag_info.get("frame_ok"))
-    if not frame_known_ok and oh_len % 3 != 0:
-        for b in bins:
-            for f in b["fragments"]:
-                if f.get("remove_stop") or f.get("remove_start"):
-                    warnings.append(
-                        f"⚠ '{f['name']}': {enzyme} overhang length ({oh_len}bp) is not divisible by 3 — "
-                        f"check that the destination vector's linker absorbs this offset (MoClo-style CD "
-                        f"vectors do; ad-hoc designs may not)"
-                    )
+    # The proper frame check happens above, in vec_tag_info["orf_check"]. If
+    # that check ran and failed, surface it once here (per assembly, not per
+    # fragment — the check is on the assembled construct). If it wasn't run
+    # (no precut vector to build the assembly against), stay silent rather
+    # than emit the old `overhang_len % 3` false-positive.
+    orf_check = vec_tag_info.get("orf_check") if vec_tag_info else None
+    if orf_check is not None and not orf_check["ok"]:
+        # Only surface if a fragment has remove_stop/remove_start (i.e. the
+        # user intends a fusion — for non-fusion designs a downstream stop is
+        # actually fine and a "frame failure" is meaningless).
+        any_fusion = any(f.get("remove_stop") or f.get("remove_start")
+                         for b in bins for f in b["fragments"])
+        if any_fusion:
+            warnings.append(f"⚠ Assembled ORF frame check failed: {orf_check['reason']}")
 
     # ── Vector primers (if provided and NOT pre-cut)
     vec_primers = None

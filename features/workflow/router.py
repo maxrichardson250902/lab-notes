@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import json, re, uuid, threading, os, html as html_lib
 
 from core.database import register_table, register_seed, ensure_column, get_db
@@ -58,6 +58,58 @@ register_table("workflow_migration_log", """CREATE TABLE IF NOT EXISTS workflow_
     migrated_at TEXT NOT NULL)""")
 
 
+def _build_block_from_entry(time_: str, etype: str, content: str,
+                            group: str, fmt: str) -> str:
+    """Turn a single workflow_entries row into the same block HTML the migration
+    would produce. Used both by the migration and by the Read-mode range
+    endpoint (when a date has workflow_entries but no day_document yet)."""
+    fmt = (fmt or 'plain').lower()
+    tag_attr = f' data-groups="{html_lib.escape(group)}"' if group else ''
+    time_chip = (f'<span class="wf-time" contenteditable="false">'
+                 f'{html_lib.escape((time_ or "").strip())}</span> ') if time_ else ''
+    cls = 'wf-block'
+    if etype == 'task_done':
+        cls += ' wf-task-done'
+    elif etype == 'protocol_run':
+        cls += ' wf-protocol'
+
+    if fmt == 'html':
+        body = re.sub(r'^<div class="wf-rich-render">', '', content or '')
+        body = re.sub(r'</div>\s*$', '', body)
+        return f'<div class="{cls}"{tag_attr}>{time_chip}{body}</div>'
+    else:
+        safe = html_lib.escape(content or '').replace('\n', '<br>')
+        return f'<p class="{cls}"{tag_attr}>{time_chip}{safe}</p>'
+
+
+def _synth_day_html_from_entries(conn, date: str) -> str:
+    """Concat all workflow_entries for a date into a day_document-shaped HTML
+    string, without touching the DB. Returns '' if no entries.
+
+    This is what the migration produces, minus the writes — used by Read mode
+    to render dates whose workflow_entries haven't been migrated yet."""
+    entries = conn.execute(
+        "SELECT time, type, content, group_name, format "
+        "FROM workflow_entries WHERE date=? ORDER BY time ASC, created ASC",
+        (date,)
+    ).fetchall()
+    blocks = []
+    for e in entries:
+        time_ = e['time'] if hasattr(e, 'keys') else e[0]
+        etype = e['type'] if hasattr(e, 'keys') else e[1]
+        content = e['content'] if hasattr(e, 'keys') else e[2]
+        group = e['group_name'] if hasattr(e, 'keys') else e[3]
+        fmt = e['format'] if hasattr(e, 'keys') else e[4]
+        blocks.append(_build_block_from_entry(time_, etype, content, group, fmt))
+    # Include any day_scratch content, matching the migration's behaviour.
+    scratch = conn.execute("SELECT content FROM day_scratch WHERE date=?", (date,)).fetchone()
+    if scratch:
+        sc = scratch[0] if not hasattr(scratch, 'keys') else scratch['content']
+        if sc:
+            blocks.append(f'<div class="wf-block wf-block-scratch">{sc}</div>')
+    return '\n'.join(blocks)
+
+
 def _migrate_entries_to_documents(conn):
     """For each date with workflow_entries but no entry in workflow_migration_log,
     concat its entries into a day_documents row. Idempotent — re-runs are no-ops.
@@ -83,38 +135,12 @@ def _migrate_entries_to_documents(conn):
 
         blocks = []
         for e in entries:
-            time_ = (e['time'] or '').strip() if hasattr(e, 'keys') else (e[0] or '').strip()
+            time_ = e['time'] if hasattr(e, 'keys') else e[0]
             etype = e['type'] if hasattr(e, 'keys') else e[1]
             content = e['content'] if hasattr(e, 'keys') else e[2]
             group = e['group_name'] if hasattr(e, 'keys') else e[3]
-            fmt = (e['format'] if hasattr(e, 'keys') else e[4]) or 'plain'
-
-            # Build the block. Wrap plain content in <p>, html content as-is in a <div>.
-            tag_attr = f' data-groups="{html_lib.escape(group)}"' if group else ''
-            time_chip = f'<span class="wf-time" contenteditable="false">{html_lib.escape(time_)}</span> ' if time_ else ''
-
-            if fmt == 'html':
-                # Strip any wrapping div the renderer added (defensive)
-                body = re.sub(r'^<div class="wf-rich-render">', '', content or '')
-                body = re.sub(r'</div>\s*$', '', body)
-                # If task/protocol type, mark them so the new UI can colour-code
-                cls = 'wf-block'
-                if etype == 'task_done':
-                    cls += ' wf-task-done'
-                elif etype == 'protocol_run':
-                    cls += ' wf-protocol'
-                blocks.append(f'<div class="{cls}"{tag_attr}>{time_chip}{body}</div>')
-            else:
-                # Plain — escape and wrap in <p>
-                safe = html_lib.escape(content or '')
-                # preserve newlines as <br>
-                safe = safe.replace('\n', '<br>')
-                cls = 'wf-block'
-                if etype == 'task_done':
-                    cls += ' wf-task-done'
-                elif etype == 'protocol_run':
-                    cls += ' wf-protocol'
-                blocks.append(f'<p class="{cls}"{tag_attr}>{time_chip}{safe}</p>')
+            fmt = e['format'] if hasattr(e, 'keys') else e[4]
+            blocks.append(_build_block_from_entry(time_, etype, content, group, fmt))
 
         # Also append any existing day_scratch content (preserving the previous round's work).
         scratch = conn.execute("SELECT content FROM day_scratch WHERE date=?", (date,)).fetchone()
@@ -174,6 +200,7 @@ _ALLOWED_TAGS = {
     "table", "thead", "tbody", "tr", "td", "th",
     "img", "a",
     "blockquote",
+    "del", "s",  # track-changes: strikethrough for retroactive deletions
 }
 # Attributes allowed per tag. Anything else is stripped silently.
 _ALLOWED_ATTRS = {
@@ -490,6 +517,186 @@ def get_document(date: str):
     return {"date": date, "content": row["content"], "updated": row["updated"]}
 
 
+# ── Read-mode support: fetch a range of day_documents in one shot ────────────
+# The Workflow view's "Read" mode renders a scrolling book of past days. Rather
+# than 30 round-trips, one endpoint returns the whole window. `end` is the
+# newest date in the window; `days` is how many to include walking backwards.
+# Empty days (no day_document row) are OMITTED — the client renders only days
+# that actually have content, so gaps don't create empty page-eating dividers.
+
+@router.get("/workflow/documents/range")
+def get_document_range(end: str, days: int = 30):
+    """Return all day content in the window [end - days + 1, end], newest
+    first. Prefers day_documents rows; falls back to synthesising HTML from
+    workflow_entries for dates that haven't been migrated yet (either because
+    the app hasn't restarted since they were added, or because they were
+    added by the legacy addWorkflowNote flow that still writes to
+    workflow_entries directly).
+
+    Only dates with actual content are included."""
+    try:
+        end_dt = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "end must be YYYY-MM-DD")
+    if days < 1 or days > 366:
+        raise HTTPException(400, "days must be between 1 and 366")
+    start_dt = end_dt - timedelta(days=days - 1)
+    start_s = start_dt.strftime("%Y-%m-%d")
+
+    with get_db() as conn:
+        # Pull day_documents rows for the window
+        doc_rows = conn.execute(
+            "SELECT date, content, updated FROM day_documents "
+            "WHERE date >= ? AND date <= ? AND content != ''",
+            (start_s, end),
+        ).fetchall()
+        by_date = {r["date"]: (r["content"], r["updated"]) for r in doc_rows}
+
+        # Also find dates with workflow_entries in the window that DON'T have a
+        # day_document — those need on-the-fly synthesis.
+        we_dates = conn.execute(
+            "SELECT DISTINCT date FROM workflow_entries "
+            "WHERE date >= ? AND date <= ? "
+            "AND date NOT IN (SELECT date FROM day_documents WHERE content != '') "
+            "ORDER BY date DESC",
+            (start_s, end),
+        ).fetchall()
+
+        for r in we_dates:
+            date = r["date"]
+            synth = _synth_day_html_from_entries(conn, date)
+            if synth:
+                # Mark synthesised content with `updated=None` so the client
+                # can tell it wasn't loaded from a day_document. (Purely
+                # informational — not used to gate rendering.)
+                by_date[date] = (synth, None)
+
+    documents = [
+        {"date": d, "content": c, "updated": u, "source": "day_document" if u else "synth_workflow_entries"}
+        for d, (c, u) in by_date.items()
+    ]
+    documents.sort(key=lambda x: x["date"], reverse=True)  # newest first
+    return {
+        "start": start_s,
+        "end": end,
+        "days": days,
+        "documents": documents,
+    }
+
+
+@router.get("/workflow/documents/dates-with-content")
+def dates_with_content(start: str, end: str):
+    """Return the set of dates in [start, end] that have content — either as
+    a day_document row or as workflow_entries. Used by the calendar picker
+    to mark populated days."""
+    try:
+        datetime.strptime(start, "%Y-%m-%d")
+        datetime.strptime(end, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "start and end must be YYYY-MM-DD")
+    with get_db() as conn:
+        dd = conn.execute(
+            "SELECT date FROM day_documents "
+            "WHERE date >= ? AND date <= ? AND content != ''",
+            (start, end),
+        ).fetchall()
+        we = conn.execute(
+            "SELECT DISTINCT date FROM workflow_entries "
+            "WHERE date >= ? AND date <= ?",
+            (start, end),
+        ).fetchall()
+    dates = sorted({r["date"] for r in dd} | {r["date"] for r in we})
+    return {"dates": dates}
+
+
+# ── Project / group listing + block-by-group extraction ─────────────────────
+# These back the active-project selector in workflow view and the notebook
+# view's read-from-tagged-blocks rewrite.
+
+@router.get("/workflow/projects")
+def list_known_projects():
+    """Return the union of project/group names known anywhere in the data:
+    - entries.group_name  (Process Day output; legacy)
+    - workflow_entries.group_name  (legacy input pathway)
+    - data-groups attributes across all day_documents.content
+    Also reports how many day_documents currently contain each group. Sorted
+    by day count desc, then name asc."""
+    groups: dict[str, int] = {}
+    with get_db() as conn:
+        for r in conn.execute("SELECT DISTINCT group_name FROM entries WHERE group_name IS NOT NULL AND group_name != ''"):
+            groups.setdefault(r["group_name"], 0)
+        for r in conn.execute("SELECT DISTINCT group_name FROM workflow_entries WHERE group_name IS NOT NULL AND group_name != ''"):
+            groups.setdefault(r["group_name"], 0)
+        # Scan day_documents.content for data-groups attributes. This is coarse
+        # but effective — the sanitizer only lets data-groups sit on block-level
+        # tags, so a substring hit is a real tag.
+        for r in conn.execute("SELECT date, content FROM day_documents WHERE content != ''"):
+            seen_in_this_day: set[str] = set()
+            for m in re.finditer(r'data-groups="([^"]+)"', r["content"]):
+                for g in m.group(1).split(","):
+                    g = g.strip()
+                    if g and g not in seen_in_this_day:
+                        seen_in_this_day.add(g)
+                        groups[g] = groups.get(g, 0) + 1
+    items = [{"name": n, "day_count": c} for n, c in groups.items()]
+    items.sort(key=lambda x: (-x["day_count"], x["name"].lower()))
+    return {"projects": items}
+
+
+@router.get("/workflow/blocks-by-group")
+def blocks_by_group(group: str, limit: int = 200):
+    """For the given project/group name, walk day_documents newest first and
+    return the matching top-level blocks per day. Also falls back to
+    workflow_entries synthesis for dates without a day_document, so
+    unmigrated legacy days still show up.
+
+    Returns {"group": str, "days": [{"date": str, "blocks": [html, ...]}]}.
+    Days without any matching block are omitted."""
+    if not group.strip():
+        raise HTTPException(400, "group is required")
+    group = group.strip()
+    if limit < 1 or limit > 5000:
+        raise HTTPException(400, "limit out of range")
+
+    days: dict[str, list[str]] = {}
+    with get_db() as conn:
+        # 1) day_documents — the primary source
+        for r in conn.execute(
+            "SELECT date, content FROM day_documents WHERE content != '' ORDER BY date DESC LIMIT ?",
+            (limit,)
+        ):
+            hits = _extract_blocks_html_for_group(r["content"], group)
+            if hits:
+                days[r["date"]] = hits
+        # 2) workflow_entries fallback for dates NOT in day_documents. Only
+        # entries whose group_name matches — no block scanning needed.
+        we_dates = conn.execute(
+            "SELECT DISTINCT date FROM workflow_entries "
+            "WHERE group_name = ? AND date NOT IN "
+            "(SELECT date FROM day_documents WHERE content != '') "
+            "ORDER BY date DESC LIMIT ?",
+            (group, limit)
+        ).fetchall()
+        for r in we_dates:
+            synth = _synth_day_html_from_entries(conn, r["date"])
+            if not synth:
+                continue
+            hits = _extract_blocks_html_for_group(synth, group)
+            if not hits:
+                # workflow_entries may have carried the group in `group_name`
+                # while the synthesised HTML doesn't (blocks with no
+                # data-groups). Show the whole synthesised day in that case
+                # rather than lose the content.
+                hits = [synth]
+            days[r["date"]] = hits
+
+    out = sorted(days.items(), key=lambda x: x[0], reverse=True)
+    return {
+        "group": group,
+        "days": [{"date": d, "blocks": b} for d, b in out],
+    }
+
+
 class DocumentUpdate(BaseModel):
     content: str
 
@@ -580,6 +787,30 @@ def _extract_blocks_for_llm(html: str) -> list[dict]:
             blocks.append({'groups': groups, 'text': text})
         pos = m.end()
     return blocks
+
+
+def _extract_blocks_html_for_group(html: str, target_group: str) -> list[str]:
+    """Same top-level block parser as _extract_blocks_for_llm, but returns the
+    RAW HTML of each matching block (not plain text) so the client can render
+    it faithfully in the notebook view. Case-sensitive group match. Blocks
+    with no data-groups attribute are never matched (they're "untagged", not
+    "everything")."""
+    if not html or not target_group:
+        return []
+    pattern = re.compile(
+        r'<(?P<tag>div|p|ul|ol|table|pre|blockquote|h3|h4)'
+        r'(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)\s*>',
+        re.IGNORECASE | re.DOTALL
+    )
+    out = []
+    for m in pattern.finditer(html):
+        grp_m = re.search(r'data-groups="([^"]*)"', m.group('attrs') or '')
+        if not grp_m:
+            continue
+        groups = [g.strip() for g in grp_m.group(1).split(',') if g.strip()]
+        if target_group in groups:
+            out.append(m.group(0))
+    return out
 
 
 # ── Image upload + serve ─────────────────────────────────────────────────────

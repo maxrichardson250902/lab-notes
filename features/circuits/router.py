@@ -120,14 +120,19 @@ def parse_genbank(filepath: str) -> dict:
             feat.qualifiers.get("ApEinfo_fwdcolor", [None])[0]
             or FEATURE_COLORS.get(feat.type, "#95A5A6")
         )
-        annotations.append({
-            "name": name,
-            "start": int(feat.location.start),
-            "end": int(feat.location.end),
-            "direction": 1 if feat.location.strand == 1 else -1,
-            "color": color,
-            "type": feat.type,
-        })
+        # Iterate parts so origin-wrapping features (CompoundLocation) render as
+        # two adjacent segments instead of one huge bar spanning the whole plasmid.
+        # A plain FeatureLocation exposes a one-item .parts list, so this handles
+        # both cases uniformly.
+        for part in feat.location.parts:
+            annotations.append({
+                "name": name,
+                "start": int(part.start),
+                "end": int(part.end),
+                "direction": 1 if feat.location.strand == 1 else -1,
+                "color": color,
+                "type": feat.type,
+            })
 
     return {
         "name": rec.name or rec.id or "Unknown",

@@ -112,7 +112,13 @@ def quality_trim(bases, quals, threshold=20, window=10):
 # ── Reference parsing ────────────────────────────────────
 
 def parse_gb_annotations(record):
-    """Extract all meaningful annotations from a BioPython SeqRecord."""
+    """Extract all meaningful annotations from a BioPython SeqRecord.
+
+    Iterates location.parts so that features written as a CompoundLocation
+    (origin-wrapping features on circular sequences) emit one annotation per
+    part instead of collapsing to the outer [min_start, max_end] bounds, which
+    would visually paint a single feature across the whole plasmid.
+    """
     annos = []
     seen = set()  # deduplicate overlapping gene/CDS with same label+span
     for feat in record.features:
@@ -127,28 +133,34 @@ def parse_gb_annotations(record):
                 break
         if not label:
             label = feat.type
-        try:
-            start = int(feat.location.start)
-            end = int(feat.location.end)
-        except Exception:
-            continue
-        if end <= start:
-            continue
-        # Deduplicate: if a gene and CDS share the same label and span, keep one
-        key = (label, start, end)
-        if key in seen:
-            continue
-        seen.add(key)
-        # Map SnapGene/ApE feature types to standard types
+        strand = feat.location.strand
+        color = _get_feat_color(feat)
         ftype = feat.type
-        annos.append({
-            "type": ftype,
-            "label": label,
-            "start": start,
-            "end": end,
-            "strand": feat.location.strand,
-            "color": _get_feat_color(feat),
-        })
+        # A plain FeatureLocation exposes a one-item .parts list, so this
+        # handles both plain and compound locations uniformly.
+        for part in feat.location.parts:
+            try:
+                start = int(part.start)
+                end = int(part.end)
+            except Exception:
+                continue
+            if end <= start:
+                continue
+            # Deduplicate: if a gene and CDS share the same label and span, keep one.
+            # Dedup is per-part-span, so the two halves of a wrapping feature aren't
+            # collapsed into a single row.
+            key = (label, start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            annos.append({
+                "type": ftype,
+                "label": label,
+                "start": start,
+                "end": end,
+                "strand": strand,
+                "color": color,
+            })
     return annos
 
 
@@ -163,9 +175,17 @@ def _get_feat_color(feat):
     return None
 
 
+def _is_circular(record):
+    """Read topology from a BioPython SeqRecord. Defaults to linear if unset."""
+    topo = record.annotations.get("topology", "linear")
+    return isinstance(topo, str) and topo.lower() == "circular"
+
+
 def get_reference_sequence(ref_source, ref_id=None, ref_text=None):
-    """Get reference sequence, name, and annotations."""
+    """Get reference sequence, name, annotations, and topology flag.
+    Returns (seq_str, name, annotations_list, is_circular_bool)."""
     annotations = []
+    is_circular = False
     # Handle inventory items — ref_source is the table name, ref_id is the row id
     INVENTORY_TABLES = {"plasmids", "gblocks", "kit_parts", "parts", "primers"}
     # Map table name to singular prefix used in file naming
@@ -195,17 +215,19 @@ def get_reference_sequence(ref_source, ref_id=None, ref_text=None):
             raise HTTPException(404, f".gb file not found for {ref_source} id {ref_id}")
         record = SeqIO.read(gb_path, "genbank")
         annotations = parse_gb_annotations(record)
-        return str(record.seq), row["name"] or record.name or f"{ref_source}_{ref_id}", annotations
+        is_circular = _is_circular(record)
+        return str(record.seq), row["name"] or record.name or f"{ref_source}_{ref_id}", annotations, is_circular
     elif ref_source == "fasta" and ref_text:
         record = SeqIO.read(io.StringIO(ref_text), "fasta")
-        return str(record.seq), record.id, annotations
+        return str(record.seq), record.id, annotations, False
     elif ref_source == "genbank" and ref_text:
         record = SeqIO.read(io.StringIO(ref_text), "genbank")
         annotations = parse_gb_annotations(record)
-        return str(record.seq), record.name or record.id, annotations
+        is_circular = _is_circular(record)
+        return str(record.seq), record.name or record.id, annotations, is_circular
     elif ref_source == "raw" and ref_text:
         seq = ref_text.strip().upper().replace("\n", "").replace(" ", "")
-        return seq, "manual_sequence", annotations
+        return seq, "manual_sequence", annotations, False
     raise HTTPException(400, "Invalid reference source")
 
 
@@ -274,26 +296,120 @@ def reverse_complement(seq):
     return seq.translate(COMP)[::-1]
 
 
-def do_alignment(query_seq, ref_seq):
-    """Try both forward and reverse complement, return best."""
-    fwd = _do_align(query_seq, ref_seq)
-    rc_seq = reverse_complement(query_seq)
-    rev = _do_align(rc_seq, ref_seq)
+def _split_wrap_alignment(result, ref_len):
+    """Take a single alignment result computed against a DOUBLED reference and
+    return a list of pieces normalised to real ref coordinates [0, ref_len).
+
+    Three cases:
+      (a) Alignment sits entirely in the first copy → 1 piece, unchanged.
+      (b) Alignment sits entirely in the second copy → 1 piece, coords - ref_len.
+      (c) Alignment spans the origin (ref_start < ref_len <= ref_end) → 2 pieces:
+          piece 1 covers [ref_start, ref_len), piece 2 covers [0, ref_end - ref_len).
+    """
+    rs = int(result["ref_start"])
+    re = int(result["ref_end"])
+
+    # Case (a): all in first copy
+    if re <= ref_len:
+        return [result]
+
+    # Case (b): all in second copy → shift coords back
+    if rs >= ref_len:
+        result["ref_start"] = rs - ref_len
+        result["ref_end"] = re - ref_len
+        return [result]
+
+    # Case (c): wraps origin. Walk aligned strings to find the column where
+    # ref position transitions from ref_len-1 to ref_len.
+    aligned_ref = result["aligned_ref"]
+    aligned_query = result["aligned_query"]
+    ref_pos = rs
+    split_col = None
+    for i, ch in enumerate(aligned_ref):
+        if ref_pos == ref_len:
+            split_col = i
+            break
+        if ch != "-":
+            ref_pos += 1
+    if split_col is None:
+        # Shouldn't happen given rs < ref_len <= re, but be defensive.
+        result["ref_start"] = rs
+        result["ref_end"] = re if re <= ref_len else ref_len
+        return [result]
+
+    # Where does the query position stand at split_col?
+    q_at_split = int(result["query_start"])
+    for i in range(split_col):
+        if aligned_query[i] != "-":
+            q_at_split += 1
+
+    def _stats(ref_str, qry_str, r_start, r_end, q_start, q_end):
+        matches = sum(1 for a, b in zip(ref_str, qry_str) if a == b and a != "-")
+        mismatches = sum(1 for a, b in zip(ref_str, qry_str)
+                         if a != b and a != "-" and b != "-")
+        gaps = ref_str.count("-") + qry_str.count("-")
+        total = matches + mismatches
+        identity = (matches / total * 100) if total > 0 else 0.0
+        return {
+            "aligned_ref": ref_str,
+            "aligned_query": qry_str,
+            "score": result["score"],  # share the aligner's score across pieces
+            "identity_pct": round(identity, 2),
+            "num_mismatches": mismatches,
+            "num_gaps": gaps,
+            "ref_start": int(r_start),
+            "ref_end": int(r_end),
+            "query_start": int(q_start),
+            "query_end": int(q_end),
+        }
+
+    piece1 = _stats(
+        aligned_ref[:split_col], aligned_query[:split_col],
+        rs, ref_len, int(result["query_start"]), q_at_split,
+    )
+    piece2 = _stats(
+        aligned_ref[split_col:], aligned_query[split_col:],
+        0, re - ref_len, q_at_split, int(result["query_end"]),
+    )
+    return [piece1, piece2]
+
+
+def do_alignment(query_seq, ref_seq, is_circular=False):
+    """Try forward and reverse-complement alignment, pick the best.
+
+    For circular references, aligns against a DOUBLED reference (ref+ref) so
+    reads that span the origin get a single contiguous alignment; then splits
+    origin-spanning hits into two pieces normalised to real ref coordinates.
+
+    Returns a list of alignment pieces (list of 1 for normal cases, list of 2
+    when a read spans the origin), or None if no alignment could be found.
+    Each piece dict has 'is_reverse' set.
+    """
+    if is_circular:
+        ref_len = len(ref_seq)
+        target = ref_seq + ref_seq
+        fwd = _do_align(query_seq, target)
+        rc_seq = reverse_complement(query_seq)
+        rev = _do_align(rc_seq, target)
+    else:
+        ref_len = None
+        fwd = _do_align(query_seq, ref_seq)
+        rc_seq = reverse_complement(query_seq)
+        rev = _do_align(rc_seq, ref_seq)
 
     if fwd and rev:
-        result = fwd if fwd["score"] >= rev["score"] else rev
+        picked, is_rev = (fwd, False) if fwd["score"] >= rev["score"] else (rev, True)
     elif fwd:
-        result = fwd
+        picked, is_rev = fwd, False
     elif rev:
-        result = rev
+        picked, is_rev = rev, True
     else:
         return None
 
-    if result is rev and rev is not None:
-        result["is_reverse"] = True
-    else:
-        result["is_reverse"] = False
-    return result
+    pieces = _split_wrap_alignment(picked, ref_len) if is_circular else [picked]
+    for p in pieces:
+        p["is_reverse"] = is_rev
+    return pieces
 
 
 def _do_align(query_seq, ref_seq):
@@ -475,7 +591,9 @@ async def align_ab1(
     trim_qual: Optional[int] = Form(20),
 ):
     try:
-        ref_seq, ref_label, ref_annos = get_reference_sequence(ref_source, ref_id, ref_text)
+        ref_seq, ref_label, ref_annos, is_circular = get_reference_sequence(
+            ref_source, ref_id, ref_text
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -529,39 +647,45 @@ async def align_ab1(
                 errors.append({"file": file.filename, "error": "No bases left after trimming"})
                 continue
 
-        result = do_alignment(query_seq, ref_seq)
-        if not result:
+        pieces = do_alignment(query_seq, ref_seq, is_circular=is_circular)
+        if not pieces:
             ab1_path.unlink(missing_ok=True)
             errors.append({"file": file.filename, "error": "No valid alignment"})
             continue
 
-        aln_name = safe_name.replace(".ab1", "").replace(".abi", "")
+        base_name = safe_name.replace(".ab1", "").replace(".abi", "")
         if name and len(ab1) == 1:
-            aln_name = name
-        is_rev = 1 if result.get("is_reverse") else 0
+            base_name = name
+        is_rev = 1 if pieces[0].get("is_reverse") else 0
         if is_rev:
-            aln_name += " (RC)"
+            base_name += " (RC)"
 
-        with get_db() as conn:
-            cur = conn.execute(
-                """INSERT INTO sanger_alignments
-                   (batch_id, name, ab1_filename, ref_source, ref_name, identity_pct,
-                    aligned_query, aligned_ref, alignment_score,
-                    query_start, query_end, ref_start, ref_end,
-                    num_mismatches, num_gaps, is_reverse, trim_start, trim_end, created)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (batch_id, aln_name, stored_name, ref_source, ref_label,
-                 result["identity_pct"], result["aligned_query"], result["aligned_ref"],
-                 result["score"], result["query_start"], result["query_end"],
-                 result["ref_start"], result["ref_end"],
-                 result["num_mismatches"], result["num_gaps"], is_rev,
-                 trim_start_idx, trim_end_idx, now),
-            )
-            conn.commit()
-            row = dict(conn.execute(
-                "SELECT * FROM sanger_alignments WHERE id=?", (cur.lastrowid,)
-            ).fetchone())
-        results.append(row)
+        # One DB row per piece; origin-split reads become 2 rows sharing an AB1.
+        for idx, piece in enumerate(pieces):
+            piece_name = base_name
+            if len(pieces) > 1:
+                piece_name = f"{base_name} (part {idx + 1}/{len(pieces)})"
+
+            with get_db() as conn:
+                cur = conn.execute(
+                    """INSERT INTO sanger_alignments
+                       (batch_id, name, ab1_filename, ref_source, ref_name, identity_pct,
+                        aligned_query, aligned_ref, alignment_score,
+                        query_start, query_end, ref_start, ref_end,
+                        num_mismatches, num_gaps, is_reverse, trim_start, trim_end, created)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (batch_id, piece_name, stored_name, ref_source, ref_label,
+                     piece["identity_pct"], piece["aligned_query"], piece["aligned_ref"],
+                     piece["score"], piece["query_start"], piece["query_end"],
+                     piece["ref_start"], piece["ref_end"],
+                     piece["num_mismatches"], piece["num_gaps"], is_rev,
+                     trim_start_idx, trim_end_idx, now),
+                )
+                conn.commit()
+                row = dict(conn.execute(
+                    "SELECT * FROM sanger_alignments WHERE id=?", (cur.lastrowid,)
+                ).fetchone())
+            results.append(row)
 
     if not results and errors:
         raise HTTPException(400, f"All files failed: {errors[0]['error']}")
@@ -614,7 +738,15 @@ def delete_alignment(aid: int):
         ).fetchone()
         if not row:
             raise HTTPException(404, "Alignment not found")
-        (AB1_DIR / row["ab1_filename"]).unlink(missing_ok=True)
+        ab1_filename = row["ab1_filename"]
         conn.execute("DELETE FROM sanger_alignments WHERE id=?", (aid,))
+        # Only remove the AB1 file if no sibling alignment still references it
+        # (origin-split reads produce two rows sharing one AB1).
+        still_used = conn.execute(
+            "SELECT 1 FROM sanger_alignments WHERE ab1_filename=? LIMIT 1",
+            (ab1_filename,),
+        ).fetchone()
+        if not still_used:
+            (AB1_DIR / ab1_filename).unlink(missing_ok=True)
         conn.commit()
     return {"ok": True}

@@ -244,8 +244,9 @@ def _call_llamacpp_ssh(system: str, prompt: str, max_tokens: int) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-def call_llm_3090(system: str, prompt: str, max_tokens: int = 300) -> str:
-    """Unified LLM call — routes to Ollama or llama.cpp depending on backend."""
+def _call_3090_backend(system: str, prompt: str, max_tokens: int = 300) -> str:
+    """Pure 3090 LLM call — routes to Ollama or llama.cpp depending on backend.
+    (Was `call_llm_3090`; renamed so call_llm_3090 can be a backend dispatcher.)"""
     global active_backend
 
     if not active_backend:
@@ -259,6 +260,44 @@ def call_llm_3090(system: str, prompt: str, max_tokens: int = 300) -> str:
         return _call_llamacpp_ssh(system, prompt, max_tokens)
     else:
         raise RuntimeError("No LLM backend available — is the 3090 on?")
+
+
+def call_llm_3090(system: str, prompt: str, max_tokens: int = 300) -> str:
+    """Backend dispatcher. Despite the historical name, this routes to whichever
+    LLM backend is selected in Settings:
+
+        "claude" → Anthropic API (falls back to the 3090 if the daily spend
+                   ceiling is reached or no API key is configured)
+        "3090"   → local 3090 (Ollama / llama.cpp), the original behaviour
+        "local"  → same local 3090 path (kept as an explicit alias)
+
+    Every existing caller already imports `call_llm_3090`, so they all pick up
+    backend selection for free without any change to the feature files."""
+    backend = "3090"
+    try:
+        from core.claude import current_backend
+        backend = current_backend()
+    except Exception:
+        backend = "3090"
+
+    if backend == "claude":
+        try:
+            from core.claude import call_claude, CapReachedError, ClaudeNotConfigured
+            try:
+                elog("Calling Claude API...")
+                return call_claude(system, prompt, max_tokens)
+            except CapReachedError:
+                elog("Claude daily budget ceiling reached — falling back to 3090")
+                return _call_3090_backend(system, prompt, max_tokens)
+            except ClaudeNotConfigured:
+                elog("ANTHROPIC_API_KEY not set — falling back to 3090")
+                return _call_3090_backend(system, prompt, max_tokens)
+        except Exception as e:
+            elog(f"Claude backend error ({e}) — falling back to 3090")
+            return _call_3090_backend(system, prompt, max_tokens)
+
+    # "3090" / "local" / anything else → local path
+    return _call_3090_backend(system, prompt, max_tokens)
 
 
 def title_similarity(a: str, b: str) -> float:
