@@ -1,13 +1,12 @@
 """Protocols feature - protocol library with manual entry, Claude round-trip import,
 recipe tables, and run history."""
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
-import json, re, io
+import json, re
 
 from core.database import register_table, register_seed, ensure_column, get_db
-from core.llm import fetch_url_text  # HTTP scrape helper, not an LLM call
 
 register_table("protocols", """CREATE TABLE IF NOT EXISTS protocols (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,54 +67,13 @@ def _migrate():
 _migrate()
 
 # --------------------------------------------------------------------------- #
-#  Claude round-trip helpers
+#  Claude import helpers
 #
-#  Flow: user hits "Copy Claude prompt" on a protocol → clipboard gets the
-#  template + source_text below. User pastes into Claude chat, Claude returns
-#  a delimited block. User pastes that back via "Import from Claude", which
-#  parses steps + recipe tables + notes and updates the protocol.
+#  Flow: user pastes Claude's formatted output (steps + recipe tables + notes,
+#  each in a delimited block) into either "From Claude" on the create panel
+#  or "Import from Claude" on an existing protocol. The parser below splits
+#  those blocks into the shapes stored in the `steps` and `recipe` columns.
 # --------------------------------------------------------------------------- #
-
-CLAUDE_PROMPT_TEMPLATE = """You are formatting a lab protocol for import into a lab notebook system.
-Read the source protocol below and output ONLY the formatted block, using
-these exact delimiters:
-
-=== STEPS ===
-Numbered list, one step per line. Keep steps atomic and imperative.
-
-=== RECIPES ===
-For each table in the protocol (master mix, thermocycler program, buffer,
-gel loading, etc.), output a level-2 markdown header with the table name
-followed by a standard markdown table. Example:
-
-## Master Mix
-| Component | Stock conc. | Volume (uL) | Final conc. |
-|-----------|-------------|-------------|-------------|
-| Buffer    | 10x         | 2           | 1x          |
-
-=== NOTES ===
-Any warnings, tips, or context worth preserving. Free text.
-
-Rules:
-- Do not invent volumes, concentrations, temperatures, or times not present
-  in the source. If a value is missing, leave the cell blank or write "?".
-- Do not add commentary before or after the delimited block.
-- If a section has no content, still include the delimiter with nothing under it.
-
---- SOURCE PROTOCOL ---
-"""
-
-def _clean_source_text(text: str, truncate: int = 0) -> str:
-    """Strip HTML/entities. Pass truncate>0 to limit length."""
-    if not text:
-        return ""
-    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL)
-    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.DOTALL)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'&nbsp;', ' ', text)
-    text = re.sub(r'&[a-z]+;', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text[:truncate] if truncate else text
 
 
 def _split_claude_sections(formatted: str) -> dict:
@@ -219,49 +177,6 @@ def _parse_recipes_block(block: str) -> Optional[str]:
         return json.dumps(tables[0])
     return json.dumps(tables)
 
-async def _text_from_upload(file: UploadFile) -> str:
-    content = await file.read()
-    fname = (file.filename or "").lower()
-    if fname.endswith(".pdf"):
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(io.BytesIO(content))
-            return " ".join(page.extract_text() or "" for page in reader.pages)
-        except ImportError:
-            raise HTTPException(400, "pypdf not installed")
-    if fname.endswith(".docx"):
-        try:
-            import docx
-            from docx.oxml.ns import qn
-            doc = docx.Document(io.BytesIO(content))
-            lines = []
-            for p in doc.paragraphs:
-                t = p.text.strip()
-                if t:
-                    lines.append(t)
-            for table in doc.tables:
-                for row in table.rows:
-                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
-                    if cells:
-                        lines.append(" | ".join(cells))
-            for el in doc.element.body.iter():
-                if el.tag == qn('w:txbxContent'):
-                    for child in el.iter(qn('w:t')):
-                        t = (child.text or "").strip()
-                        if t:
-                            lines.append(t)
-            extracted = "\n".join(lines).strip()
-            if not extracted:
-                raise HTTPException(400, "Could not extract text from this .docx")
-            return extracted
-        except HTTPException:
-            raise
-        except ImportError:
-            raise HTTPException(400, "python-docx not installed")
-        except Exception as e:
-            raise HTTPException(400, "Failed to read .docx: " + str(e))
-    return content.decode("utf-8", errors="ignore")
-
 DEFAULT_RECIPE = {
     "columns": ["Component", "Stock conc.", "Volume (uL)", "Final conc."],
     "rows": []
@@ -270,18 +185,11 @@ DEFAULT_RECIPE = {
 # --------------------------------------------------------------------------- #
 #  Models
 # --------------------------------------------------------------------------- #
-class CreateProtocol(BaseModel):
-    title: str
-    url:   Optional[str] = None
-    notes: str = ""
-    tags:  List[str] = []
-    auto_complete: str = "manual"
-
-class PasteProtocol(BaseModel):
-    title: str
-    text:  str
-    notes: str = ""
-    tags:  List[str] = []
+class ClaudeProtocol(BaseModel):
+    title:     str
+    formatted: str
+    notes:     str = ""
+    tags:      List[str] = []
     auto_complete: str = "manual"
 
 class ManualProtocol(BaseModel):
@@ -578,50 +486,54 @@ def cancel_active_run(run_id: str, body: CancelRunRequest):
         conn.commit()
     return {"cancelled": run_id, "entry_id": entry_id}
 
-@router.post("/protocols")
-async def create_from_url(body: CreateProtocol):
-    now = datetime.utcnow().isoformat()
-    source_text = ""
-    if body.url:
-        source_text = await fetch_url_text(body.url)
-        if source_text and source_text.startswith("Error"):
-            source_text = ""
-    with get_db() as conn:
-        cur = conn.execute(
-            "INSERT INTO protocols (title,source_type,url,source_text,steps,recipe,notes,tags,auto_complete,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (body.title, "url", body.url, source_text, None, json.dumps(DEFAULT_RECIPE), body.notes, json.dumps(body.tags), body.auto_complete, now, now))
-        conn.commit()
-        proto = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
-    return proto
+@router.post("/protocols/from-claude")
+async def create_from_claude(body: ClaudeProtocol):
+    """Create a protocol from a pasted Claude-formatted block.
 
-@router.post("/protocols/from-paste")
-async def create_from_paste(body: PasteProtocol):
+    Parses the same delimited format as POST /protocols/{id}/import-from-claude
+    (=== STEPS ===, === RECIPES ===, === NOTES ===) but into a brand-new row
+    rather than updating an existing one."""
     now = datetime.utcnow().isoformat()
-    with get_db() as conn:
-        cur = conn.execute(
-            "INSERT INTO protocols (title,source_type,url,source_text,steps,recipe,notes,tags,auto_complete,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (body.title, "paste", None, body.text[:50000], None, json.dumps(DEFAULT_RECIPE), body.notes, json.dumps(body.tags), body.auto_complete, now, now))
-        conn.commit()
-        proto = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
-    return proto
 
-@router.post("/protocols/from-file")
-async def create_from_file(
-    title: str = Form(...),
-    notes: str = Form(""),
-    tags:  str = Form("[]"),
-    auto_complete: str = Form("manual"),
-    file:  UploadFile = File(...),
-):
-    now         = datetime.utcnow().isoformat()
-    source_text = await _text_from_upload(file)
+    sections = _split_claude_sections(body.formatted)
+    if not any(sections.values()):
+        raise HTTPException(400,
+            "Could not find any === STEPS ===, === RECIPES ===, or === NOTES === "
+            "delimiters in the pasted text")
+
+    steps_json  = _parse_steps_block(sections["STEPS"])   if sections["STEPS"]   else json.dumps([])
+    recipe_json = _parse_recipes_block(sections["RECIPES"]) if sections["RECIPES"] else json.dumps(DEFAULT_RECIPE)
+
+    # Notes from the pasted block get merged with any notes the user typed in
+    # the form field (form notes come first, Claude notes appended).
+    combined_notes = body.notes.strip()
+    if sections["NOTES"].strip():
+        addition = sections["NOTES"].strip()
+        combined_notes = (combined_notes + "\n\n---\n\n" + addition) if combined_notes else addition
+
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO protocols (title,source_type,url,source_text,steps,recipe,notes,tags,auto_complete,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (title, "file", None, source_text[:50000], None, json.dumps(DEFAULT_RECIPE), notes, tags, auto_complete, now, now))
+            "INSERT INTO protocols (title,source_type,url,source_text,steps,recipe,notes,tags,auto_complete,created,updated) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (body.title, "claude", None, None, steps_json, recipe_json,
+             combined_notes, json.dumps(body.tags), body.auto_complete, now, now))
         conn.commit()
         proto = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
-    return proto
+
+    # Report counts so the UI toast can be specific.
+    try:
+        step_count = len(json.loads(steps_json))
+    except Exception:
+        step_count = 0
+    try:
+        r = json.loads(recipe_json) if recipe_json else None
+        table_count = len(r) if isinstance(r, list) else (1 if isinstance(r, dict) and r.get("columns") and r.get("rows") else 0)
+    except Exception:
+        table_count = 0
+
+    return {**proto, "steps_parsed": step_count, "tables_parsed": table_count,
+            "notes_appended": bool(sections["NOTES"].strip())}
+
 
 @router.post("/protocols/from-manual")
 async def create_manual(body: ManualProtocol):
@@ -661,19 +573,6 @@ def delete_protocol(protocol_id: int):
         conn.execute("DELETE FROM protocols WHERE id=?", (protocol_id,))
         conn.commit()
     return {"deleted": protocol_id}
-
-@router.get("/protocols/{protocol_id}/claude-prompt")
-def claude_prompt(protocol_id: int):
-    """Return a ready-to-paste prompt for Claude chat. Frontend clipboards it."""
-    with get_db() as conn:
-        row = conn.execute("SELECT * FROM protocols WHERE id=?", (protocol_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Not found")
-    p = dict(row)
-    source = _clean_source_text(p.get("source_text") or "")
-    if not source:
-        raise HTTPException(400, "No source text stored for this protocol")
-    return {"prompt": CLAUDE_PROMPT_TEMPLATE + source}
 
 
 class ImportFromClaude(BaseModel):

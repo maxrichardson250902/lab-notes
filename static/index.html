@@ -4844,7 +4844,7 @@ async function renderProtocols(el) {
 function _compactCard(p) {
   var tags = JSON.parse(p.tags||'[]');
   var hasSteps = p.steps && p.steps !== '[]' && p.steps !== 'null';
-  var icon = {manual:'&#9998;',file:'&#128196;',paste:'&#128203;'}[p.source_type] || '&#127760;';
+  var icon = {manual:'&#9998;',file:'&#128196;',paste:'&#128203;',claude:'&#10024;'}[p.source_type] || '&#127760;';
   return '<div class="pli'+(_activePanel===p.id?' selected':'')+'" id="pli-'+p.id+'" onclick="protoOpenPanel('+p.id+')">' +
     '<div class="pli-title">'+esc(p.title)+'</div><div class="pli-meta"><span>'+icon+'</span>'+
     (!hasSteps?'<span class="pli-badge no-steps">no steps</span>':'')+
@@ -4873,15 +4873,12 @@ function _panelBody(p) {
   h+='</div><div style="display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0">';
   h+='<button class="btn" style="color:#5b7a5e" onclick="protoOpenRun('+p.id+')">&#9654; Run</button>';
   h+='<button class="btn" onclick="protoEdit('+p.id+')">&#9998; Edit</button>';
-  if(p.source_type!=='manual') {
-    h+='<button class="btn" style="color:#5b7a5e" onclick="protoCopyClaudePrompt('+p.id+')" title="Copy prompt for Claude chat">&#128203; Copy Claude prompt</button>';
-    h+='<button class="btn" onclick="protoImportFromClaude('+p.id+')" title="Paste Claude&#39;s formatted output to update steps + tables">&#128228; Import from Claude</button>';
-  }
+  h+='<button class="btn" onclick="protoImportFromClaude('+p.id+')" title="Paste Claude&#39;s formatted output to overwrite steps + tables">&#128228; Import from Claude</button>';
   h+='<button class="btn" onclick="protoClone('+p.id+')">&#128464; Clone</button>';
   h+='<button class="btn" style="color:#c0392b" onclick="protoDelete('+p.id+')">&#128465; Delete</button>';
   h+='</div></div>';
   // steps
-  if(!hasSteps) h+='<div style="color:#8a7f72;font-size:13px;font-style:italic;margin-bottom:16px">No steps yet — extract or add manually.</div>';
+  if(!hasSteps) h+='<div style="color:#8a7f72;font-size:13px;font-style:italic;margin-bottom:16px">No steps yet — import from Claude or add manually.</div>';
   else if(isStructured) h+='<ol class="steps-list">'+steps.map(function(s){return '<li>'+_renderStepText(s.text)+(s.note?'<div style="font-size:11px;color:#8a7f72;margin:2px 0 4px;padding-left:4px;border-left:2px solid #e8e2d8">'+esc(s.note)+'</div>':'')+'</li>';}).join('')+'</ol>';
   else h+='<div class="steps-text">'+esc(p.steps)+'</div>';
   // recipe
@@ -4898,16 +4895,14 @@ function _panelBody(p) {
 // ── import UI ─────────────────────────────────────────────────────────────────
 function _buildImportUI() {
   return '<div class="proto-import-tabs">' +
-    '<button class="proto-tab active" onclick="protoTab(\'url\',this)">URL</button>' +
-    '<button class="proto-tab" onclick="protoTab(\'paste\',this)">Paste text</button>' +
-    '<button class="proto-tab" onclick="protoTab(\'file\',this)">Upload file</button>' +
+    '<button class="proto-tab active" onclick="protoTab(\'claude\',this)">From Claude</button>' +
     '<button class="proto-tab" onclick="protoTab(\'manual\',this)">Write manually</button></div>' +
-  '<div id="pt-url"><div class="proto-import-col"><div class="proto-import-row"><input type="text" id="proto-url" placeholder="https://www.protocols.io/..." spellcheck="false"/><input type="text" id="proto-title-url" placeholder="Protocol name" style="width:200px" spellcheck="false"/></div>' +
-    '<div style="font-size:11px;color:#8a7f72">Tags</div>'+_tagInputHTML('import-url',[])+'<div style="text-align:right"><button class="btn primary" onclick="protoAddUrl()">Fetch + Extract</button></div></div></div>' +
-  '<div id="pt-paste" style="display:none"><div class="proto-import-col"><input type="text" id="proto-title-paste" placeholder="Protocol name" spellcheck="false"/><textarea id="proto-paste-text" placeholder="Paste protocol text here..."></textarea>' +
-    '<div style="font-size:11px;color:#8a7f72">Tags</div>'+_tagInputHTML('import-paste',[])+'<div style="text-align:right"><button class="btn primary" onclick="protoAddPaste()">Extract Steps</button></div></div></div>' +
-  '<div id="pt-file" style="display:none"><div class="proto-import-col"><div class="proto-import-row"><input type="text" id="proto-title-file" placeholder="Protocol name" spellcheck="false"/><input type="file" id="proto-file" accept=".txt,.md,.pdf,.docx"/></div>' +
-    '<div style="font-size:11px;color:#8a7f72">Tags</div>'+_tagInputHTML('import-file',[])+'<div style="text-align:right"><button class="btn primary" onclick="protoAddFile()">Upload + Extract</button></div></div></div>' +
+  '<div id="pt-claude"><div class="proto-import-col">' +
+    '<input type="text" id="proto-title-claude" placeholder="Protocol name" spellcheck="false"/>' +
+    '<textarea id="proto-claude-text" placeholder="Paste Claude&#39;s formatted output here.&#10;&#10;=== STEPS ===&#10;1. First step&#10;2. Second step&#10;&#10;=== RECIPES ===&#10;## Table name&#10;| col | col |&#10;| --- | --- |&#10;| val | val |&#10;&#10;=== NOTES ===&#10;Optional notes" style="min-height:260px;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:12px"></textarea>' +
+    '<div style="font-size:11px;color:#8a7f72">Tags</div>'+_tagInputHTML('import-claude',[]) +
+    '<div style="text-align:right"><button class="btn primary" onclick="protoAddFromClaude()">Save Protocol</button></div>' +
+  '</div></div>' +
   '<div id="pt-manual" style="display:none"><div class="proto-import-col"><input type="text" id="proto-title-manual" placeholder="Protocol name" spellcheck="false"/><div id="manual-steps-list"></div>' +
     '<div style="display:flex;gap:6px"><button class="btn" onclick="manualAddStep()">+ Step</button><button class="btn" style="color:#5b7a5e" onclick="manualLinkProtocol()">&#8599; Link protocol</button></div>' +
     '<div class="manual-recipe-section"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px"><div class="manual-recipe-label">Reaction Tables <span style="font-weight:400;text-transform:none;font-size:11px">(optional)</span></div><button class="btn" onclick="manualAddTable()">+ Add table</button></div><div id="manual-recipe-body"></div></div>' +
@@ -4917,7 +4912,7 @@ function _buildImportUI() {
 function protoTab(name, btn) {
   document.querySelectorAll('.proto-import-tabs .proto-tab').forEach(function(t){t.classList.remove('active');});
   btn.classList.add('active');
-  ['url','paste','file','manual'].forEach(function(t){var el=document.getElementById('pt-'+t);if(el)el.style.display=(t===name)?'':'none';});
+  ['claude','manual'].forEach(function(t){var el=document.getElementById('pt-'+t);if(el)el.style.display=(t===name)?'':'none';});
   if(name==='manual'){_manualSteps=[''];_manualRecipes=[];_refreshManualSteps();_refreshManualRecipe();}
 }
 
@@ -4981,28 +4976,23 @@ function manualAddStep(){_manualSteps.push('');var l=document.getElementById('ma
 function manualDelStep(idx){if(_manualSteps.length<=1){_manualSteps[0]='';_refreshManualSteps();return;}_manualSteps.splice(idx,1);_refreshManualSteps();}
 
 // ── import actions ────────────────────────────────────────────────────────────
-async function protoAddUrl() {
-  var url=document.getElementById('proto-url')?.value.trim(), title=document.getElementById('proto-title-url')?.value.trim();
-  if(!url){toast('Paste a URL first',true);return;} if(!title){toast('Add a title',true);return;}
-  var btn=document.querySelector('#pt-url .btn.primary'); if(btn){btn.textContent='Saving...';btn.disabled=true;}
-  try{await api('POST','/api/protocols',{title:title,url:url,tags:_getTags('import-url')});document.getElementById('proto-url').value='';document.getElementById('proto-title-url').value='';_tagState['import-url']=[];await loadView();toast('Protocol saved');}
-  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Fetch + Save';btn.disabled=false;}}
-}
-
-async function protoAddPaste() {
-  var title=document.getElementById('proto-title-paste')?.value.trim(), text=document.getElementById('proto-paste-text')?.value.trim();
-  if(!title){toast('Add a title',true);return;} if(!text){toast('Paste some text first',true);return;}
-  var btn=document.querySelector('#pt-paste .btn.primary'); if(btn){btn.textContent='Saving...';btn.disabled=true;}
-  try{await api('POST','/api/protocols/from-paste',{title:title,text:text,tags:_getTags('import-paste')});document.getElementById('proto-title-paste').value='';document.getElementById('proto-paste-text').value='';_tagState['import-paste']=[];await loadView();toast('Protocol saved');}
-  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Save Protocol';btn.disabled=false;}}
-}
-
-async function protoAddFile() {
-  var title=document.getElementById('proto-title-file')?.value.trim(), fi=document.getElementById('proto-file'), file=fi?.files[0];
-  if(!title){toast('Add a title',true);return;} if(!file){toast('Choose a file first',true);return;}
-  var btn=document.querySelector('#pt-file .btn.primary'); if(btn){btn.textContent='Uploading...';btn.disabled=true;}
-  try{var fd=new FormData();fd.append('title',title);fd.append('file',file);fd.append('tags',JSON.stringify(_getTags('import-file')));var resp=await fetch('/api/protocols/from-file',{method:'POST',body:fd});if(!resp.ok)throw new Error(await resp.text());document.getElementById('proto-title-file').value='';fi.value='';_tagState['import-file']=[];await loadView();toast('Protocol saved');}
-  catch(e){toast('Failed: '+e.message,true);} finally{if(btn){btn.textContent='Upload + Save';btn.disabled=false;}}
+async function protoAddFromClaude() {
+  var title=document.getElementById('proto-title-claude')?.value.trim(),
+      formatted=document.getElementById('proto-claude-text')?.value;
+  if(!title){toast('Add a title',true);return;}
+  if(!formatted||!formatted.trim()){toast('Paste Claude\'s formatted output first',true);return;}
+  var btn=document.querySelector('#pt-claude .btn.primary');
+  if(btn){btn.textContent='Saving...';btn.disabled=true;}
+  try{
+    var data=await api('POST','/api/protocols/from-claude',{title:title,formatted:formatted,tags:_getTags('import-claude')});
+    document.getElementById('proto-title-claude').value='';
+    document.getElementById('proto-claude-text').value='';
+    _tagState['import-claude']=[];
+    await loadView();
+    var msg='Saved: '+(data.steps_parsed||0)+' step(s), '+(data.tables_parsed||0)+' table(s)';
+    toast(msg);
+  }catch(e){toast('Failed: '+(e.message||e),true);}
+  finally{if(btn){btn.textContent='Save Protocol';btn.disabled=false;}}
 }
 
 async function protoAddManual() {
@@ -5029,18 +5019,7 @@ async function protoClone(pid) {
   catch(e){toast('Clone failed: '+e.message,true);}
 }
 
-// ── Claude round-trip: copy prompt + import formatted output ─────────────────
-async function protoCopyClaudePrompt(pid) {
-  try {
-    var data = await api('GET', '/api/protocols/' + pid + '/claude-prompt');
-    if (!data || !data.prompt) { toast('No prompt returned', true); return; }
-    await navigator.clipboard.writeText(data.prompt);
-    toast('Prompt copied — paste into a Claude chat');
-  } catch(e) {
-    toast('Copy failed: ' + (e.message || e), true);
-  }
-}
-
+// ── Import formatted Claude output into an existing protocol ─────────────────
 function protoImportFromClaude(pid) {
   var div = document.createElement('div');
   div.className = 'prv-overlay';
