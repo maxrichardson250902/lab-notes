@@ -135,11 +135,12 @@
   }
 
   // ── core ──────────────────────────────────────────────────────────────────
-  function addTimer(label, totalSeconds, protocol) {
+  function addTimer(label, totalSeconds, protocol, tag) {
     var timers = loadTimers();
     var id = 't_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
     timers.push({
       id: id, label: label, protocol: protocol || '',
+      tag: tag || '',
       totalSeconds: totalSeconds, remainingSeconds: totalSeconds,
       running: true, resumedAt: Date.now(), done: false, notified: false
     });
@@ -149,6 +150,20 @@
     ensureTicking();
     // request notification permission early
     if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+  }
+
+  // Remove every timer that carries this tag. Called by scratch.js when a
+  // run is abandoned so only that run's timers vanish — timers from other
+  // runs, or ad-hoc ones started outside a run, are untouched. A blank/null
+  // tag matches nothing (guards against accidental "remove all" calls).
+  function removeByTag(tag) {
+    if (!tag) return 0;
+    var before = loadTimers();
+    var after = before.filter(function(t) { return t.tag !== tag; });
+    if (after.length === before.length) return 0;
+    saveTimers(after); render();
+    if (!after.length) stopTicking();
+    return before.length - after.length;
   }
 
   function removeTimer(id) {
@@ -280,8 +295,9 @@
   function _esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
   // ── global API ────────────────────────────────────────────────────────────
-  window.protoTimerAdd = function(label, seconds, protocol) { addTimer(label, seconds, protocol); };
+  window.protoTimerAdd = function(label, seconds, protocol, tag) { addTimer(label, seconds, protocol, tag); };
   window.protoTimerRemove = function(id) { removeTimer(id); };
+  window.protoTimerRemoveByTag = function(tag) { return removeByTag(tag); };
   window.protoTimerToggle = function(id) { togglePause(id); };
   window.protoTimerAddMin = function(id) { addMinute(id); };
   window.protoTimerCollapse = function() { setCollapsed(true); render(); };
