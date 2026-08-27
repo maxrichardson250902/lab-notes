@@ -633,7 +633,13 @@ async function renderProtocols(el) {
   var data = await api('GET', '/api/protocols');
   S.protocols = data.protocols || [];
   var html = '<div id="active-runs-container"></div>';
-  html += '<div class="proto-import-box">' + _buildImportUI() + '</div>';
+  // Add-new toggle. The entry UI starts collapsed so the list view isn't
+  // cluttered by a big empty form every time the page loads. Click the button
+  // to reveal the tabs; click again (or "× Cancel") to hide.
+  html += '<div style="margin-bottom:12px">' +
+            '<button class="btn primary" id="proto-add-toggle" onclick="protoToggleImport()">+ Add new protocol</button>' +
+          '</div>';
+  html += '<div class="proto-import-box" id="proto-import-box" style="display:none">' + _buildImportUI() + '</div>';
   html += '<div class="proto-layout"><div class="proto-sidebar"><div class="proto-sidebar-inner">';
   html += '<div class="proto-search-bar"><input type="text" id="proto-search" placeholder="Search..." oninput="protoFilter()" spellcheck="false"/></div>';
   html += S.protocols.length ? '<div id="proto-list">'+S.protocols.map(_compactCard).join('')+'</div>' : '<div style="color:#8a7f72;font-size:13px;text-align:center;padding:20px">No protocols yet</div>';
@@ -708,12 +714,87 @@ function _buildImportUI() {
     '<input type="text" id="proto-title-claude" placeholder="Protocol name" spellcheck="false"/>' +
     '<textarea id="proto-claude-text" placeholder="Paste Claude&#39;s formatted output here.&#10;&#10;=== STEPS ===&#10;1. First step&#10;2. Second step&#10;&#10;=== RECIPES ===&#10;## Table name&#10;| col | col |&#10;| --- | --- |&#10;| val | val |&#10;&#10;=== NOTES ===&#10;Optional notes" style="min-height:260px;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:12px"></textarea>' +
     '<div style="font-size:11px;color:#8a7f72">Tags</div>'+_tagInputHTML('import-claude',[]) +
-    '<div style="text-align:right"><button class="btn primary" onclick="protoAddFromClaude()">Save Protocol</button></div>' +
+    // Action row: prompt-template copy on the left, save on the right.
+    // Copy button clipboards the ready-to-paste prompt so users can paste it
+    // into any Claude chat with their raw protocol text below.
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">' +
+      '<button class="btn" onclick="protoCopyPromptTemplate()" title="Copy a prompt to paste into a Claude chat along with your protocol text">&#128203; Copy prompt template</button>' +
+      '<button class="btn primary" onclick="protoAddFromClaude()">Save Protocol</button>' +
+    '</div>' +
   '</div></div>' +
   '<div id="pt-manual" style="display:none"><div class="proto-import-col"><input type="text" id="proto-title-manual" placeholder="Protocol name" spellcheck="false"/><div id="manual-steps-list"></div>' +
     '<div style="display:flex;gap:6px"><button class="btn" onclick="manualAddStep()">+ Step</button><button class="btn" style="color:#5b7a5e" onclick="manualLinkProtocol()">&#8599; Link protocol</button></div>' +
     '<div class="manual-recipe-section"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px"><div class="manual-recipe-label">Reaction Tables <span style="font-weight:400;text-transform:none;font-size:11px">(optional)</span></div><button class="btn" onclick="manualAddTable()">+ Add table</button></div><div id="manual-recipe-body"></div></div>' +
     '<div style="font-size:11px;color:#8a7f72;margin-top:8px">Tags</div>'+_tagInputHTML('import-manual',[])+'<div style="text-align:right;margin-top:10px"><button class="btn primary" onclick="protoAddManual()">Save Protocol</button></div></div></div>';
+}
+
+// The template Claude gets, matching the parser's expectations exactly.
+// Kept as a JS string (rather than a backend endpoint) because it's static
+// and this way it works even if the backend is briefly down.
+var PROTO_CLAUDE_PROMPT_TEMPLATE = [
+  "Format the lab protocol I'm about to give you using these exact delimiters,",
+  "and output NOTHING else — no preamble, no commentary, no explanation.",
+  "",
+  "=== STEPS ===",
+  "Numbered list, one step per line. Keep steps atomic and imperative.",
+  "Include volumes, temperatures, times, and speeds where specified.",
+  "",
+  "=== RECIPES ===",
+  "For each reagent/reaction table in the protocol (master mix, buffer,",
+  "thermocycler program, etc.), output a level-2 markdown header with the",
+  "table name, then a standard markdown table. Example:",
+  "",
+  "## Master Mix",
+  "| Component | Stock | Volume (uL) | Final |",
+  "|-----------|-------|-------------|-------|",
+  "| Buffer    | 5x    | 5           | 1x    |",
+  "",
+  "=== NOTES ===",
+  "Warnings, tips, or context worth preserving. Free text.",
+  "",
+  "RULES:",
+  "- Do not invent volumes, concentrations, temperatures, or times not",
+  "  present in the source. If a value is missing, leave the cell blank",
+  "  or write \"?\".",
+  "- If a section has no content, still include the delimiter with nothing",
+  "  under it.",
+  "- Output ONLY the delimited block — no other text.",
+  "",
+  "--- PROTOCOL TO FORMAT ---",
+  "[paste your protocol text here, replacing this line]",
+  ""
+].join("\n");
+
+async function protoCopyPromptTemplate() {
+  try {
+    await navigator.clipboard.writeText(PROTO_CLAUDE_PROMPT_TEMPLATE);
+    toast('Prompt copied — paste into a Claude chat with your protocol text');
+  } catch (e) {
+    toast('Copy failed: ' + (e && e.message ? e.message : 'clipboard unavailable'), true);
+  }
+}
+
+function protoToggleImport() {
+  var box = document.getElementById('proto-import-box');
+  var btn = document.getElementById('proto-add-toggle');
+  if (!box || !btn) return;
+  var isOpen = box.style.display !== 'none';
+  if (isOpen) {
+    box.style.display = 'none';
+    btn.textContent = '+ Add new protocol';
+    btn.classList.add('primary');
+  } else {
+    box.style.display = '';
+    btn.textContent = '× Cancel';
+    btn.classList.remove('primary');
+    // Focus the currently-active tab's title field so the user can start typing.
+    setTimeout(function() {
+      var tabName = document.querySelector('.proto-import-tabs .proto-tab.active');
+      var which = tabName && tabName.textContent.indexOf('Claude') >= 0 ? 'claude' : 'manual';
+      var titleField = document.getElementById('proto-title-' + which);
+      if (titleField) titleField.focus();
+    }, 0);
+  }
 }
 
 function protoTab(name, btn) {
