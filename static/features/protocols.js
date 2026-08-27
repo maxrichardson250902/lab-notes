@@ -190,6 +190,22 @@ function _parseRecipeArray(raw) {
 function _parseRecipe(raw) { return _parseRecipeArray(raw)[0] || JSON.parse(JSON.stringify(DEFAULT_RECIPE)); }
 function _isUnitCol(n) { return /vol|amount|conc|stock|final|mass|weight/i.test(n); }
 function _parseAmountUnit(val) { val = (val || '').trim(); var m = val.match(/^([\d.,]*)\s*(.*)$/); return { num: m ? m[1] : '', unit: m ? m[2].trim() : '' }; }
+
+// Detect fill-to-volume phrasing in a cell value.
+// Matches "up to N", "to N", "q.s. N", "q.s. to N", "fill to N",
+// "bring to N", "adjust to N" — case-insensitive, leading whitespace ok.
+// Returns the numeric target as a Number, or null if the cell isn't a
+// fill-to-volume declaration. The number is treated by the totals row as
+// the final volume for that column (rather than being summed with the
+// other rows), and by scaling as the value to scale.
+function _parseFillToVolume(val) {
+  var s = (val || '').trim();
+  if (!s) return null;
+  var m = s.match(/^(?:up\s+to|q\.?s\.?(?:\s+to)?|(?:fill|bring|adjust)\s+to|to)\s+([\d.,]+)/i);
+  if (!m) return null;
+  var n = parseFloat(m[1].replace(/,/g, ''));
+  return isNaN(n) ? null : n;
+}
 function _serializeRecipeState(tables) { if (!tables || !tables.length) return JSON.stringify(DEFAULT_RECIPE); return tables.length === 1 ? JSON.stringify(tables[0]) : JSON.stringify(tables); }
 
 // ── recipe display ────────────────────────────────────────────────────────────
@@ -216,8 +232,20 @@ function _recipeReadHTML(recipe) {
   var hasTotals = false;
   var totals = recipe.columns.map(function(col, ci) {
     if (!_isUnitCol(col) || recipe.rows.length < 2) return '';
-    var sum = 0, found = false;
-    recipe.rows.forEach(function(row) { var n = parseFloat(_parseAmountUnit(row[ci] || '').num); if (!isNaN(n)) { sum += n; found = true; } });
+    var sum = 0, found = false, fillTo = null;
+    recipe.rows.forEach(function(row) {
+      var raw = row[ci] || '';
+      var f = _parseFillToVolume(raw);
+      if (f !== null) { fillTo = f; return; }   // skip from sum; use as final total
+      var n = parseFloat(_parseAmountUnit(raw).num);
+      if (!isNaN(n)) { sum += n; found = true; }
+    });
+    if (fillTo !== null) {
+      hasTotals = true;
+      // Show the fill-to target as the total. This is the whole point — a
+      // "up to 100 mL" row means the final volume IS 100 mL, not 100 + sum.
+      return fillTo % 1 === 0 ? String(fillTo) : fillTo.toFixed(2);
+    }
     if (found) { hasTotals = true; return sum % 1 === 0 ? String(sum) : sum.toFixed(2); }
     return '';
   });
@@ -692,7 +720,7 @@ function _panelBody(p) {
   h+='</div></div>';
   // steps
   if(!hasSteps) h+='<div style="color:#8a7f72;font-size:13px;font-style:italic;margin-bottom:16px">No steps yet — import from Claude or add manually.</div>';
-  else if(isStructured) h+='<ol class="steps-list">'+steps.map(function(s, i){return '<li>'+_renderStepText(s.text, p.title, i+1)+(s.note?'<div style="font-size:11px;color:#8a7f72;margin:2px 0 4px;padding-left:4px;border-left:2px solid #e8e2d8">'+esc(s.note)+'</div>':'')+'</li>';}).join('')+'</ol>';
+  else if(isStructured) h+='<ol class="steps-list">'+steps.map(function(s){return '<li>'+_renderStepText(s.text)+(s.note?'<div style="font-size:11px;color:#8a7f72;margin:2px 0 4px;padding-left:4px;border-left:2px solid #e8e2d8">'+esc(s.note)+'</div>':'')+'</li>';}).join('')+'</ol>';
   else h+='<div class="steps-text">'+esc(p.steps)+'</div>';
   // recipe
   h+='<div class="recipe-section"><div class="recipe-section-head"><span>Reaction Tables</span><div class="recipe-edit-actions" id="recipe-actions-'+p.id+'"><button class="btn" onclick="protoRecipeEdit('+p.id+')">Edit tables</button></div></div>';
@@ -756,6 +784,10 @@ var PROTO_CLAUDE_PROMPT_TEMPLATE = [
   "- Do not invent volumes, concentrations, temperatures, or times not",
   "  present in the source. If a value is missing, leave the cell blank",
   "  or write \"?\".",
+  "- For fill-to-volume rows (e.g. water bringing the reaction to final",
+  "  volume), write \"up to N units\" in the volume column — e.g. \"up to",
+  "  25 uL\". The totals row treats this as the final volume rather than",
+  "  adding it to the running sum, and scaling multiplies through it.",
   "- If a section has no content, still include the delimiter with nothing",
   "  under it.",
   "- Output ONLY the delimited block — no other text.",
@@ -960,25 +992,18 @@ function protoOpenRun(pid) {
 }
 
 // ── protocol link rendering + timer detection ─────────────────────────────────
-// stepNum (1-indexed) and protoTitle are optional; when supplied they get
-// embedded into the label / subtitle of the floating timer so the user can
-// tell at a glance which step of which protocol each running timer belongs to.
-function _renderStepText(text, protoTitle, stepNum) {
+function _renderStepText(text) {
   var rendered = text.split(/(\[@[^\]]+\]\(proto:\d+\))/g).map(function(part){
     var m=part.match(/^\[@([^\]]+)\]\(proto:(\d+)\)$/);
     if(m) return '<span class="proto-link-badge" onclick="protoOpenPanel('+m[2]+')" title="Open '+esc(m[1])+'">&#8599; '+esc(m[1])+'</span>';
     return esc(part);
   }).join('');
-  // detect duration and add timer button — routes through window.protoTimerAdd
-  // which the floating widget owns. Timer lives outside this view.
+  // detect duration and add timer button
   if (typeof protoTimerParseDuration === 'function') {
     var dur = protoTimerParseDuration(text);
     if (dur > 0) {
-      var shortText = text.length > 60 ? text.substring(0, 57) + '...' : text;
-      var label = (stepNum ? 'Step ' + stepNum + ': ' : '') + shortText;
-      var jsSafeLabel = esc(label).replace(/'/g, "\\'");
-      var jsSafeProto = esc(protoTitle || '').replace(/'/g, "\\'");
-      rendered += ' <button class="proto-timer-btn" onclick="event.stopPropagation();protoTimerAdd(\'' + jsSafeLabel + '\',' + dur + ',\'' + jsSafeProto + '\')" title="Start ' + _fmtDurShort(dur) + ' timer">&#9202; ' + _fmtDurShort(dur) + '</button>';
+      var label = text.length > 60 ? text.substring(0, 57) + '...' : text;
+      rendered += ' <button class="proto-timer-btn" onclick="event.stopPropagation();protoTimerAdd(\'' + esc(label).replace(/'/g, "\\'") + '\',' + dur + ')" title="Start ' + _fmtDurShort(dur) + ' timer">&#9202; ' + _fmtDurShort(dur) + '</button>';
     }
   }
   return rendered;

@@ -143,12 +143,29 @@ async function _getAllRuns() {
     '.sp-summary-clean{font-size:13px;color:#5b7a5e;font-style:italic}',
     '.sp-run-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}',
 
-    /* Step timer button — delegates to the floating proto-timer widget. All
-       running/paused/expired state now lives in that widget, so the button
-       is a plain "start" affordance. */
+    '.sp-runtabs{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid #e8e2d8}',
+    '.sp-runtab{display:inline-flex;align-items:center;gap:8px;background:#f0ebe3;border:1px solid #d5cec0;border-radius:6px 6px 0 0;padding:6px 10px 6px 12px;font-size:12px;color:#8a7f72;cursor:pointer;transition:background 120ms}',
+    '.sp-runtab:hover{background:#e6dfd0}',
+    '.sp-runtab.active{background:#faf8f4;color:#4a4139;font-weight:600;border-bottom-color:#faf8f4;position:relative;top:1px}',
+    '.sp-runtab-title{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.sp-runtab-count{font-size:10px;background:#e8f0e8;color:#5b7a5e;padding:1px 6px;border-radius:8px;font-weight:600}',
+    '.sp-runtab-x{background:none;border:none;color:#8a7f72;cursor:pointer;padding:0 2px;font-size:14px;line-height:1;font-weight:600}',
+    '.sp-runtab-x:hover{color:#c0392b}',
+    '.sp-runtab-add{background:#fff;border-style:dashed;color:#5b7a5e;border-radius:6px;font-weight:600}',
+    '.sp-runtab-add:hover{background:#e8f0e8}',
+    '.sp-inline-picker{width:100%;background:#faf8f4;border:1px solid #d5cec0;border-radius:6px;padding:10px;margin-top:8px;display:flex;flex-direction:column;gap:6px}',
+    '.sp-inline-picker input,.sp-inline-picker select{width:100%;box-sizing:border-box;padding:6px 10px;border:1px solid #d5cec0;border-radius:4px;font-size:13px;color:#4a4139;background:#fff;font-family:inherit}',
+
     '.sp-timer-btn{background:none;border:1px solid #d5cec0;border-radius:4px;font-size:11px;color:#8a7f72;cursor:pointer;padding:2px 8px;margin-left:25px;margin-top:4px;display:inline-flex;align-items:center;gap:4px}',
     '.sp-timer-btn:hover{background:#f0ebe3;color:#4a4139}',
-    '.sp-timer-btn.disabled{opacity:.5;cursor:not-allowed}',
+    '.sp-timer-btn.running{border-color:#5b7a5e;color:#5b7a5e;background:#e8f0e8}',
+    '.sp-timer-btn.expired{border-color:#c0392b;color:#c0392b;background:#fde8e8;animation:sp-flash 0.8s infinite}',
+    '.sp-timer-display{font-family:"SF Mono",Monaco,Consolas,monospace;font-size:12px;font-weight:600;min-width:44px;text-align:center}',
+    '@keyframes sp-flash{0%,100%{opacity:1}50%{opacity:0.3}}',
+    '.sp-timer-popup{position:fixed;bottom:24px;right:24px;background:#faf8f4;border:2px solid #c0392b;border-radius:8px;padding:16px 20px;z-index:3000;min-width:260px;max-width:380px;box-shadow:0 4px 20px rgba(60,52,42,.2)}',
+    '.sp-timer-popup-title{font-weight:700;font-size:13px;color:#c0392b;margin-bottom:4px}',
+    '.sp-timer-popup-text{font-size:12px;color:#4a4139;margin-bottom:10px;line-height:1.5}',
+    '.sp-step.timer-expired{border-left:3px solid #c0392b;background:#fff8f8}',
     /* Brief highlight when navigated here via "Finish" from dashboard */
     '@keyframes sp-finish-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(91,122,94,.4); } 50% { box-shadow: 0 0 0 8px rgba(91,122,94,0); } }',
     '.sp-finish-highlight { animation: sp-finish-pulse 1.1s ease-in-out 2; }'
@@ -160,71 +177,79 @@ async function _getAllRuns() {
 // ── recipe helpers ────────────────────────────────────────────────────────────
 var _DEFAULT_RECIPE = { columns: ['Component', 'Stock conc.', 'Volume (uL)', 'Final conc.'], rows: [] };
 
-// ── timer helpers (delegates to floating proto-timer widget) ────────────────
-// The floating widget in /static/proto-timer.js owns all timer state,
-// persistence, and ticking — this file just parses duration and hands off.
-// Timers survive view changes and page reloads because they live in
-// localStorage and are managed by an interval inside that IIFE, not here.
+// ── timer state ───────────────────────────────────────────────────────────────
+var _stepTimers = {}; // stepId -> {endTime, intervalId, duration, paused, remaining}
+var _timerMasterInterval = null;
 
 function _parseDurationFromText(text) {
-  // Prefer the widget's parser (kept in one place); fall back to a local
-  // parse if the widget isn't loaded yet (e.g. during boot before
-  // proto-timer.js has evaluated).
-  if (typeof window.protoTimerParseDuration === 'function') {
-    return window.protoTimerParseDuration(text);
-  }
-  var t = (text || '').toLowerCase(); var m;
+  // auto-detect duration from step text e.g. "37°C for 30 min", "incubate 2 hours", "45 sec"
+  var t = text.toLowerCase();
+  var m;
   if ((m = t.match(/(\d+(?:\.\d+)?)\s*h(?:ours?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]) * 3600);
   if ((m = t.match(/(\d+(?:\.\d+)?)\s*min(?:utes?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]) * 60);
   if ((m = t.match(/(\d+(?:\.\d+)?)\s*s(?:ec(?:onds?)?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]));
   return 0;
 }
 
-function _fmtDurShortSp(sec) {
-  if (sec >= 3600) { var h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60); return h + 'h' + (m ? m + 'm' : ''); }
-  if (sec >= 60) { var m = Math.floor(sec/60), s = sec % 60; return m + 'm' + (s ? s + 's' : ''); }
-  return sec + 's';
+function _fmtTime(secs) {
+  if (secs < 0) secs = 0;
+  var h = Math.floor(secs / 3600);
+  var m = Math.floor((secs % 3600) / 60);
+  var s = secs % 60;
+  if (h > 0) return h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
 }
 
-// Called from the per-step ⏱ button. Reads current run state, computes
-// duration (falling back to a prompt if the step text has no parseable
-// duration), and hands off to the floating widget. Multiple can run at once —
-// the widget shows each one with the step-number label and protocol title
-// as subtitle. Nothing view-scoped is kept here.
+function _requestNotifPermission() {
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
 function spStartTimer(stepId) {
   var rs = _scratchProtoRun; if (!rs) return;
-  var idx = rs.steps.findIndex(function(s){ return s.id === stepId; });
-  if (idx < 0) return;
-  var step = rs.steps[idx];
-
-  if (typeof window.protoTimerAdd !== 'function') {
-    toast('Timer widget not loaded — try refreshing the page', true);
+  var step = rs.steps.find(function(s) { return s.id === stepId; }); if (!step) return;
+  var existing = _stepTimers[stepId];
+  if (existing && existing.intervalId) {
+    // already running — pause it
+    clearInterval(existing.intervalId);
+    existing.paused = true;
+    existing.remaining = Math.max(0, Math.ceil((existing.endTime - Date.now()) / 1000));
+    existing.intervalId = null;
+    _updateTimerDisplay(stepId);
     return;
   }
-
+  if (existing && existing.paused) {
+    // resume
+    existing.endTime = Date.now() + existing.remaining * 1000;
+    existing.paused = false;
+    existing.intervalId = setInterval(function() { _timerTick(stepId); }, 500);
+    _updateTimerDisplay(stepId);
+    return;
+  }
+  // start fresh — prompt for duration if not set
   var duration = step.duration || _parseDurationFromText(step.text);
   if (!duration) {
-    var input = prompt('Timer duration for this step (e.g. 30min, 1h, 45sec):');
+    var input = prompt('Timer duration (e.g. 30min, 1h, 45sec, or seconds):');
     if (!input) return;
-    duration = _parseInputDurationSp(input);
+    duration = _parseInputDuration(input);
     if (!duration) { toast('Could not parse duration', true); return; }
     step.duration = duration;
-    if (typeof _saveRun === 'function') _saveRun(rs);
   }
-
-  // Label is "Step N: <trimmed text>" — protocol title becomes the subtitle
-  // in the floating widget's render.
-  var shortText = (step.text || '').replace(/\s+/g, ' ').trim();
-  if (shortText.length > 60) shortText = shortText.substring(0, 57) + '...';
-  var label = 'Step ' + (idx + 1) + (shortText ? ': ' + shortText : '');
-  var protoTitle = (rs.protocol && rs.protocol.title) || '';
-
-  window.protoTimerAdd(label, duration, protoTitle);
-  toast('Timer started: ' + _fmtDurShortSp(duration));
+  _stepTimers[stepId] = {
+    duration:   duration,
+    endTime:    Date.now() + duration * 1000,
+    remaining:  duration,
+    paused:     false,
+    expired:    false,
+    intervalId: setInterval(function() { _timerTick(stepId); }, 500)
+  };
+  _requestNotifPermission();
+  _updateTimerDisplay(stepId);
 }
 
-function _parseInputDurationSp(input) {
-  input = (input || '').trim().toLowerCase();
+function _parseInputDuration(input) {
+  input = input.trim().toLowerCase();
   var m;
   if ((m = input.match(/^(\d+(?:\.\d+)?)\s*h/))) return Math.round(parseFloat(m[1]) * 3600);
   if ((m = input.match(/^(\d+(?:\.\d+)?)\s*m/))) return Math.round(parseFloat(m[1]) * 60);
@@ -233,18 +258,124 @@ function _parseInputDurationSp(input) {
   return 0;
 }
 
-// Rendered inside each step row. The button starts a NEW timer each click —
-// running state, pause, reset, and countdown display are all owned by the
-// floating widget now. If the step text has no parseable duration the button
-// still appears; clicking prompts for one.
-function _getTimerHTML(step) {
-  var dur = step.duration || _parseDurationFromText(step.text);
-  var label = dur ? _fmtDurShortSp(dur) : 'Timer';
-  return '<button class="sp-timer-btn" onclick="spStartTimer(' + step.id + ')" title="Start timer in the floating widget">' +
-    '&#9202; ' + label +
-    '</button>';
+function spResetTimer(stepId) {
+  var t = _stepTimers[stepId]; if (!t) return;
+  if (t.intervalId) clearInterval(t.intervalId);
+  delete _stepTimers[stepId];
+  var el = document.getElementById('sps-' + stepId);
+  if (el) {
+    el.classList.remove('timer-expired');
+    var btn = el.querySelector('.sp-timer-btn');
+    if (btn) { btn.className = 'sp-timer-btn'; btn.innerHTML = '&#9202; ' + (document.getElementById('sp-timer-custom-' + stepId) ? _fmtTime(0) : 'Timer'); }
+  }
+  _removeTimerPopup(stepId);
 }
 
+function _timerTick(stepId) {
+  var t = _stepTimers[stepId]; if (!t || t.paused) return;
+  var remaining = Math.ceil((t.endTime - Date.now()) / 1000);
+  t.remaining = remaining;
+  if (remaining <= 0 && !t.expired) {
+    t.expired = true;
+    clearInterval(t.intervalId);
+    t.intervalId = null;
+    _onTimerExpired(stepId);
+  }
+  _updateTimerDisplay(stepId);
+}
+
+function _updateTimerDisplay(stepId) {
+  var t = _stepTimers[stepId];
+  var el = document.getElementById('sps-' + stepId); if (!el) return;
+  var btn = el.querySelector('.sp-timer-btn'); if (!btn) return;
+  var disp = el.querySelector('.sp-timer-display');
+
+  if (!t) {
+    btn.className = 'sp-timer-btn';
+    btn.innerHTML = '&#9202; Timer';
+    return;
+  }
+  var remaining = t.paused ? t.remaining : Math.max(0, Math.ceil((t.endTime - Date.now()) / 1000));
+  var timeStr = _fmtTime(remaining);
+
+  if (t.expired) {
+    btn.className = 'sp-timer-btn expired';
+    btn.innerHTML = '&#9203; ' + timeStr + ' &nbsp;<small>done</small>';
+  } else if (t.paused) {
+    btn.className = 'sp-timer-btn';
+    btn.innerHTML = '&#9654; ' + timeStr + ' &nbsp;<small>paused</small>';
+  } else {
+    btn.className = 'sp-timer-btn running';
+    btn.innerHTML = '&#9646;&#9646; ' + timeStr;
+  }
+}
+
+function _onTimerExpired(stepId) {
+  var rs = _scratchProtoRun; if (!rs) return;
+  var step = rs.steps.find(function(s) { return s.id === stepId; });
+  var stepText = step ? step.text : 'Step ' + stepId;
+  // flash the step card
+  var el = document.getElementById('sps-' + stepId);
+  if (el) el.classList.add('timer-expired');
+  // browser notification
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    new Notification('Timer done — ' + (rs.protocol.title || 'Protocol'), {
+      body: stepText,
+      icon: '/favicon.ico'
+    });
+  }
+  // popup in corner
+  _showTimerPopup(stepId, stepText);
+  _updateTimerDisplay(stepId);
+}
+
+function _showTimerPopup(stepId, stepText) {
+  _removeTimerPopup(stepId);
+  var div = document.createElement('div');
+  div.className = 'sp-timer-popup';
+  div.id = 'sp-timer-popup-' + stepId;
+  div.innerHTML =
+    '<div class="sp-timer-popup-title">&#9203; Timer complete!</div>' +
+    '<div class="sp-timer-popup-text">' + esc(stepText) + '</div>' +
+    '<div style="display:flex;gap:8px">' +
+      '<button class="btn primary" style="flex:1" onclick="spDismissTimer(' + stepId + ')">Dismiss</button>' +
+      '<button class="btn" onclick="spResetTimer(' + stepId + ')">Reset</button>' +
+    '</div>';
+  document.body.appendChild(div);
+}
+
+function _removeTimerPopup(stepId) {
+  var el = document.getElementById('sp-timer-popup-' + stepId);
+  if (el) el.remove();
+}
+
+function spDismissTimer(stepId) {
+  _removeTimerPopup(stepId);
+  var el = document.getElementById('sps-' + stepId);
+  if (el) el.classList.remove('timer-expired');
+}
+
+function _clearAllTimers() {
+  Object.keys(_stepTimers).forEach(function(id) {
+    var t = _stepTimers[id];
+    if (t && t.intervalId) clearInterval(t.intervalId);
+    _removeTimerPopup(parseInt(id));
+  });
+  _stepTimers = {};
+}
+
+function _getTimerHTML(step) {
+  var t = _stepTimers[step.id];
+  var duration = step.duration || _parseDurationFromText(step.text);
+  var label = t ? '' : (duration ? _fmtTime(duration) : 'Timer');
+  var cls = t ? (t.expired ? 'expired' : t.paused ? '' : 'running') : '';
+  var icon = t ? (t.expired ? '&#9203;' : t.paused ? '&#9654;' : '&#9646;&#9646;') : '&#9202;';
+  var timeStr = t ? _fmtTime(t.paused ? t.remaining : Math.max(0, Math.ceil((t.endTime - Date.now()) / 1000))) : label;
+  return '<button class="sp-timer-btn ' + cls + '" onclick="spStartTimer(' + step.id + ')">' +
+    icon + ' ' + timeStr +
+    '</button>' +
+    (t ? ' <button class="sp-timer-btn" style="margin-left:4px" onclick="spResetTimer(' + step.id + ')">&#215;</button>' : '');
+}
 
 function _parseRecipeRun(raw) {
   if (!raw) return JSON.parse(JSON.stringify(_DEFAULT_RECIPE));
@@ -270,6 +401,19 @@ function _volColIndex(columns) {
   return -1;
 }
 
+// Detect "up to N units" / "q.s. to N" style fill-to-volume cells so scaling
+// multiplies through them (e.g. "up to 25 uL" at 2× → "up to 50 uL") and so
+// the display can show them distinctly from summable values.
+function _matchFillToVolume(val) {
+  var s = (val || '').trim();
+  if (!s) return null;
+  var m = s.match(/^((?:up\s+to|q\.?s\.?(?:\s+to)?|(?:fill|bring|adjust)\s+to|to))\s+([\d.,]+)\s*(.*)$/i);
+  if (!m) return null;
+  var n = parseFloat(m[2].replace(/,/g, ''));
+  if (isNaN(n)) return null;
+  return { prefix: m[1], num: n, tail: m[3] };
+}
+
 function _renderSingleTable(recipe, scaling, factor) {
   var volCol = _volColIndex(recipe.columns);
   if (!recipe.rows.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components defined.</div>';
@@ -280,7 +424,18 @@ function _renderSingleTable(recipe, scaling, factor) {
     html += '<tr>';
     recipe.columns.forEach(function(_, ci) {
       var rawVal = row[ci] || '', isVol = (ci === volCol), displayVal = rawVal;
-      if (isVol && scaling && factor && rawVal) { var num = parseFloat(rawVal); if (!isNaN(num)) displayVal = (num * factor).toFixed(2).replace(/\.00$/, ''); }
+      if (isVol && scaling && factor && rawVal) {
+        // Fill-to-volume ("up to 25 uL"): scale the embedded number, keep the
+        // "up to" prefix and unit tail so the semantics survive scaling.
+        var fill = _matchFillToVolume(rawVal);
+        if (fill) {
+          var scaledN = (fill.num * factor).toFixed(2).replace(/\.00$/, '');
+          displayVal = fill.prefix + ' ' + scaledN + (fill.tail ? ' ' + fill.tail : '');
+        } else {
+          var num = parseFloat(rawVal);
+          if (!isNaN(num)) displayVal = (num * factor).toFixed(2).replace(/\.00$/, '');
+        }
+      }
       var cc = isVol ? ' class="vol-cell"' : '';
       if (isVol && scaling) {
         html += '<td' + cc + '><input type="text" value="' + esc(displayVal) + '" readonly/></td>';
@@ -428,7 +583,7 @@ function spLaunchRunDirect(p, group, subgroup) {
   }).catch(function() {});
 
   _saveLocalOnly(_scratchProtoRun);
-  // Notification permission is requested lazily by protoTimerAdd on first use.
+  _requestNotifPermission();
 
   if (S.view === 'scratch') {
     var el = document.getElementById('content');
@@ -510,6 +665,7 @@ function _renderProtoRunInScratch(el) {
   }).join('');
   var groupLabel = rs.group_name + (rs.subgroup ? ' / ' + rs.subgroup : '');
   el.innerHTML =
+    _renderRunTabs() +
     '<div style="padding:0 0 24px">' +
       '<div class="sp-run-header">' +
         '<div>' +
@@ -533,13 +689,144 @@ function _renderProtoRunInScratch(el) {
         '<button class="btn primary sp-finish-btn" data-sp-finish="1" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
       '</div>' +
     '</div>';
+  // initialise timer buttons for each step (after DOM is set)
+  rs.steps.forEach(function(step) { _renderTimerBtn(step.id); });
+}
+
+// ── multi-run tabs ─────────────────────────────────────────────────────
+// The scratch pad historically showed ONE run at a time — you had to save
+// or abandon to start a new one. Underlying storage (localStorage +
+// /api/active-runs) already supported multiple concurrent runs; the workflow
+// sidebar could see them all. These functions expose that in the scratch UI:
+// a tab bar shows every active run, click switches, × discards, "+ Run
+// another" opens the picker inline without losing your current run.
+
+function _renderRunTabs() {
+  var allRuns = _getAllRunsLocal();
+  var activeId = _scratchProtoRun && _scratchProtoRun.runId;
+  // Ensure the active run appears in the list even if localStorage was
+  // out of sync (e.g. cross-tab race). Idempotent since dedupe below.
+  if (activeId && !allRuns.some(function(r){return r.runId === activeId;})) {
+    allRuns.push(_scratchProtoRun);
+  }
+  var seen = {}; allRuns = allRuns.filter(function(r){
+    if (!r || !r.runId || seen[r.runId]) return false;
+    seen[r.runId] = true; return true;
+  });
+  var tabs = allRuns.map(function(r) {
+    var isActive = r.runId === activeId;
+    var doneCount = (r.steps || []).filter(function(s){return s.done;}).length;
+    var total = (r.steps || []).length;
+    var title = (r.protocol && r.protocol.title) || 'Untitled';
+    return '<div class="sp-runtab' + (isActive ? ' active' : '') + '" ' +
+                'onclick="spSwitchRun(\'' + esc(r.runId) + '\')" ' +
+                'title="' + esc(title) + ' — ' + doneCount + '/' + total + ' steps">' +
+      '<span class="sp-runtab-title">' + esc(title) + '</span>' +
+      '<span class="sp-runtab-count">' + doneCount + '/' + total + '</span>' +
+      '<button class="sp-runtab-x" onclick="event.stopPropagation();spDiscardRunTab(\'' + esc(r.runId) + '\')" title="Discard this run">&#215;</button>' +
+    '</div>';
+  }).join('');
+  return '<div class="sp-runtabs">' + tabs +
+    '<button class="sp-runtab sp-runtab-add" onclick="spShowRunPickerInline()" title="Start another run alongside this one">+ Run another</button>' +
+    '<div id="sp-runpicker-inline" style="flex-basis:100%"></div>' +
+    '</div>';
+}
+
+async function spSwitchRun(runId) {
+  if (!runId || (_scratchProtoRun && _scratchProtoRun.runId === runId)) return;
+  // Save (but don't remove) the current run before swapping. _saveRun writes
+  // to localStorage synchronously and schedules a DB write; safe to switch away.
+  _clearAllTimers();
+  if (_scratchProtoRun) _saveRun(_scratchProtoRun);
+  var target = _getRunByIdLocal(runId);
+  if (!target) {
+    // Fall back to the DB — the run might exist there but not in this tab's
+    // localStorage (cross-machine / cross-tab).
+    try {
+      var data = await api('GET', '/api/active-runs');
+      var dbRun = (data.runs || []).find(function(r){return r.run_id === runId;});
+      if (dbRun) {
+        target = {
+          runId:       dbRun.run_id,
+          protocol:    JSON.parse(dbRun.protocol_json),
+          steps:       JSON.parse(dbRun.steps_json || '[]'),
+          recipe:      JSON.parse(dbRun.recipe_json || 'null') || _parseRecipeRun(null),
+          scaling:     !!dbRun.scaling,
+          scaleFactor: dbRun.scale_factor || 1.0,
+          group_name:  dbRun.group_name || 'Protocols',
+          subgroup:    dbRun.subgroup || '',
+          startedAt:   dbRun.started_at
+        };
+        _saveLocalOnly(target);
+      }
+    } catch (e) {}
+  }
+  if (!target) { toast('Run not found', true); return; }
+  _scratchProtoRun = target;
+  var el = document.getElementById('content');
+  if (el) _renderProtoRunInScratch(el);
+}
+
+async function spDiscardRunTab(runId) {
+  if (!runId) return;
+  if (!confirm('Discard this run? Progress will be lost.')) return;
+  var wasActive = _scratchProtoRun && _scratchProtoRun.runId === runId;
+  if (wasActive) _clearAllTimers();
+  await _removeRun(runId);
+  if (wasActive) {
+    // Fall through to next remaining run, or back to picker if none left.
+    var remaining = _getAllRunsLocal();
+    _scratchProtoRun = remaining.length ? remaining[0] : null;
+  }
+  var el = document.getElementById('content');
+  if (el) { if (_scratchProtoRun) _renderProtoRunInScratch(el); else renderScratch(el); }
+}
+
+async function spShowRunPickerInline() {
+  var wrap = document.getElementById('sp-runpicker-inline'); if (!wrap) return;
+  wrap.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:6px">Loading...</div>';
+  var data = await api('GET', '/api/protocols');
+  S.protocols = data.protocols || [];
+  if (!S.protocols.length) {
+    wrap.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:6px;font-style:italic">No protocols saved yet.</div>';
+    return;
+  }
+  // Filter out protocols already running (dedup by protocol.id)
+  var runningPids = _getAllRunsLocal()
+    .map(function(r){return r.protocol && r.protocol.id;})
+    .filter(function(x){return x != null;});
+  var choices = S.protocols.filter(function(p){return runningPids.indexOf(p.id) === -1;});
+  var opts = choices.map(function(p){return '<option value="' + p.id + '">' + esc(p.title) + '</option>';}).join('');
+  wrap.innerHTML =
+    '<div class="sp-inline-picker">' +
+      '<input type="text" id="sp-inline-q" placeholder="Filter protocols..." spellcheck="false" oninput="spInlinePickerFilter()"/>' +
+      '<select id="sp-inline-sel" size="4">' + (opts || '<option disabled>All protocols already running</option>') + '</select>' +
+      '<div style="margin-top:6px;display:flex;gap:6px;justify-content:flex-end">' +
+        '<button class="btn" onclick="spHideRunPickerInline()">Cancel</button>' +
+        '<button class="btn primary" onclick="spLaunchInline()">&#9654; Start run</button>' +
+      '</div>' +
+    '</div>';
+  document.getElementById('sp-inline-q')?.focus();
+}
+function spInlinePickerFilter() {
+  var q = (document.getElementById('sp-inline-q')?.value || '').toLowerCase();
+  document.querySelectorAll('#sp-inline-sel option').forEach(function(o){o.style.display = (!q || o.textContent.toLowerCase().includes(q)) ? '' : 'none';});
+}
+function spHideRunPickerInline() {
+  var wrap = document.getElementById('sp-runpicker-inline'); if (wrap) wrap.innerHTML = '';
+}
+function spLaunchInline() {
+  var sel = document.getElementById('sp-inline-sel');
+  if (!sel || !sel.value) { toast('Select a protocol first', true); return; }
+  var p = (S.protocols || []).find(function(x){return x.id === parseInt(sel.value);});
+  if (!p) return;
+  // spLaunchRunDirect swaps _scratchProtoRun to the new run and re-renders.
+  // The tab bar picks up the new run automatically.
+  spLaunchRunDirect(p, null, null);
 }
 
 function spSaveAndExit() {
-  // Deliberately do NOT clear timers here. Running timers live in the floating
-  // widget and should keep counting even after the user exits the run — a
-  // 30-min incubation shouldn't die because the user navigated back to
-  // protocols. They can dismiss timers from the widget itself.
+  _clearAllTimers();
   if (_scratchProtoRun) _saveRun(_scratchProtoRun);
   _scratchProtoRun = null;
   if (typeof setView === 'function') setView('protocols'); else loadView();
@@ -548,9 +835,7 @@ function spSaveAndExit() {
 
 function spAbandonRun() {
   if (!confirm('Abandon this run? Progress will be lost.')) return;
-  // Same reasoning as spSaveAndExit — don't touch the floating widget on
-  // abandon. If a timer is genuinely no longer wanted, the user removes it
-  // from the widget.
+  _clearAllTimers();
   if (_scratchProtoRun) _removeRun(_scratchProtoRun.runId);
   _scratchProtoRun = null;
   if (typeof setView === 'function') setView('protocols'); else loadView();
