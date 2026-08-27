@@ -692,7 +692,7 @@ function _panelBody(p) {
   h+='</div></div>';
   // steps
   if(!hasSteps) h+='<div style="color:#8a7f72;font-size:13px;font-style:italic;margin-bottom:16px">No steps yet — import from Claude or add manually.</div>';
-  else if(isStructured) h+='<ol class="steps-list">'+steps.map(function(s){return '<li>'+_renderStepText(s.text)+(s.note?'<div style="font-size:11px;color:#8a7f72;margin:2px 0 4px;padding-left:4px;border-left:2px solid #e8e2d8">'+esc(s.note)+'</div>':'')+'</li>';}).join('')+'</ol>';
+  else if(isStructured) h+='<ol class="steps-list">'+steps.map(function(s, i){return '<li>'+_renderStepText(s.text, p.title, i+1)+(s.note?'<div style="font-size:11px;color:#8a7f72;margin:2px 0 4px;padding-left:4px;border-left:2px solid #e8e2d8">'+esc(s.note)+'</div>':'')+'</li>';}).join('')+'</ol>';
   else h+='<div class="steps-text">'+esc(p.steps)+'</div>';
   // recipe
   h+='<div class="recipe-section"><div class="recipe-section-head"><span>Reaction Tables</span><div class="recipe-edit-actions" id="recipe-actions-'+p.id+'"><button class="btn" onclick="protoRecipeEdit('+p.id+')">Edit tables</button></div></div>';
@@ -960,18 +960,25 @@ function protoOpenRun(pid) {
 }
 
 // ── protocol link rendering + timer detection ─────────────────────────────────
-function _renderStepText(text) {
+// stepNum (1-indexed) and protoTitle are optional; when supplied they get
+// embedded into the label / subtitle of the floating timer so the user can
+// tell at a glance which step of which protocol each running timer belongs to.
+function _renderStepText(text, protoTitle, stepNum) {
   var rendered = text.split(/(\[@[^\]]+\]\(proto:\d+\))/g).map(function(part){
     var m=part.match(/^\[@([^\]]+)\]\(proto:(\d+)\)$/);
     if(m) return '<span class="proto-link-badge" onclick="protoOpenPanel('+m[2]+')" title="Open '+esc(m[1])+'">&#8599; '+esc(m[1])+'</span>';
     return esc(part);
   }).join('');
-  // detect duration and add timer button
+  // detect duration and add timer button — routes through window.protoTimerAdd
+  // which the floating widget owns. Timer lives outside this view.
   if (typeof protoTimerParseDuration === 'function') {
     var dur = protoTimerParseDuration(text);
     if (dur > 0) {
-      var label = text.length > 60 ? text.substring(0, 57) + '...' : text;
-      rendered += ' <button class="proto-timer-btn" onclick="event.stopPropagation();protoTimerAdd(\'' + esc(label).replace(/'/g, "\\'") + '\',' + dur + ')" title="Start ' + _fmtDurShort(dur) + ' timer">&#9202; ' + _fmtDurShort(dur) + '</button>';
+      var shortText = text.length > 60 ? text.substring(0, 57) + '...' : text;
+      var label = (stepNum ? 'Step ' + stepNum + ': ' : '') + shortText;
+      var jsSafeLabel = esc(label).replace(/'/g, "\\'");
+      var jsSafeProto = esc(protoTitle || '').replace(/'/g, "\\'");
+      rendered += ' <button class="proto-timer-btn" onclick="event.stopPropagation();protoTimerAdd(\'' + jsSafeLabel + '\',' + dur + ',\'' + jsSafeProto + '\')" title="Start ' + _fmtDurShort(dur) + ' timer">&#9202; ' + _fmtDurShort(dur) + '</button>';
     }
   }
   return rendered;

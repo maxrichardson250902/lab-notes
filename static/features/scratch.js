@@ -143,16 +143,12 @@ async function _getAllRuns() {
     '.sp-summary-clean{font-size:13px;color:#5b7a5e;font-style:italic}',
     '.sp-run-footer{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap}',
 
+    /* Step timer button — delegates to the floating proto-timer widget. All
+       running/paused/expired state now lives in that widget, so the button
+       is a plain "start" affordance. */
     '.sp-timer-btn{background:none;border:1px solid #d5cec0;border-radius:4px;font-size:11px;color:#8a7f72;cursor:pointer;padding:2px 8px;margin-left:25px;margin-top:4px;display:inline-flex;align-items:center;gap:4px}',
     '.sp-timer-btn:hover{background:#f0ebe3;color:#4a4139}',
-    '.sp-timer-btn.running{border-color:#5b7a5e;color:#5b7a5e;background:#e8f0e8}',
-    '.sp-timer-btn.expired{border-color:#c0392b;color:#c0392b;background:#fde8e8;animation:sp-flash 0.8s infinite}',
-    '.sp-timer-display{font-family:"SF Mono",Monaco,Consolas,monospace;font-size:12px;font-weight:600;min-width:44px;text-align:center}',
-    '@keyframes sp-flash{0%,100%{opacity:1}50%{opacity:0.3}}',
-    '.sp-timer-popup{position:fixed;bottom:24px;right:24px;background:#faf8f4;border:2px solid #c0392b;border-radius:8px;padding:16px 20px;z-index:3000;min-width:260px;max-width:380px;box-shadow:0 4px 20px rgba(60,52,42,.2)}',
-    '.sp-timer-popup-title{font-weight:700;font-size:13px;color:#c0392b;margin-bottom:4px}',
-    '.sp-timer-popup-text{font-size:12px;color:#4a4139;margin-bottom:10px;line-height:1.5}',
-    '.sp-step.timer-expired{border-left:3px solid #c0392b;background:#fff8f8}',
+    '.sp-timer-btn.disabled{opacity:.5;cursor:not-allowed}',
     /* Brief highlight when navigated here via "Finish" from dashboard */
     '@keyframes sp-finish-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(91,122,94,.4); } 50% { box-shadow: 0 0 0 8px rgba(91,122,94,0); } }',
     '.sp-finish-highlight { animation: sp-finish-pulse 1.1s ease-in-out 2; }'
@@ -164,79 +160,71 @@ async function _getAllRuns() {
 // ── recipe helpers ────────────────────────────────────────────────────────────
 var _DEFAULT_RECIPE = { columns: ['Component', 'Stock conc.', 'Volume (uL)', 'Final conc.'], rows: [] };
 
-// ── timer state ───────────────────────────────────────────────────────────────
-var _stepTimers = {}; // stepId -> {endTime, intervalId, duration, paused, remaining}
-var _timerMasterInterval = null;
+// ── timer helpers (delegates to floating proto-timer widget) ────────────────
+// The floating widget in /static/proto-timer.js owns all timer state,
+// persistence, and ticking — this file just parses duration and hands off.
+// Timers survive view changes and page reloads because they live in
+// localStorage and are managed by an interval inside that IIFE, not here.
 
 function _parseDurationFromText(text) {
-  // auto-detect duration from step text e.g. "37°C for 30 min", "incubate 2 hours", "45 sec"
-  var t = text.toLowerCase();
-  var m;
+  // Prefer the widget's parser (kept in one place); fall back to a local
+  // parse if the widget isn't loaded yet (e.g. during boot before
+  // proto-timer.js has evaluated).
+  if (typeof window.protoTimerParseDuration === 'function') {
+    return window.protoTimerParseDuration(text);
+  }
+  var t = (text || '').toLowerCase(); var m;
   if ((m = t.match(/(\d+(?:\.\d+)?)\s*h(?:ours?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]) * 3600);
   if ((m = t.match(/(\d+(?:\.\d+)?)\s*min(?:utes?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]) * 60);
   if ((m = t.match(/(\d+(?:\.\d+)?)\s*s(?:ec(?:onds?)?)?(?:\s|$)/))) return Math.round(parseFloat(m[1]));
   return 0;
 }
 
-function _fmtTime(secs) {
-  if (secs < 0) secs = 0;
-  var h = Math.floor(secs / 3600);
-  var m = Math.floor((secs % 3600) / 60);
-  var s = secs % 60;
-  if (h > 0) return h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
-  return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+function _fmtDurShortSp(sec) {
+  if (sec >= 3600) { var h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60); return h + 'h' + (m ? m + 'm' : ''); }
+  if (sec >= 60) { var m = Math.floor(sec/60), s = sec % 60; return m + 'm' + (s ? s + 's' : ''); }
+  return sec + 's';
 }
 
-function _requestNotifPermission() {
-  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-    Notification.requestPermission();
-  }
-}
-
+// Called from the per-step ⏱ button. Reads current run state, computes
+// duration (falling back to a prompt if the step text has no parseable
+// duration), and hands off to the floating widget. Multiple can run at once —
+// the widget shows each one with the step-number label and protocol title
+// as subtitle. Nothing view-scoped is kept here.
 function spStartTimer(stepId) {
   var rs = _scratchProtoRun; if (!rs) return;
-  var step = rs.steps.find(function(s) { return s.id === stepId; }); if (!step) return;
-  var existing = _stepTimers[stepId];
-  if (existing && existing.intervalId) {
-    // already running — pause it
-    clearInterval(existing.intervalId);
-    existing.paused = true;
-    existing.remaining = Math.max(0, Math.ceil((existing.endTime - Date.now()) / 1000));
-    existing.intervalId = null;
-    _updateTimerDisplay(stepId);
+  var idx = rs.steps.findIndex(function(s){ return s.id === stepId; });
+  if (idx < 0) return;
+  var step = rs.steps[idx];
+
+  if (typeof window.protoTimerAdd !== 'function') {
+    toast('Timer widget not loaded — try refreshing the page', true);
     return;
   }
-  if (existing && existing.paused) {
-    // resume
-    existing.endTime = Date.now() + existing.remaining * 1000;
-    existing.paused = false;
-    existing.intervalId = setInterval(function() { _timerTick(stepId); }, 500);
-    _updateTimerDisplay(stepId);
-    return;
-  }
-  // start fresh — prompt for duration if not set
+
   var duration = step.duration || _parseDurationFromText(step.text);
   if (!duration) {
-    var input = prompt('Timer duration (e.g. 30min, 1h, 45sec, or seconds):');
+    var input = prompt('Timer duration for this step (e.g. 30min, 1h, 45sec):');
     if (!input) return;
-    duration = _parseInputDuration(input);
+    duration = _parseInputDurationSp(input);
     if (!duration) { toast('Could not parse duration', true); return; }
     step.duration = duration;
+    if (typeof _saveRun === 'function') _saveRun(rs);
   }
-  _stepTimers[stepId] = {
-    duration:   duration,
-    endTime:    Date.now() + duration * 1000,
-    remaining:  duration,
-    paused:     false,
-    expired:    false,
-    intervalId: setInterval(function() { _timerTick(stepId); }, 500)
-  };
-  _requestNotifPermission();
-  _updateTimerDisplay(stepId);
+
+  // Label is "Step N: <trimmed text>" — protocol title becomes the subtitle
+  // in the floating widget's render.
+  var shortText = (step.text || '').replace(/\s+/g, ' ').trim();
+  if (shortText.length > 60) shortText = shortText.substring(0, 57) + '...';
+  var label = 'Step ' + (idx + 1) + (shortText ? ': ' + shortText : '');
+  var protoTitle = (rs.protocol && rs.protocol.title) || '';
+
+  window.protoTimerAdd(label, duration, protoTitle);
+  toast('Timer started: ' + _fmtDurShortSp(duration));
 }
 
-function _parseInputDuration(input) {
-  input = input.trim().toLowerCase();
+function _parseInputDurationSp(input) {
+  input = (input || '').trim().toLowerCase();
   var m;
   if ((m = input.match(/^(\d+(?:\.\d+)?)\s*h/))) return Math.round(parseFloat(m[1]) * 3600);
   if ((m = input.match(/^(\d+(?:\.\d+)?)\s*m/))) return Math.round(parseFloat(m[1]) * 60);
@@ -245,124 +233,18 @@ function _parseInputDuration(input) {
   return 0;
 }
 
-function spResetTimer(stepId) {
-  var t = _stepTimers[stepId]; if (!t) return;
-  if (t.intervalId) clearInterval(t.intervalId);
-  delete _stepTimers[stepId];
-  var el = document.getElementById('sps-' + stepId);
-  if (el) {
-    el.classList.remove('timer-expired');
-    var btn = el.querySelector('.sp-timer-btn');
-    if (btn) { btn.className = 'sp-timer-btn'; btn.innerHTML = '&#9202; ' + (document.getElementById('sp-timer-custom-' + stepId) ? _fmtTime(0) : 'Timer'); }
-  }
-  _removeTimerPopup(stepId);
-}
-
-function _timerTick(stepId) {
-  var t = _stepTimers[stepId]; if (!t || t.paused) return;
-  var remaining = Math.ceil((t.endTime - Date.now()) / 1000);
-  t.remaining = remaining;
-  if (remaining <= 0 && !t.expired) {
-    t.expired = true;
-    clearInterval(t.intervalId);
-    t.intervalId = null;
-    _onTimerExpired(stepId);
-  }
-  _updateTimerDisplay(stepId);
-}
-
-function _updateTimerDisplay(stepId) {
-  var t = _stepTimers[stepId];
-  var el = document.getElementById('sps-' + stepId); if (!el) return;
-  var btn = el.querySelector('.sp-timer-btn'); if (!btn) return;
-  var disp = el.querySelector('.sp-timer-display');
-
-  if (!t) {
-    btn.className = 'sp-timer-btn';
-    btn.innerHTML = '&#9202; Timer';
-    return;
-  }
-  var remaining = t.paused ? t.remaining : Math.max(0, Math.ceil((t.endTime - Date.now()) / 1000));
-  var timeStr = _fmtTime(remaining);
-
-  if (t.expired) {
-    btn.className = 'sp-timer-btn expired';
-    btn.innerHTML = '&#9203; ' + timeStr + ' &nbsp;<small>done</small>';
-  } else if (t.paused) {
-    btn.className = 'sp-timer-btn';
-    btn.innerHTML = '&#9654; ' + timeStr + ' &nbsp;<small>paused</small>';
-  } else {
-    btn.className = 'sp-timer-btn running';
-    btn.innerHTML = '&#9646;&#9646; ' + timeStr;
-  }
-}
-
-function _onTimerExpired(stepId) {
-  var rs = _scratchProtoRun; if (!rs) return;
-  var step = rs.steps.find(function(s) { return s.id === stepId; });
-  var stepText = step ? step.text : 'Step ' + stepId;
-  // flash the step card
-  var el = document.getElementById('sps-' + stepId);
-  if (el) el.classList.add('timer-expired');
-  // browser notification
-  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-    new Notification('Timer done — ' + (rs.protocol.title || 'Protocol'), {
-      body: stepText,
-      icon: '/favicon.ico'
-    });
-  }
-  // popup in corner
-  _showTimerPopup(stepId, stepText);
-  _updateTimerDisplay(stepId);
-}
-
-function _showTimerPopup(stepId, stepText) {
-  _removeTimerPopup(stepId);
-  var div = document.createElement('div');
-  div.className = 'sp-timer-popup';
-  div.id = 'sp-timer-popup-' + stepId;
-  div.innerHTML =
-    '<div class="sp-timer-popup-title">&#9203; Timer complete!</div>' +
-    '<div class="sp-timer-popup-text">' + esc(stepText) + '</div>' +
-    '<div style="display:flex;gap:8px">' +
-      '<button class="btn primary" style="flex:1" onclick="spDismissTimer(' + stepId + ')">Dismiss</button>' +
-      '<button class="btn" onclick="spResetTimer(' + stepId + ')">Reset</button>' +
-    '</div>';
-  document.body.appendChild(div);
-}
-
-function _removeTimerPopup(stepId) {
-  var el = document.getElementById('sp-timer-popup-' + stepId);
-  if (el) el.remove();
-}
-
-function spDismissTimer(stepId) {
-  _removeTimerPopup(stepId);
-  var el = document.getElementById('sps-' + stepId);
-  if (el) el.classList.remove('timer-expired');
-}
-
-function _clearAllTimers() {
-  Object.keys(_stepTimers).forEach(function(id) {
-    var t = _stepTimers[id];
-    if (t && t.intervalId) clearInterval(t.intervalId);
-    _removeTimerPopup(parseInt(id));
-  });
-  _stepTimers = {};
-}
-
+// Rendered inside each step row. The button starts a NEW timer each click —
+// running state, pause, reset, and countdown display are all owned by the
+// floating widget now. If the step text has no parseable duration the button
+// still appears; clicking prompts for one.
 function _getTimerHTML(step) {
-  var t = _stepTimers[step.id];
-  var duration = step.duration || _parseDurationFromText(step.text);
-  var label = t ? '' : (duration ? _fmtTime(duration) : 'Timer');
-  var cls = t ? (t.expired ? 'expired' : t.paused ? '' : 'running') : '';
-  var icon = t ? (t.expired ? '&#9203;' : t.paused ? '&#9654;' : '&#9646;&#9646;') : '&#9202;';
-  var timeStr = t ? _fmtTime(t.paused ? t.remaining : Math.max(0, Math.ceil((t.endTime - Date.now()) / 1000))) : label;
-  return '<button class="sp-timer-btn ' + cls + '" onclick="spStartTimer(' + step.id + ')">' +
-    icon + ' ' + timeStr +
-    '</button>' +
-    (t ? ' <button class="sp-timer-btn" style="margin-left:4px" onclick="spResetTimer(' + step.id + ')">&#215;</button>' : '');
+  var dur = step.duration || _parseDurationFromText(step.text);
+  var label = dur ? _fmtDurShortSp(dur) : 'Timer';
+  return '<button class="sp-timer-btn" onclick="spStartTimer(' + step.id + ')" title="Start timer in the floating widget">' +
+    '&#9202; ' + label +
+    '</button>';
 }
+
 
 function _parseRecipeRun(raw) {
   if (!raw) return JSON.parse(JSON.stringify(_DEFAULT_RECIPE));
@@ -546,7 +428,7 @@ function spLaunchRunDirect(p, group, subgroup) {
   }).catch(function() {});
 
   _saveLocalOnly(_scratchProtoRun);
-  _requestNotifPermission();
+  // Notification permission is requested lazily by protoTimerAdd on first use.
 
   if (S.view === 'scratch') {
     var el = document.getElementById('content');
@@ -651,12 +533,13 @@ function _renderProtoRunInScratch(el) {
         '<button class="btn primary sp-finish-btn" data-sp-finish="1" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
       '</div>' +
     '</div>';
-  // initialise timer buttons for each step (after DOM is set)
-  rs.steps.forEach(function(step) { _renderTimerBtn(step.id); });
 }
 
 function spSaveAndExit() {
-  _clearAllTimers();
+  // Deliberately do NOT clear timers here. Running timers live in the floating
+  // widget and should keep counting even after the user exits the run — a
+  // 30-min incubation shouldn't die because the user navigated back to
+  // protocols. They can dismiss timers from the widget itself.
   if (_scratchProtoRun) _saveRun(_scratchProtoRun);
   _scratchProtoRun = null;
   if (typeof setView === 'function') setView('protocols'); else loadView();
@@ -665,7 +548,9 @@ function spSaveAndExit() {
 
 function spAbandonRun() {
   if (!confirm('Abandon this run? Progress will be lost.')) return;
-  _clearAllTimers();
+  // Same reasoning as spSaveAndExit — don't touch the floating widget on
+  // abandon. If a timer is genuinely no longer wanted, the user removes it
+  // from the widget.
   if (_scratchProtoRun) _removeRun(_scratchProtoRun.runId);
   _scratchProtoRun = null;
   if (typeof setView === 'function') setView('protocols'); else loadView();

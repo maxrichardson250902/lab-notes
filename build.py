@@ -44,6 +44,16 @@ def build():
         else:
             print(f"  WARN: {path} not found, skipping")
 
+    # Global singletons that live outside features/. Loaded AFTER all features
+    # so any wired-up buttons calling window.protoTimer* find the API present.
+    top_level_singletons = ["proto-timer.js"]
+    for fname in top_level_singletons:
+        path = STATIC / fname
+        if path.exists():
+            js_parts.append(f"// ── {fname} ──\n{path.read_text()}")
+        else:
+            print(f"  WARN: {path} not found, skipping")
+
     all_js = "\n\n".join(js_parts)
 
     # Replace the script tags block with a single inline <script>
