@@ -7875,13 +7875,13 @@ function _categoryLabel(key) {
 // ── data loading ──────────────────────────────────────────────────────────
 async function _hoursLoad() {
   if (!_hoursCategories.length) {
-    var catsResp = await api('/api/hours/categories');
+    var catsResp = await api('GET', '/api/hours/categories');
     _hoursCategories = catsResp.categories;
   }
   if (!_hoursWeekStart) _hoursWeekStart = _mondayOf(new Date());
   var earliest = _addDays(_hoursWeekStart, -(_hoursWeeksToShow - 1) * 7);
   var latest = _addDays(_hoursWeekStart, 6);
-  var resp = await api('/api/hours/entries?start=' + _isoDate(earliest) +
+  var resp = await api('GET', '/api/hours/entries?start=' + _isoDate(earliest) +
                        '&end=' + _isoDate(latest));
   _hoursEntries = resp.entries;
 }
@@ -8075,7 +8075,7 @@ async function _hoursOpenEntryModal(id) {
   var entry = _hoursEntries.find(function(e){ return e.id === id; });
   if (!entry) {
     // Fallback: refetch (entry may not be in the loaded range)
-    entry = await api('/api/hours/entries/' + id);
+    entry = await api('GET', '/api/hours/entries/' + id);
   }
   await _hoursRenderModal(entry);
 }
@@ -8086,7 +8086,7 @@ async function _hoursRenderModal(entry) {
   // Workflow-day suggestion for the entry date
   var wfSuggest = null;
   try {
-    wfSuggest = await api('/api/hours/workflow-day-suggestions?date=' + data.date_iso);
+    wfSuggest = await api('GET', '/api/hours/workflow-day-suggestions?date=' + data.date_iso);
   } catch (e) { /* non-fatal */ }
 
   var currentWfDate = isNew ? (wfSuggest && wfSuggest.exact ? wfSuggest.exact.date : '')
@@ -8205,18 +8205,14 @@ async function _hoursSaveEntry() {
 
   try {
     if (_hoursEditingId) {
-      await api('/api/hours/entries/' + _hoursEditingId, {
-        method: 'PATCH',
-        body: JSON.stringify({ start_hour: start, end_hour: end, category: category,
-                               notes: notes, workflow_day_date: wfDate || '' })
+      await api('PATCH', '/api/hours/entries/' + _hoursEditingId, {
+        start_hour: start, end_hour: end, category: category,
+        notes: notes, workflow_day_date: wfDate || ''
       });
     } else {
-      await api('/api/hours/entries', {
-        method: 'POST',
-        body: JSON.stringify({
-          date_iso: _hoursPendingNew.date_iso, start_hour: start, end_hour: end,
-          category: category, notes: notes, workflow_day_date: wfDate
-        })
+      await api('POST', '/api/hours/entries', {
+        date_iso: _hoursPendingNew.date_iso, start_hour: start, end_hour: end,
+        category: category, notes: notes, workflow_day_date: wfDate
       });
     }
     _hoursCloseModal();
@@ -8232,7 +8228,7 @@ async function _hoursDeleteEntry() {
   if (!_hoursEditingId) return;
   if (!confirm('Delete this entry and its attachments?')) return;
   try {
-    await api('/api/hours/entries/' + _hoursEditingId, { method: 'DELETE' });
+    await api('DELETE', '/api/hours/entries/' + _hoursEditingId);
     _hoursCloseModal();
     await _hoursLoad();
     _hoursRerender();
@@ -8270,7 +8266,7 @@ async function _hoursUploadFile() {
 async function _hoursRemoveAttachment(attId) {
   if (!confirm('Remove this attachment?')) return;
   try {
-    await api('/api/hours/attachments/' + attId, { method: 'DELETE' });
+    await api('DELETE', '/api/hours/attachments/' + attId);
     await _hoursLoad();
     var updated = _hoursEntries.find(function(e){ return e.id === _hoursEditingId; });
     if (updated) await _hoursRenderModal(updated);
