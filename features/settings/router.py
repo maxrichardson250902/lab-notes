@@ -35,6 +35,12 @@ DEFAULTS = {
     "sidebar_peek_delay_ms": 150,
     # Debounce for auto-save in editors (workflow doc, scratch). Milliseconds.
     "auto_save_delay_ms": 1500,
+    # ── Workflow chip auto-insertion ───────────────────────────────────────
+    # On Enter in the workflow doc, insert a time chip only if the user has
+    # been idle for at least this long. Prevents spam during active typing
+    # while still stamping natural break points. Manual Ctrl+T always
+    # inserts regardless of this setting.
+    "wf_chip_idle_minutes": 5,
     # ── LLM backend selection ──────────────────────────────────────────────
     # Which LLM backend the app uses for enrichment, predictions, protocol
     # extraction, Process Day, etc. "3090" = local GPU (free); "claude" =

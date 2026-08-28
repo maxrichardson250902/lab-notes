@@ -55,7 +55,11 @@ TIME_CHIP_RE = re.compile(
 # at write time rather than silently accepted.
 VALID_EVENT_TYPES = {
     "step_done", "step_undone",
-    # hours_period_* and workflow_chip are synthesised on read (not written)
+    # workflow_chip is allowed as a write for immediate-visibility on chip
+    # insert. Live parsing also emits it (synthesized on read). Dedupe in
+    # _dedupe_workflow_chips prevents doubling.
+    "workflow_chip",
+    # hours_period is synthesized on read only (not written directly).
 }
 VALID_SOURCE_TYPES = {
     "protocol_run", "hours_entry", "workflow_day"
@@ -260,6 +264,31 @@ def _load_day_doc(conn, day_iso: str) -> str:
     return row["content"] if row else ""
 
 
+def _dedupe_workflow_chips(events: List[dict]) -> List[dict]:
+    """Remove duplicate workflow_chip events at the same (source_id, ts_iso).
+    Chips can appear twice temporarily: once as a stored event (fired
+    on insert by the frontend for immediate visibility) and once as a
+    live-parsed event (from day_documents.content after debounced save).
+
+    We keep the parsed one when both exist — its `content` reflects the
+    text that has actually been typed following the chip in the doc,
+    which the stored copy captured only at insert time.
+
+    Parsed events are identified by `id is None`; stored events have an
+    integer id. Non-workflow_chip events pass through unchanged."""
+    seen_parsed = set()
+    for e in events:
+        if e.get("event_type") == "workflow_chip" and e.get("id") is None:
+            seen_parsed.add((e["source_id"], e["ts_iso"]))
+    out = []
+    for e in events:
+        if (e.get("event_type") == "workflow_chip" and e.get("id") is not None
+                and (e["source_id"], e["ts_iso"]) in seen_parsed):
+            continue  # drop stored duplicate — parsed wins
+        out.append(e)
+    return out
+
+
 # ── endpoints ───────────────────────────────────────────────────────────────
 @router.post("/log")
 def log_event(event: EventIn):
@@ -305,6 +334,14 @@ def events_for_date(date: str, collapse: bool = False):
         chip_evs = _parse_workflow_chips(date_iso, doc) if doc else []
 
     merged = stored + hours_evs + chip_evs
+    # Dedupe workflow_chip events. On insert, the frontend fires a
+    # /log call so the chip shows up immediately. When the doc later
+    # saves, the same chip becomes visible via HTML re-parse. Without
+    # dedupe, both would appear. Rule: if a stored and a parsed chip
+    # share the same (date, HH:MM), keep the parsed one — its content
+    # reflects whatever text has been typed following the chip since
+    # insertion, which the stored copy can't track.
+    merged = _dedupe_workflow_chips(merged)
     merged.sort(key=lambda e: e["ts_iso"])
     if collapse:
         merged = _collapse_step_events(merged)

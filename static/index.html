@@ -2318,6 +2318,51 @@ var _readWindowDays = 30;      // window size
 var _wfActiveProject = null;         // string project name, or null = untagged
 var _wfKnownProjects = [];           // [{name, day_count}, ...] from /api/workflow/projects
 
+// ── Chip auto-insert idle tracker ───────────────────────────────────────────
+// Timestamp of the user's last content-producing keydown (character keys,
+// Backspace/Delete). Enter and pure modifier keys DON'T update this — Enter
+// is what we're gating on, and modifier-only presses aren't "activity".
+//
+// The Enter handler compares (now - _wfLastActivityAt) against the user's
+// configured wf_chip_idle_minutes threshold. If below threshold → user was
+// recently active, don't stamp another chip. If above → insert chip and
+// bump _wfLastActivityAt so the next Enter doesn't immediately re-stamp.
+//
+// Initial value = load time so the first Enter after loading the app
+// (probably a while after last real activity, since docs aren't edited
+// while the app is closed) will get a chip.
+var _wfLastActivityAt = Date.now();
+
+// Keys that DON'T count as "activity" for the idle tracker. Enter is what
+// we gate on; modifiers/nav don't produce content; F-keys and Escape are
+// meta. Backspace/Delete are intentionally NOT here — deleting is
+// activity.
+var _WF_NON_ACTIVITY_KEYS = {
+  Enter: 1, Shift: 1, Control: 1, Alt: 1, Meta: 1, CapsLock: 1,
+  ArrowUp: 1, ArrowDown: 1, ArrowLeft: 1, ArrowRight: 1,
+  Tab: 1, Escape: 1, PageUp: 1, PageDown: 1, Home: 1, End: 1,
+  F1: 1, F2: 1, F3: 1, F4: 1, F5: 1, F6: 1, F7: 1, F8: 1, F9: 1, F10: 1, F11: 1, F12: 1
+};
+
+// Fire-and-forget log to /api/time-events so the chip shows up in hours
+// copy-from-workflow immediately, without waiting for the debounced doc
+// save. Deduped on read against the live-parsed chip from the doc HTML,
+// so no double-count.
+function _wfLogChipEvent(dateIso, hh, mm, followingText) {
+  var ts = dateIso + 'T' + hh + ':' + mm + ':00';
+  fetch('/api/time-events/log', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      ts_iso: ts,
+      event_type: 'workflow_chip',
+      source_type: 'workflow_day',
+      source_id: dateIso,
+      content: (followingText || '').substring(0, 500)
+    })
+  }).catch(function() { /* silent — save+reparse will catch it later */ });
+}
+
 function _wfGetActiveProject() {
   if (_wfActiveProject !== null) return _wfActiveProject;
   try { _wfActiveProject = localStorage.getItem('wf-active-project') || ''; }
@@ -2952,14 +2997,32 @@ async function _wfSaveDoc(html) {
   }
 }
 
-/* Time chip — inserts current HH:MM as a non-editable chip */
-function wfInsertTimeChip() {
+/* Time chip — inserts current HH:MM as a non-editable chip. Called both
+   from the toolbar button (no args) and from the Ctrl+T keydown handler
+   ({manual: true}). Manual insert bypasses the idle-threshold check
+   (auto-insert enforces it separately in _wfDocKeydownExtras Enter path).
+   Always fires the time_events log for immediate hours-copy visibility. */
+function wfInsertTimeChip(opts) {
   if (!window._wfDocApi) return;
   var now = new Date();
   var hh = String(now.getHours()).padStart(2, '0');
   var mm = String(now.getMinutes()).padStart(2, '0');
   var chip = '<span class="wf-time" contenteditable="false">' + hh + ':' + mm + '</span>&nbsp;';
   document.execCommand('insertHTML', false, chip);
+  _wfLastActivityAt = now.getTime();  /* manual insert counts as activity */
+  var dateIso = (typeof _workflowDate !== 'undefined' && _workflowDate)
+                ? _workflowDate : now.toISOString().slice(0, 10);
+  // Following text is best-effort — take the containing block's text.
+  var sel = window.getSelection();
+  var followingText = '';
+  if (sel && sel.anchorNode) {
+    var b = sel.anchorNode.parentNode;
+    while (b && b.id !== 'wf-doc' && !(b.matches && b.matches('p, div, h3, h4, blockquote'))) {
+      b = b.parentNode;
+    }
+    if (b && b.id !== 'wf-doc') followingText = (b.textContent || '').trim();
+  }
+  _wfLogChipEvent(dateIso, hh, mm, followingText);
 }
 
 /* Doc-specific keydown: Ctrl+T (time), Ctrl+G (tag picker), Enter auto-time-chip */
@@ -3080,6 +3143,16 @@ function _wfHandleTrackedDelete(direction) {
 
 
 function _wfDocKeydownExtras(e) {
+  /* Update the last-activity tracker on any content-producing keypress.
+     Excludes Enter (that's what we gate on) and pure modifier keys
+     (Shift/Ctrl/Alt/Meta/CapsLock — pressing Shift alone isn't "activity").
+     Arrow keys and Tab are also excluded because caret navigation without
+     input isn't real editing. Backspace/Delete DO count — user is
+     actively modifying content. */
+  if (!_WF_NON_ACTIVITY_KEYS[e.key]) {
+    _wfLastActivityAt = Date.now();
+  }
+
   /* Track-changes interception FIRST — must run before Ctrl+T / Enter etc.
      Only Backspace/Delete are affected. Only active for past days when
      redact mode is OFF. */
@@ -3092,7 +3165,9 @@ function _wfDocKeydownExtras(e) {
     }
   }
   if ((e.ctrlKey || e.metaKey) && (e.key === 't' || e.key === 'T')) {
-    e.preventDefault(); wfInsertTimeChip(); return;
+    /* Manual chip insert — bypasses the idle-threshold check. User asked
+       for it explicitly, so we insert unconditionally. */
+    e.preventDefault(); wfInsertTimeChip({manual: true}); return;
   }
   if ((e.ctrlKey || e.metaKey) && (e.key === 'g' || e.key === 'G')) {
     e.preventDefault(); wfOpenTagPicker(); return;
@@ -3133,29 +3208,17 @@ function _wfDocKeydownExtras(e) {
 
       if (block.querySelector && block.querySelector('.wf-time')) return;
 
-      /* ── 15-min gap check ────────────────────────────────────────────
-         Skip insertion if any existing chip in the doc has a time within
-         15 minutes of now. Stops rapid typing from stamping every line.
-         Uses the max-time-value across all chips so ordering doesn't matter. */
-      var docRoot = document.getElementById('wf-doc');
+      /* ── Idle-threshold check ────────────────────────────────────────
+         Stamp a chip only if the user has been idle at least
+         wf_chip_idle_minutes minutes. Reference point is the user's last
+         content-producing keystroke (_wfLastActivityAt), NOT the max
+         chip time in the doc. This means continuous typing never
+         inserts more chips, and returning after a real break always
+         gets one. */
+      var thresholdMin = (window.S && S.settings && S.settings.wf_chip_idle_minutes) || 5;
       var now = new Date();
-      var nowMin = now.getHours() * 60 + now.getMinutes();
-      if (docRoot) {
-        var chips = docRoot.querySelectorAll('.wf-time');
-        var maxMin = -1;
-        for (var i = 0; i < chips.length; i++) {
-          var m = chips[i].textContent.trim().match(/^(\d{1,2}):(\d{2})$/);
-          if (m) {
-            var v = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-            if (v > maxMin) maxMin = v;
-          }
-        }
-        if (maxMin >= 0) {
-          var diff = nowMin - maxMin;
-          if (diff < 0) diff += 24 * 60;  /* crossed midnight */
-          if (diff < 15) return;
-        }
-      }
+      var idleMs = now.getTime() - _wfLastActivityAt;
+      if (idleMs < thresholdMin * 60 * 1000) return;
 
       var hh = String(now.getHours()).padStart(2, '0');
       var mm = String(now.getMinutes()).padStart(2, '0');
@@ -3166,6 +3229,17 @@ function _wfDocKeydownExtras(e) {
       var spaceNode = document.createTextNode(' ');
       block.insertBefore(chip, block.firstChild);
       block.insertBefore(spaceNode, chip.nextSibling);
+
+      /* Bump activity timestamp so the next Enter after this doesn't
+         immediately try to insert again (idle since this chip = 0). */
+      _wfLastActivityAt = now.getTime();
+
+      /* Log to time_events immediately so hours copy-from-workflow sees
+         this chip without waiting for the debounced doc save. Deduped
+         against the eventual live-parsed chip so no double-count. */
+      var dateIso = (typeof _workflowDate !== 'undefined' && _workflowDate)
+                    ? _workflowDate : (new Date()).toISOString().slice(0, 10);
+      _wfLogChipEvent(dateIso, hh, mm, (block.textContent || '').trim());
 
       /* ── Cursor fix ───────────────────────────────────────────────────
          Previously the caret stayed at position 0 (before the chip) so the
@@ -25331,6 +25405,16 @@ var SETTINGS_SPEC = [
     max: 10000,
     step: 100,
     suffix: 'ms',
+  },
+  {
+    key: 'wf_chip_idle_minutes',
+    label: 'Workflow time-chip idle threshold',
+    hint: 'On Enter, insert a time chip only if you\u2019ve been idle for at least this many minutes. Stops chips from spamming during active typing. Manual Ctrl+T always inserts.',
+    type: 'number',
+    min: 1,
+    max: 60,
+    step: 1,
+    suffix: 'min',
   },
 ];
 

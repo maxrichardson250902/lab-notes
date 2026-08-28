@@ -52,6 +52,16 @@ var SETTINGS_SPEC = [
     step: 100,
     suffix: 'ms',
   },
+  {
+    key: 'wf_chip_idle_minutes',
+    label: 'Workflow time-chip idle threshold',
+    hint: 'On Enter, insert a time chip only if you\u2019ve been idle for at least this many minutes. Stops chips from spamming during active typing. Manual Ctrl+T always inserts.',
+    type: 'number',
+    min: 1,
+    max: 60,
+    step: 1,
+    suffix: 'min',
+  },
 ];
 
 async function renderSettings(el) {
