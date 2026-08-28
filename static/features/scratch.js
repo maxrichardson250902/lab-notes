@@ -120,6 +120,25 @@ async function _getAllRuns() {
     '.sp-recipe-table td.vol-cell input{font-weight:600;color:#5b7a5e}',
     '.sp-recipe-table td.vol-cell input[readonly]{color:#8a7f72;background:#f0f4f0}',
     '.sp-recipe-add{margin-top:7px;display:flex;gap:6px}',
+
+    /* Per-row "added" checkbox column — sits at the far left of every recipe
+       table. State stored in rs.recipe._addedTables[tableIndex][rowIndex],
+       persisted via the existing recipe_json blob (no schema change). */
+    '.sp-recipe-table th.sp-recipe-check-cell{width:32px;text-align:center;padding:6px 4px}',
+    '.sp-recipe-table td.sp-recipe-check-cell{width:32px;text-align:center;padding:6px 4px;background:#f0ebe3}',
+    '.sp-recipe-table td.sp-recipe-check-cell input[type=checkbox]{margin:0;cursor:pointer;accent-color:#5b7a5e;width:15px;height:15px;vertical-align:middle}',
+    /* Added row: green tint on every cell, muted text so it reads as "done" */
+    '.sp-recipe-table tr.added td{background:#e8f0e8}',
+    '.sp-recipe-table tr.added td input{color:#5b7a5e}',
+    '.sp-recipe-table tr.added td.vol-cell input{color:#5b7a5e}',
+    '.sp-recipe-table tr.added td.sp-recipe-check-cell{background:#d8e8d8}',
+
+    /* Totals row (tfoot). Slightly darker than headers so it reads as an
+       endcap. The Σ label sits in the checkbox column so it doesn't crowd
+       the first data column. Warning ⚠ has red dotted underline (see
+       inline style in _computeColTotal output). */
+    '.sp-recipe-table tfoot td.sp-recipe-total-cell{background:#e0d8c8;border:1px solid #d5cec0;padding:6px 10px;font-size:12px;font-weight:600;color:#4a4139;white-space:nowrap}',
+    '.sp-recipe-table tfoot td.sp-recipe-total-label{text-align:center;color:#8a7f72;font-size:14px}',
     '.sp-step{border:1px solid #e8e2d8;border-radius:6px;padding:10px 12px;margin-bottom:7px;background:#fff;transition:background .15s,border-color .15s}',
     '.sp-step.done{background:#f0f4f0;border-color:#c8d8c8}',
     '.sp-step.has-dev{border-left:3px solid #c97b3c}',
@@ -295,14 +314,186 @@ function _matchFillToVolume(val) {
   return { prefix: m[1], num: n, tail: m[3] };
 }
 
-function _renderSingleTable(recipe, scaling, factor) {
+// ── unit-aware column totals ─────────────────────────────────────────────────
+// Every recipe column gets a total row when possible. Values are parsed for
+// number + unit, categorized into a family, and summed within-family only.
+// Mixed families in the same column produce a warning ("g + mL don't sum").
+// Non-additive families (concentration, ratio, %) get no total — summing
+// concentrations across components is meaningless.
+//
+// `factor` in _UNIT_TABLE is the multiplier to the family's base unit:
+//   volume base = L, mass base = g, mole base = mol, molar base = M.
+// This means "largest unit" = the entry with the biggest factor, which is
+// where the total gets displayed.
+var _UNIT_TABLE = {
+  // volume (base L)
+  'l':{family:'volume',factor:1}, 'liter':{family:'volume',factor:1}, 'liters':{family:'volume',factor:1}, 'litre':{family:'volume',factor:1}, 'litres':{family:'volume',factor:1},
+  'ml':{family:'volume',factor:1e-3}, 'milliliter':{family:'volume',factor:1e-3}, 'milliliters':{family:'volume',factor:1e-3}, 'millilitre':{family:'volume',factor:1e-3}, 'millilitres':{family:'volume',factor:1e-3},
+  'ul':{family:'volume',factor:1e-6}, 'μl':{family:'volume',factor:1e-6}, 'µl':{family:'volume',factor:1e-6}, 'microliter':{family:'volume',factor:1e-6}, 'microliters':{family:'volume',factor:1e-6},
+  'nl':{family:'volume',factor:1e-9}, 'nanoliter':{family:'volume',factor:1e-9}, 'nanoliters':{family:'volume',factor:1e-9},
+  'pl':{family:'volume',factor:1e-12},
+
+  // mass (base g)
+  'kg':{family:'mass',factor:1e3},
+  'g':{family:'mass',factor:1}, 'gram':{family:'mass',factor:1}, 'grams':{family:'mass',factor:1},
+  'mg':{family:'mass',factor:1e-3}, 'milligram':{family:'mass',factor:1e-3}, 'milligrams':{family:'mass',factor:1e-3},
+  'ug':{family:'mass',factor:1e-6}, 'μg':{family:'mass',factor:1e-6}, 'µg':{family:'mass',factor:1e-6}, 'microgram':{family:'mass',factor:1e-6}, 'micrograms':{family:'mass',factor:1e-6},
+  'ng':{family:'mass',factor:1e-9}, 'nanogram':{family:'mass',factor:1e-9},
+  'pg':{family:'mass',factor:1e-12},
+
+  // amount (base mol)
+  'mol':{family:'mole',factor:1}, 'moles':{family:'mole',factor:1},
+  'mmol':{family:'mole',factor:1e-3},
+  'umol':{family:'mole',factor:1e-6}, 'μmol':{family:'mole',factor:1e-6}, 'µmol':{family:'mole',factor:1e-6},
+  'nmol':{family:'mole',factor:1e-9},
+  'pmol':{family:'mole',factor:1e-12},
+  'fmol':{family:'mole',factor:1e-15},
+
+  // molar concentration — NOT additive (kept in family for detection only)
+  'm':{family:'conc_molar',factor:1}, 'mm':{family:'conc_molar',factor:1e-3},
+  'um':{family:'conc_molar',factor:1e-6}, 'μm':{family:'conc_molar',factor:1e-6}, 'µm':{family:'conc_molar',factor:1e-6},
+  'nm':{family:'conc_molar',factor:1e-9}, 'pm':{family:'conc_molar',factor:1e-12},
+
+  // ratios / percent — NOT additive
+  'x':{family:'ratio',factor:1}, '×':{family:'ratio',factor:1},
+  '%':{family:'percent',factor:1}
+};
+
+// Families where a sum is scientifically meaningful.
+var _ADDITIVE_FAMILIES = { volume:1, mass:1, mole:1, unitless:1 };
+
+function _lookupUnit(str) {
+  if (!str) return null;
+  return _UNIT_TABLE[_normalizeUnit(str)] || null;
+}
+
+// Normalize a unit string so "UL", "uL", "Ul", "μL", "µL" all map together.
+// Merges lowercase-ing, Unicode micro sign U+00B5, Greek mu U+03BC, and
+// ASCII 'u' when used as a micro prefix. Only used for canonical grouping —
+// display strings keep the user's original casing.
+function _normalizeUnit(str) {
+  return String(str || '').toLowerCase().replace(/\u00b5|\u03bc/g, 'u');
+}
+
+// Parse a cell value into { number, unit, family, factor, isFillTo }.
+// Returns null for empty. `number: null` marks a non-numeric cell (e.g. a
+// component name) — those get filtered out of totals.
+function _parseValueUnit(raw) {
+  if (raw == null) return null;
+  var s = String(raw).trim();
+  if (!s) return null;
+
+  var fill = _matchFillToVolume(s);
+  if (fill) {
+    var fUnit = _lookupUnit(fill.tail || '');
+    return {
+      number: fill.num, unit: fill.tail || '',
+      family: fUnit ? fUnit.family : 'unitless',
+      factor: fUnit ? fUnit.factor : 1,
+      isFillTo: true
+    };
+  }
+
+  var m = s.match(/^([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*(.*)$/);
+  if (!m) return { number: null, unit: '', family: 'unknown' };
+  var num = parseFloat(m[1]);
+  var unitStr = (m[2] || '').trim();
+  if (!unitStr) return { number: num, unit: '', family: 'unitless', factor: 1 };
+  // Compound units like "mg/mL" — mass-per-volume concentration, non-additive
+  if (/^[a-zμµ]+\/[a-zμµ]+$/i.test(unitStr)) {
+    return { number: num, unit: unitStr, family: 'conc_massvol', factor: 1 };
+  }
+  var info = _lookupUnit(unitStr);
+  if (info) return { number: num, unit: unitStr, family: info.family, factor: info.factor };
+  return { number: num, unit: unitStr, family: 'unknown', factor: 1 };
+}
+
+// Compute a single column's total. Returns null if no total should be shown
+// (all cells empty/non-numeric, or column is a non-additive concentration/
+// ratio/percent). Returns { text, warn, tip } otherwise; warn=true triggers
+// the ⚠ icon.
+function _computeColTotal(parsedCells, scaleFactor) {
+  var sf = scaleFactor || 1;
+  var cells = parsedCells.filter(function(p) { return p && p.number !== null; });
+  if (!cells.length) return null;
+
+  // Fill-to shortcut: any fill-to row IS the total for this column.
+  var fill = cells.filter(function(p) { return p.isFillTo; })[0];
+  if (fill) {
+    var val = _fmtTotalNum(fill.number * sf);
+    return { text: val + (fill.unit ? ' ' + fill.unit : ''), warn: false, isFillTo: true };
+  }
+
+  var families = {};
+  cells.forEach(function(p) { families[p.family] = (families[p.family] || 0) + 1; });
+  var famList = Object.keys(families);
+
+  // All same family and non-additive → no total (concentrations don't sum).
+  if (famList.length === 1 && !_ADDITIVE_FAMILIES[famList[0]]) return null;
+
+  // Mixed families → warn, no numeric total. Includes cases like "one row
+  // has a unit, another is bare number" (unitless + volume) — user's fix
+  // is to add a unit or convert.
+  if (famList.length > 1) {
+    return {
+      text: '—', warn: true,
+      tip: 'Column has mixed unit types (' + famList.join(', ') + ') — cannot sum'
+    };
+  }
+
+  // Single additive family. Sum in the largest unit encountered.
+  var totalInBase = 0, largestFactor = 0, largestUnit = '';
+  cells.forEach(function(p) {
+    var f = p.factor || 1;
+    totalInBase += p.number * f;
+    if (f > largestFactor) { largestFactor = f; largestUnit = p.unit; }
+  });
+  var displayTotal = (totalInBase / (largestFactor || 1)) * sf;
+  var text = _fmtTotalNum(displayTotal) + (largestUnit ? ' ' + largestUnit : '');
+
+  // Warn if units were mixed within the family (uL + mL) — sum is correct
+  // but user should sanity-check. Compare by canonical form so "UL" vs
+  // "uL" doesn't count as mixed.
+  var canonUnits = {};
+  cells.forEach(function(p) { canonUnits[_normalizeUnit(p.unit) || '(none)'] = 1; });
+  var mixed = Object.keys(canonUnits).length > 1;
+  return {
+    text: text, warn: mixed,
+    tip: mixed ? 'Converted mixed units (' + Object.keys(canonUnits).join(', ') + ') to ' + (largestUnit || 'dimensionless') : ''
+  };
+}
+
+function _fmtTotalNum(n) {
+  if (!isFinite(n)) return '?';
+  // Trim trailing zeros; keep up to 4 significant fractional digits.
+  return parseFloat(n.toFixed(4)).toString();
+}
+
+function _renderSingleTable(recipe, scaling, factor, tableIndex) {
   var volCol = _volColIndex(recipe.columns);
   if (!recipe.rows.length) return '<div style="color:#8a7f72;font-size:13px;font-style:italic">No components defined.</div>';
+  // Lazy-read added flags off the run's recipe (piggybacked storage). Missing
+  // entries default to false so pre-existing runs render unchecked without a
+  // migration step.
+  var rs = _scratchProtoRun;
+  var addedTables = (rs && rs.recipe && rs.recipe._addedTables) || {};
+  var addedRow = addedTables[String(tableIndex || 0)] || [];
   var html = '<div class="sp-recipe-wrap"><table class="sp-recipe-table"><thead><tr>';
+  // Checkbox column header — no label; the column speaks for itself with an
+  // icon at column-header height would be visually noisy against real headers.
+  html += '<th class="sp-recipe-check-cell" title="Mark row as added">&#10003;</th>';
   recipe.columns.forEach(function(c) { html += '<th>' + esc(c) + '</th>'; });
   html += '</tr></thead><tbody>';
   recipe.rows.forEach(function(row, ri) {
-    html += '<tr>';
+    var isAdded = !!addedRow[ri];
+    html += '<tr' + (isAdded ? ' class="added"' : '') + '>';
+    // Checkbox cell — always present, always clickable, even for read-only
+    // (multi-table protocol) rows since the whole point is to track additions
+    // to buffer recipes that come from the protocol definition.
+    html += '<td class="sp-recipe-check-cell">' +
+      '<input type="checkbox"' + (isAdded ? ' checked' : '') +
+      ' onchange="spToggleRecipeRow(' + (tableIndex || 0) + ',' + ri + ',this.checked)"' +
+      ' title="Mark this component as added"/></td>';
     recipe.columns.forEach(function(_, ci) {
       var rawVal = row[ci] || '', isVol = (ci === volCol), displayVal = rawVal;
       if (isVol && scaling && factor && rawVal) {
@@ -326,7 +517,33 @@ function _renderSingleTable(recipe, scaling, factor) {
     });
     html += '</tr>';
   });
-  return html + '</tbody></table></div>';
+  html += '</tbody>';
+
+  // Totals row. Each column gets computed independently. Scaling only affects
+  // the volume column (matching existing per-cell scaling logic above).
+  html += '<tfoot><tr>';
+  html += '<td class="sp-recipe-total-cell sp-recipe-total-label" title="Column totals — unit-aware">&Sigma;</td>';
+  recipe.columns.forEach(function(_, ci) {
+    var parsedCol = recipe.rows.map(function(row) { return _parseValueUnit(row[ci] || ''); });
+    var sf = (ci === volCol && scaling && factor) ? factor : 1;
+    var t = _computeColTotal(parsedCol, sf);
+    var cellHtml = '';
+    var extraStyle = '';
+    if (t) {
+      var text = esc(t.text);
+      if (t.isFillTo) {
+        cellHtml = '<span title="Fill-to-volume: the &quot;up to X&quot; value is the total" style="color:#5b7a5e;font-weight:600">' + text + '</span>';
+      } else if (t.warn) {
+        cellHtml = '<span title="' + esc(t.tip) + '" style="border-bottom:1.5px dotted #c0392b;cursor:help">' + text + ' &#9888;</span>';
+      } else {
+        cellHtml = text;
+      }
+    }
+    html += '<td class="sp-recipe-total-cell"' + extraStyle + '>' + cellHtml + '</td>';
+  });
+  html += '</tr></tfoot>';
+
+  return html + '</table></div>';
 }
 
 function _renderRunRecipe() {
@@ -342,12 +559,12 @@ function _renderRunRecipe() {
     tables.forEach(function(t, ti) {
       html += '<div style="margin-bottom:12px">';
       if (t.name) html += '<div style="font-size:11px;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">' + esc(t.name) + '</div>';
-      html += _renderSingleTable(ti === 0 ? rs.recipe : t, scaling, factor);
+      html += _renderSingleTable(ti === 0 ? rs.recipe : t, scaling, factor, ti);
       html += '</div>';
     });
     html += '<div class="sp-recipe-add"><button class="btn" onclick="spAddRecipeRow()">+ Row (table 1)</button><button class="btn" onclick="spAddRecipeCol()">+ Column</button></div>';
   } else {
-    html += _renderSingleTable(rs.recipe, scaling, factor);
+    html += _renderSingleTable(rs.recipe, scaling, factor, 0);
     html += '<div class="sp-recipe-add"><button class="btn" onclick="spAddRecipeRow()">+ Row</button><button class="btn" onclick="spAddRecipeCol()">+ Column</button></div>';
   }
   return html + '</div>';
@@ -356,8 +573,42 @@ function _renderRunRecipe() {
 function spToggleScale(c) { if (!_scratchProtoRun) return; _scratchProtoRun.scaling = c; if (c && !_scratchProtoRun.scaleFactor) _scratchProtoRun.scaleFactor = 1; _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
 function spUpdateScale(v) { if (!_scratchProtoRun) return; var n = parseFloat(v); _scratchProtoRun.scaleFactor = isNaN(n) ? 1 : n; _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
 function spRecipeCell(ri, ci, value) { if (_scratchProtoRun && _scratchProtoRun.recipe.rows[ri]) { _scratchProtoRun.recipe.rows[ri][ci] = value; _saveRun(_scratchProtoRun); } }
-function spAddRecipeRow() { if (!_scratchProtoRun) return; var r = _scratchProtoRun.recipe; r.rows.push(r.columns.map(function() { return ''; })); _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
+function spAddRecipeRow() {
+  if (!_scratchProtoRun) return;
+  var r = _scratchProtoRun.recipe;
+  r.rows.push(r.columns.map(function() { return ''; }));
+  // Keep the parallel added-flags array in sync for table 0 so the new row
+  // starts unchecked (rather than reading past the end of the array).
+  if (r._addedTables && r._addedTables['0']) r._addedTables['0'].push(false);
+  _saveRun(_scratchProtoRun);
+  document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe();
+}
 function spAddRecipeCol() { var name = prompt('Column name:'); if (!name || !_scratchProtoRun) return; var r = _scratchProtoRun.recipe; r.columns.push(name); r.rows.forEach(function(row) { row.push(''); }); _saveRun(_scratchProtoRun); document.getElementById('sp-recipe-wrap').innerHTML = _renderRunRecipe(); }
+
+// Toggle a single row's "added" state. Called from the checkbox onchange in
+// _renderSingleTable. State lives on rs.recipe._addedTables so it piggybacks
+// on the existing recipe_json serialisation — no schema migration.
+//
+// We deliberately mutate only the tr's class rather than re-rendering the
+// whole recipe section. Re-rendering would reset every open text-input's
+// caret position and IME state — bad UX when the user is mid-edit.
+function spToggleRecipeRow(tableIndex, rowIndex, checked) {
+  var rs = _scratchProtoRun; if (!rs || !rs.recipe) return;
+  if (!rs.recipe._addedTables) rs.recipe._addedTables = {};
+  var key = String(tableIndex);
+  if (!rs.recipe._addedTables[key]) rs.recipe._addedTables[key] = [];
+  rs.recipe._addedTables[key][rowIndex] = !!checked;
+  _saveRun(rs);
+  // Find the specific tr the click came from and toggle its class in-place.
+  // Query scoped to #sp-recipe-wrap so we don't accidentally hit an unrelated
+  // table elsewhere on the page.
+  var wrap = document.getElementById('sp-recipe-wrap');
+  if (!wrap) return;
+  var tables = wrap.querySelectorAll('table.sp-recipe-table');
+  var tbl = tables[tableIndex]; if (!tbl) return;
+  var tr = tbl.querySelectorAll('tbody tr')[rowIndex]; if (!tr) return;
+  tr.classList.toggle('added', !!checked);
+}
 
 // ── main render ───────────────────────────────────────────────────────────────
 async function renderScratch(el) {

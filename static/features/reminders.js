@@ -136,10 +136,35 @@ function renderReminderList(items, today) {
         blockedHtml +
         (r.source && r.source !== 'manual' && r.source !== 'pipeline' ? '<div style="font-size:11px;color:var(--dim);font-family:var(--mono);margin-top:2px">from: ' + esc(r.source) + '</div>' : '') +
       '</div>' +
+      // Papers references button — attaches papers to this reminder.
+      // Guarded so reminders still work if the papers feature is disabled.
+      '<button class="btn" style="padding:2px 8px;font-size:12px" onclick="openReminderRefs(' + r.id + ',this)" title="References">&#128206;</button>' +
       '<button class="btn" style="padding:2px 8px;font-size:12px" onclick="editReminderPrompt(' + r.id + ')" title="Edit">&#9998;</button>' +
       '<button class="btn" style="color:var(--red);padding:2px 8px" onclick="deleteReminder(' + r.id + ')">&#215;</button>' +
     '</div>';
   }).join('');
+}
+
+// Open a modal listing papers attached to this reminder + letting the user
+// add/remove. Falls back to a toast if the papers feature isn't loaded.
+function openReminderRefs(reminderId, btn) {
+  if (typeof window.papersOpenRefsModal !== 'function') {
+    toast('Papers feature is not available', true);
+    return;
+  }
+  // Use the containing row's reminder-text as the modal title (best-effort).
+  var titleText = '';
+  var row = btn && btn.closest('.reminder-item');
+  if (row) {
+    var t = row.querySelector('.reminder-text');
+    if (t) {
+      titleText = t.textContent.trim();
+      // Trim the group_name badge text off the end if present — it's inside
+      // the same .reminder-text and would appear duplicated in the title.
+      if (titleText.length > 60) titleText = titleText.slice(0, 57) + '…';
+    }
+  }
+  window.papersOpenRefsModal('reminder', String(reminderId), titleText);
 }
 
 function closeReminderForm() { document.getElementById('add-reminder-form').style.display = 'none'; }

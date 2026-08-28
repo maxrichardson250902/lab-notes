@@ -21,6 +21,10 @@ async function renderTimeline(el){
       '<span class="tl-project-name">'+esc(g)+'</span>'+
       '<span class="tl-project-meta">'+proj.entry_count+' entries &middot; '+days.length+' days</span>'+
     '</div>';
+    // Placeholder for the project-level References panel; wired below after
+    // innerHTML is set. Guarded so timeline still works without the papers
+    // feature.
+    html+='<div class="tl-project-refs" id="tl-refs-'+esc(g)+'"></div>';
 
     // SVG chain
     if(days.length>0){
@@ -95,6 +99,16 @@ async function renderTimeline(el){
       var g=proj.group_name;
       if(_tlExpanded[g]) loadTimelineDetail(g,_tlExpanded[g]);
     });
+    // Wire project-level papers references. Guarded so timeline still
+    // renders if the papers feature is disabled or hasn't loaded.
+    if (typeof window.papersRenderReferencesInto === 'function') {
+      projects.forEach(function(proj){
+        var box = document.getElementById('tl-refs-' + proj.group_name);
+        if (box) {
+          window.papersRenderReferencesInto(box, 'project', proj.group_name, {compact: true});
+        }
+      });
+    }
   },50);
 }
 

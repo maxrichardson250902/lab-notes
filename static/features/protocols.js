@@ -730,6 +730,18 @@ function _panelBody(p) {
   // notes
   h+='<div class="field" style="margin-top:14px"><label>Notes / modifications</label><textarea id="pn-'+p.id+'" placeholder="Your modifications, tips, observations...">'+esc(p.notes)+'</textarea></div>';
   h+='<div class="save-row"><button class="btn primary" onclick="protoSave('+p.id+')">Save notes</button></div>';
+  // Papers references panel. Self-wired via setTimeout after the returned
+  // HTML gets set into the DOM — _panelBody is called from 7 sites (open,
+  // save-refresh, clone, run-history reload, etc.) and rather than modify
+  // each one we schedule the wiring here. Guarded on window.papersRender-
+  // ReferencesInto so protocols still work without the papers feature.
+  h+='<div id="pt-refs-'+p.id+'" class="proto-refs-panel" style="margin-top:16px"></div>';
+  setTimeout(function() {
+    if (typeof window.papersRenderReferencesInto === 'function') {
+      var box = document.getElementById('pt-refs-'+p.id);
+      if (box) window.papersRenderReferencesInto(box, 'protocol', String(p.id), {compact: true});
+    }
+  }, 0);
   return h;
 }
 

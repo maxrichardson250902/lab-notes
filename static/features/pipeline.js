@@ -267,6 +267,15 @@ function plDraw() {
     '</div>';
   _plEl.innerHTML = tabs + '<div class="pl-root">' + plSidebar() + plCanvas() + '</div>';
   plBind();
+  // Render Papers references into the selected step's placeholder (if any).
+  // Guarded on the papers feature being loaded so pipeline still works
+  // without it.
+  if (PL.selectedStep !== null && typeof window.papersRenderReferencesInto === 'function') {
+    var refBox = document.getElementById('pl-refs-' + PL.selectedStep);
+    if (refBox) {
+      window.papersRenderReferencesInto(refBox, 'pipeline_step', String(PL.selectedStep), {compact: true});
+    }
+  }
 }
 
 /* ── sidebar ── */
@@ -338,7 +347,14 @@ function plSbPipeline() {
       h += '<div class="pl-sbtns">';
       h += '<button class="pl-ibtn" onclick="event.stopPropagation();plEditStep(' + s.id + ')" title="Edit">\u270E</button>';
       h += '<button class="pl-ibtn pl-ibtn-d" onclick="event.stopPropagation();plDelStep(' + s.id + ')" title="Delete">\u2715</button>';
-      h += '</div></div>';
+      h += '</div>';
+      // Papers references — only for the selected step, and only when the
+      // papers feature is loaded. Placeholder div; the papers helper renders
+      // into it after the DOM is inserted (wired in plDraw below).
+      if (sel) {
+        h += '<div class="pl-step-refs" id="pl-refs-' + s.id + '" onclick="event.stopPropagation()"></div>';
+      }
+      h += '</div>';
     });
   }
   h += '</div>';
