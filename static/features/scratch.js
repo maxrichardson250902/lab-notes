@@ -990,6 +990,33 @@ function spToggleStep(id, checked) {
   var done = _scratchProtoRun.steps.filter(function(s) { return s.done; }).length;
   var fill = document.getElementById('sp-pfill'); if (fill) fill.style.width = Math.round((done / _scratchProtoRun.steps.length) * 100) + '%';
   var meta = document.getElementById('sp-run-meta'); if (meta) meta.textContent = done + ' / ' + _scratchProtoRun.steps.length + ' steps \xb7 started ' + new Date(_scratchProtoRun.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+
+  // Honest time-event log — records the moment the click happened, not
+  // some inferred "when the step was actually done" time. Fire-and-forget;
+  // if the log endpoint fails or is missing (older backend), the tick
+  // itself still persists via _saveRun. The read side collapses
+  // spam-catchup ticks so this doesn't produce noise.
+  var idx = _scratchProtoRun.steps.findIndex(function(s) { return s.id === id; });
+  var stepNumber = idx >= 0 ? (idx + 1) : id;
+  var shortText = (step.text || '').replace(/\s+/g, ' ').trim();
+  if (shortText.length > 80) shortText = shortText.substring(0, 77) + '...';
+  fetch('/api/time-events/log', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      ts_iso: new Date().toISOString(),
+      event_type: checked ? 'step_done' : 'step_undone',
+      source_type: 'protocol_run',
+      source_id: _scratchProtoRun.runId,
+      content: 'Step ' + stepNumber + ': ' + shortText,
+      metadata: {
+        protocol_id: _scratchProtoRun.protocol && _scratchProtoRun.protocol.id,
+        protocol_title: _scratchProtoRun.protocol && _scratchProtoRun.protocol.title,
+        step_id: id,
+        step_number: stepNumber
+      }
+    })
+  }).catch(function() { /* silent — the tick already persisted via _saveRun */ });
 }
 
 function spToggleDev(id) {

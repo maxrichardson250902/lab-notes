@@ -26,6 +26,12 @@ var _hoursCategories = [];      // fetched from /api/hours/categories
 var _hoursEditingId = null;     // id of entry being edited, null while creating
 var _hoursPendingNew = null;    // {date, startHour, endHour} for a click-to-create
 
+// Drag-to-select state. _hoursDragging is null when idle, else
+// { date, start, current } where start and current are hour indices.
+// Set when the user mousedowns on an empty cell; extended by mouseenter
+// on other empty cells in the same day-view render; committed on mouseup.
+var _hoursDragging = null;
+
 // ── styling ───────────────────────────────────────────────────────────────
 // Injected once on first render. Kept inline to match the file-per-feature
 // convention (settings feature does the same).
@@ -66,6 +72,7 @@ function _hoursInjectStyles() {
     '.hrs-hour-grid{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;margin-bottom:10px}',
     '.hrs-hour-cell{background:#fff;border:1px solid #e8e2d8;border-radius:3px;height:44px;cursor:pointer;position:relative;font-size:9px;color:#8a7f72;padding:2px}',
     '.hrs-hour-cell:hover{border-color:#8a7f72}',
+    '.hrs-hour-cell.drag-preview{background:#e8f0e8;border-color:#5b7a5e;border-width:2px}',
     '.hrs-hour-cell.filled{color:#faf8f4;font-weight:600;font-size:10px}',
     '.hrs-hour-cell.filled:hover{filter:brightness(0.9)}',
     '.hrs-hour-cell-hour{position:absolute;top:2px;left:3px;font-size:9px;opacity:.7}',
@@ -101,7 +108,10 @@ function _hoursInjectStyles() {
     '.hrs-att-remove{background:none;border:none;color:#c0392b;cursor:pointer;font-size:14px;padding:0 4px}',
     '.hrs-att-upload{margin-top:6px}',
     '.hrs-wf-suggest{background:#f0ebe3;border:1px solid #e8e2d8;border-radius:4px;padding:6px 10px;font-size:12px;color:#6a5f52;margin-top:4px}',
-    '.hrs-wf-suggest button{background:none;border:none;color:#4a6fa5;cursor:pointer;padding:0 4px;font-size:12px;text-decoration:underline}'
+    '.hrs-wf-suggest button{background:none;border:none;color:#4a6fa5;cursor:pointer;padding:0 4px;font-size:12px;text-decoration:underline}',
+    '.hrs-copy-wf-btn{background:#f0ebe3;border:1px solid #d5cec0;border-radius:4px;padding:6px 10px;cursor:pointer;font-size:12px;color:#4a4139;margin-top:6px;width:100%}',
+    '.hrs-copy-wf-btn:hover{background:#e8e2d8;border-color:#8a7f72}',
+    '.hrs-copy-wf-btn:disabled{opacity:.5;cursor:not-allowed}'
   ].join('');
   document.head.appendChild(s);
 }
@@ -276,7 +286,7 @@ function _hoursRenderDayView(iso) {
           '<button class="hrs-day-close" onclick="_hoursCloseDay()">Close</button>' +
           '</h2>';
 
-  html += '<div class="hrs-hour-grid">';
+  html += '<div class="hrs-hour-grid" onmouseleave="_hoursDragCancel()">';
   for (var h = 0; h < 24; h++) {
     var entry = hourMap[h];
     if (entry) {
@@ -284,12 +294,19 @@ function _hoursRenderDayView(iso) {
       var isStart = entry.start_hour === h;
       var catLabel = isStart ? esc(_categoryLabel(entry.category)) : '';
       html += '<div class="hrs-hour-cell filled" style="background:' + color +
-              '" onclick="_hoursOpenEntryModal(' + entry.id + ')">' +
+              '" onclick="_hoursOpenEntryModal(' + entry.id + ')" data-filled="1">' +
               '<span class="hrs-hour-cell-hour">' + h + '</span>' +
               (catLabel ? '<span class="hrs-hour-cell-cat">' + catLabel + '</span>' : '') +
               '</div>';
     } else {
-      html += '<div class="hrs-hour-cell" onclick="_hoursStartCreate(\'' + iso + '\',' + h + ')">' +
+      // Drag semantics: mousedown starts a range, mouseenter extends it,
+      // mouseup on any empty cell opens the modal pre-filled. Mouseup
+      // outside the grid or on a filled cell cancels. Data attrs let the
+      // handlers find the cell's hour + date without HTML parsing.
+      html += '<div class="hrs-hour-cell" data-hour="' + h + '" data-date="' + iso +
+              '" onmousedown="_hoursDragStart(\'' + iso + '\',' + h + ',event)"' +
+              ' onmouseenter="_hoursDragExtend(' + h + ')"' +
+              ' onmouseup="_hoursDragEnd(\'' + iso + '\',' + h + ')">' +
               '<span class="hrs-hour-cell-hour">' + h + '</span>' +
               '</div>';
     }
@@ -349,10 +366,74 @@ function _hoursRerender() {
 }
 
 
+// ── drag-to-fill (24-hour grid) ───────────────────────────────────────────
+// Empty cells participate in a click-and-drag range selection. Filled
+// cells break the drag (can't overlay an existing entry). The pointer
+// leaving the grid entirely cancels via the wrapper's onmouseleave.
+// Global mouseup catches releases outside any cell (e.g. above the grid).
+
+function _hoursDragStart(iso, hour, ev) {
+  if (ev && ev.button !== 0) return;  // ignore right-click / middle-click
+  _hoursDragging = { date: iso, start: hour, current: hour };
+  _hoursDragPaint();
+  if (ev && ev.preventDefault) ev.preventDefault();
+}
+
+function _hoursDragExtend(hour) {
+  if (!_hoursDragging) return;
+  _hoursDragging.current = hour;
+  _hoursDragPaint();
+}
+
+function _hoursDragEnd(iso, hour) {
+  if (!_hoursDragging) return;
+  var start = Math.min(_hoursDragging.start, hour);
+  var end = Math.max(_hoursDragging.start, hour) + 1;  // exclusive
+  _hoursDragCancel();
+  _hoursStartCreate(iso, start, end);
+}
+
+function _hoursDragCancel() {
+  if (!_hoursDragging) return;
+  _hoursDragging = null;
+  _hoursDragPaint();
+}
+
+function _hoursDragPaint() {
+  // Highlight cells in [min(start,current), max(start,current)] with the
+  // drag-preview class; remove the class from any cell outside the range.
+  var cells = document.querySelectorAll('.hrs-hour-cell[data-hour]');
+  if (!_hoursDragging) {
+    cells.forEach(function(c) { c.classList.remove('drag-preview'); });
+    return;
+  }
+  var lo = Math.min(_hoursDragging.start, _hoursDragging.current);
+  var hi = Math.max(_hoursDragging.start, _hoursDragging.current);
+  cells.forEach(function(c) {
+    var h = parseInt(c.getAttribute('data-hour'));
+    var inRange = h >= lo && h <= hi;
+    c.classList.toggle('drag-preview', inRange);
+  });
+}
+
+// Global mouseup — releases outside any cell (above the grid, on the day
+// header, etc.) cancel the drag cleanly rather than leaving stale state.
+document.addEventListener('mouseup', function() {
+  // Only cancel if drag hasn't already been committed to a cell's mouseup.
+  // A committed drag will already have called _hoursDragCancel; this is
+  // just the "no cell caught it" case.
+  setTimeout(function() { if (_hoursDragging) _hoursDragCancel(); }, 0);
+});
+
+
 // ── modal: create / edit entry ────────────────────────────────────────────
-async function _hoursStartCreate(iso, startHour) {
+async function _hoursStartCreate(iso, startHour, endHour) {
   _hoursEditingId = null;
-  _hoursPendingNew = { date_iso: iso, start_hour: startHour, end_hour: startHour + 1 };
+  _hoursPendingNew = {
+    date_iso: iso,
+    start_hour: startHour,
+    end_hour: (typeof endHour === 'number' ? endHour : startHour + 1)
+  };
   await _hoursRenderModal(null);
 }
 
@@ -431,6 +512,13 @@ async function _hoursRenderModal(entry) {
     '<select id="hrs-mod-cat">' + catOpts + '</select>' +
     '<label>Notes</label>' +
     '<textarea id="hrs-mod-notes" placeholder="What did you do? Why does it matter?"></textarea>' +
+    // Copy events from workflow day: pulls all time-events (workflow chips
+    // + step ticks from protocol runs) in this entry's hour range and
+    // formats them into the notes field. Only useful if a workflow day
+    // is linked — the button is disabled otherwise.
+    '<button class="hrs-copy-wf-btn" id="hrs-copy-wf-btn" onclick="_hoursCopyFromWorkflow()">' +
+      '&#128203; Copy events from workflow day into notes' +
+    '</button>' +
     '<label>Workflow day link</label>' +
     '<input type="hidden" id="hrs-mod-wfdate" value="' + esc(currentWfDate) + '"/>' +
     wfHtml +
@@ -455,6 +543,46 @@ async function _hoursRenderModal(entry) {
   document.getElementById('hrs-mod-end').value = data.end_hour;
   document.getElementById('hrs-mod-cat').value = (entry && entry.category) || 'research';
   document.getElementById('hrs-mod-notes').value = (entry && entry.notes) || '';
+  // Copy-workflow button is only useful when a workflow day is linked.
+  _hoursUpdateCopyBtnState();
+}
+
+// Reflect wf-link state on the copy button. Called after modal render and
+// whenever _hoursSetWfDate changes the link.
+function _hoursUpdateCopyBtnState() {
+  var btn = document.getElementById('hrs-copy-wf-btn');
+  if (!btn) return;
+  var wfDate = (document.getElementById('hrs-mod-wfdate') || {}).value || '';
+  btn.disabled = !wfDate;
+  btn.title = wfDate
+    ? 'Copy chips + step ticks from workflow day ' + wfDate + ' in the current hour range'
+    : 'Link a workflow day first';
+}
+
+async function _hoursCopyFromWorkflow() {
+  var wfDate = (document.getElementById('hrs-mod-wfdate') || {}).value || '';
+  if (!wfDate) { toast('Link a workflow day first', true); return; }
+  var start = parseInt(document.getElementById('hrs-mod-start').value);
+  var end = parseInt(document.getElementById('hrs-mod-end').value);
+  if (end <= start) { toast('Set a valid time range first', true); return; }
+  try {
+    var resp = await api('GET',
+      '/api/time-events/for-hour-range?date=' + wfDate +
+      '&start_hour=' + start + '&end_hour=' + end);
+    if (!resp.rendered_text) {
+      toast('No events found in that time range');
+      return;
+    }
+    var notesEl = document.getElementById('hrs-mod-notes');
+    var current = (notesEl.value || '').trim();
+    // Append rather than overwrite so any notes the user already typed
+    // survive. Separator makes the source visible.
+    var block = 'From workflow day ' + wfDate + ':\n' + resp.rendered_text;
+    notesEl.value = current ? (current + '\n\n' + block) : block;
+    toast('Copied ' + resp.events.length + ' event(s)');
+  } catch (e) {
+    toast('Copy failed: ' + (e.message || e), true);
+  }
 }
 
 function _hoursCloseModal() {
@@ -476,6 +604,7 @@ function _hoursSetWfDate(d) {
       banner.innerHTML = 'Not linked to any workflow day.';
     }
   }
+  _hoursUpdateCopyBtnState();
 }
 
 async function _hoursSaveEntry() {
