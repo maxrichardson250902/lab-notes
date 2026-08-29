@@ -21604,7 +21604,7 @@ async function _dnaToggleArchived(backendTable, itemId, newPrivate) {
     // is off (never gets here in normal flow), the entry drops out on
     // subsequent renders.
     await _dnaLoadAll();
-    _dnaRender();
+    _dnaRenderTable();
     toast(newPrivate ? 'Archived' : 'Unarchived');
   } catch (e) {
     toast('Archive toggle failed: ' + (e.message || e), true);
