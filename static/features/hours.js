@@ -23,8 +23,13 @@ var _hoursWeeksToShow = 4;      // rolling 4 weeks: current + 3 prior
 var _hoursSelectedDate = null;  // 'YYYY-MM-DD' when day view active, else null
 var _hoursEntries = [];         // raw entry rows for the visible date range
 var _hoursCategories = [];      // fetched from /api/hours/categories
+var _hoursHolidays = [];        // fetched from /api/hours/holidays for the visible range
 var _hoursEditingId = null;     // id of entry being edited, null while creating
 var _hoursPendingNew = null;    // {date, startHour, endHour} for a click-to-create
+// Live-edited secondary array while the modal is open. Reset whenever the
+// modal opens (from an existing entry or as an empty list for a new entry).
+// Contains {category, minutes} objects. Persisted to backend on Save.
+var _hoursModalSecondary = [];
 
 // Drag-to-select state. _hoursDragging is null when idle, else
 // { date, start, current } where start and current are hour indices.
@@ -52,6 +57,13 @@ function _hoursInjectStyles() {
     '.hrs-legend-swatch{display:inline-block;width:12px;height:12px;border-radius:2px}',
 
     '.hrs-week{display:grid;grid-template-columns:80px repeat(7,1fr);gap:4px;margin-bottom:6px}',
+    '.hrs-week-row{display:flex;align-items:stretch;gap:8px;margin-bottom:6px}',
+    '.hrs-week-row .hrs-week{flex:1;margin-bottom:0}',
+    '.hrs-week-tally{flex:0 0 200px;font-size:11px;color:#4a4139;padding:8px;background:#faf8f4;border:1px solid #e8e2d8;border-radius:6px;display:flex;flex-direction:column;justify-content:center;line-height:1.4}',
+
+    '.hrs-grand-total{background:#f0ebe3;border:1px solid #d5cec0;border-radius:6px;padding:10px 14px;margin-bottom:12px;display:flex;align-items:center;gap:12px;font-size:13px;color:#4a4139}',
+    '.hrs-grand-total-label{font-weight:600;color:#8a7f72;font-size:11px;text-transform:uppercase;letter-spacing:.05em}',
+    '.hrs-grand-total-body{flex:1}',
     '.hrs-week-label{font-size:11px;color:#8a7f72;padding-top:20px;text-align:right;padding-right:6px}',
     '.hrs-day-cell{background:#faf8f4;border:1px solid #e8e2d8;border-radius:6px;padding:8px;min-height:80px;cursor:pointer;position:relative;transition:transform .1s}',
     '.hrs-day-cell:hover{transform:scale(1.02);border-color:#c8bfaf;box-shadow:0 2px 8px rgba(60,52,42,.08)}',
@@ -64,6 +76,12 @@ function _hoursInjectStyles() {
     '.hrs-day-stripe{position:absolute;bottom:6px;left:8px;right:8px;height:4px;border-radius:2px;display:flex;overflow:hidden;background:#e8e2d8}',
     '.hrs-day-stripe-seg{height:100%}',
     '.hrs-day-att{position:absolute;top:6px;right:8px;font-size:10px;color:#8a7f72}',
+    /* Holiday cell — grey overlay, name shown in place of hours total. */
+    '.hrs-day-cell.holiday{background:#ede8dd;border-style:dashed}',
+    '.hrs-holiday-label{margin-top:12px;font-size:11px;color:#8a7f72;font-weight:600;line-height:1.2}',
+    '.hrs-day-holiday-badge{margin-left:8px;font-size:11px;color:#8a7f72;font-weight:normal}',
+    '.hrs-day-holiday-toggle{margin-left:auto;background:none;border:1px solid #d5cec0;border-radius:4px;padding:2px 10px;cursor:pointer;font-size:12px;color:#4a4139;margin-right:6px}',
+    '.hrs-day-holiday-toggle:hover{background:#f0ebe3}',
 
     /* Day expansion view */
     '.hrs-day-view{margin-top:20px;background:#faf8f4;border:1px solid #d5cec0;border-radius:8px;padding:16px}',
@@ -111,7 +129,15 @@ function _hoursInjectStyles() {
     '.hrs-wf-suggest button{background:none;border:none;color:#4a6fa5;cursor:pointer;padding:0 4px;font-size:12px;text-decoration:underline}',
     '.hrs-copy-wf-btn{background:#f0ebe3;border:1px solid #d5cec0;border-radius:4px;padding:6px 10px;cursor:pointer;font-size:12px;color:#4a4139;margin-top:6px;width:100%}',
     '.hrs-copy-wf-btn:hover{background:#e8e2d8;border-color:#8a7f72}',
-    '.hrs-copy-wf-btn:disabled{opacity:.5;cursor:not-allowed}'
+    '.hrs-copy-wf-btn:disabled{opacity:.5;cursor:not-allowed}',
+    /* Secondary activity rows in the entry modal */
+    '.hrs-mod-sec-row{display:flex;gap:6px;align-items:center;margin:3px 0}',
+    '.hrs-mod-sec-row select{flex:1;padding:4px 6px}',
+    '.hrs-mod-sec-row input[type=number]{width:70px;padding:4px 6px;border:1px solid #d5cec0;border-radius:4px;font-size:12px}',
+    '.hrs-mod-sec-unit{font-size:11px;color:#8a7f72}',
+    '.hrs-mod-sec-remove{background:none;border:none;color:#c0392b;cursor:pointer;font-size:16px;padding:0 6px;line-height:1}',
+    '.hrs-mod-sec-empty{font-size:11px;color:#8a7f72;font-style:italic;padding:4px 0}',
+    '.hrs-mod-add-sec{background:none;border:1px dashed #d5cec0;border-radius:4px;padding:4px 10px;cursor:pointer;font-size:12px;color:#4a4139;margin-top:4px}'
   ].join('');
   document.head.appendChild(s);
 }
@@ -181,6 +207,49 @@ async function _hoursLoad() {
   var resp = await api('GET', '/api/hours/entries?start=' + _isoDate(earliest) +
                        '&end=' + _isoDate(latest));
   _hoursEntries = resp.entries;
+  // Load holidays for the visible range. Cheap: PK-indexed lookup on
+  // date_iso and there's rarely more than a few per month.
+  try {
+    var holidayResp = await api('GET', '/api/hours/holidays?start=' + _isoDate(earliest) +
+                                '&end=' + _isoDate(latest));
+    _hoursHolidays = holidayResp.holidays || [];
+  } catch (e) {
+    _hoursHolidays = [];  // don't hard-fail the view if the holidays call errors
+  }
+}
+
+// Compute total hours + per-category breakdown for a set of entries.
+// Primary contribution = end_hour - start_hour hours to entry.category.
+// Secondary contribution = each secondary's minutes/60 hours to its own
+// category. Secondaries add to the tally on top of primary — per user's
+// spec 'secondary has its own time added when its added'.
+function _hoursComputeTally(entries) {
+  var total = 0;
+  var byCategory = {};
+  entries.forEach(function(e) {
+    var primaryHours = (e.end_hour - e.start_hour);
+    total += primaryHours;
+    byCategory[e.category] = (byCategory[e.category] || 0) + primaryHours;
+    (e.secondary || []).forEach(function(s) {
+      var h = (s.minutes || 0) / 60;
+      total += h;
+      byCategory[s.category] = (byCategory[s.category] || 0) + h;
+    });
+  });
+  return { total: total, byCategory: byCategory };
+}
+
+function _hoursFmtTally(tally) {
+  // "31.5h · research 12h · writing 8h ..."
+  var parts = [_fmtHours(tally.total) + 'h'];
+  Object.keys(tally.byCategory).forEach(function(cat) {
+    parts.push('<span style="color:' + _categoryColor(cat) + '">' + esc(_categoryLabel(cat).split(' ')[0]) + ' ' + _fmtHours(tally.byCategory[cat]) + 'h</span>');
+  });
+  return parts.join(' &middot; ');
+}
+
+function _hoursHolidayFor(iso) {
+  return _hoursHolidays.find(function(h) { return h.date_iso === iso; });
 }
 
 
@@ -208,18 +277,38 @@ function _hoursRenderWeekGrid() {
   });
   html += '</div>';
 
+  // Grand total row across the visible 4 weeks. Shown above the first
+  // week. Includes categories legend info inline so users see the split
+  // at a glance without hover.
+  var grandTally = _hoursComputeTally(_hoursEntries);
+  html += '<div class="hrs-grand-total">' +
+    '<span class="hrs-grand-total-label">Last ' + _hoursWeeksToShow + ' weeks</span>' +
+    '<span class="hrs-grand-total-body">' + _hoursFmtTally(grandTally) + '</span>' +
+  '</div>';
+
   // Weeks — newest at top
   for (var w = 0; w < _hoursWeeksToShow; w++) {
     var weekStart = _addDays(_hoursWeekStart, -w * 7);
-    var weekLabel = _fmtDateShort(_isoDate(weekStart)) + '<br>' +
-                    _fmtDateShort(_isoDate(_addDays(weekStart, 6)));
-    html += '<div class="hrs-week"><div class="hrs-week-label">' + weekLabel + '</div>';
+    var weekEndIso = _isoDate(_addDays(weekStart, 6));
+    var weekStartIso = _isoDate(weekStart);
+    var weekLabel = _fmtDateShort(weekStartIso) + '<br>' + _fmtDateShort(weekEndIso);
+
+    var weekEntries = _hoursEntries.filter(function(e) {
+      return e.date_iso >= weekStartIso && e.date_iso <= weekEndIso;
+    });
+    var weekTally = _hoursComputeTally(weekEntries);
+
+    html += '<div class="hrs-week-row">' +
+      '<div class="hrs-week">' +
+        '<div class="hrs-week-label">' + weekLabel + '</div>';
     for (var d = 0; d < 7; d++) {
       var day = _addDays(weekStart, d);
       var iso = _isoDate(day);
       html += _hoursRenderDayCell(day, iso, iso === todayISO);
     }
-    html += '</div>';
+    html += '</div>' +
+      '<div class="hrs-week-tally">' + _hoursFmtTally(weekTally) + '</div>' +
+    '</div>';
   }
 
   // Day view expansion (if a day is selected)
@@ -232,6 +321,7 @@ function _hoursRenderWeekGrid() {
 
 function _hoursRenderDayCell(day, iso, isToday) {
   var dayEntries = _hoursEntries.filter(function(e) { return e.date_iso === iso; });
+  var holiday = _hoursHolidayFor(iso);
   var totalHours = 0;
   var catHours = {};
   var attCount = 0;
@@ -239,20 +329,33 @@ function _hoursRenderDayCell(day, iso, isToday) {
     var h = e.end_hour - e.start_hour;
     totalHours += h;
     catHours[e.category] = (catHours[e.category] || 0) + h;
+    // Secondaries feed into the day's cat-mix stripe too so the visual
+    // heatmap reflects the full activity, not just primary time.
+    (e.secondary || []).forEach(function(s) {
+      var sh = (s.minutes || 0) / 60;
+      totalHours += sh;
+      catHours[s.category] = (catHours[s.category] || 0) + sh;
+    });
     attCount += (e.attachments || []).length;
   });
   var dayName = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][day.getDay()];
   var cls = 'hrs-day-cell';
   if (isToday) cls += ' today';
   if (iso === _hoursSelectedDate) cls += ' selected';
+  if (holiday) cls += ' holiday';
 
   var html = '<div class="' + cls + '" onclick="_hoursSelectDay(\'' + iso + '\')">';
   html += '<div class="hrs-day-header">' + dayName + '</div>';
   html += '<div class="hrs-day-date">' + day.getDate() + '</div>';
-  if (totalHours > 0) {
+  if (holiday) {
+    // Holiday label preempts the hours total. Users can still expand the
+    // day if they want to log something (in case a holiday turned into a
+    // work day) — the "Mark as holiday" toggle in the day view can flip
+    // it back off.
+    html += '<div class="hrs-holiday-label" title="Holiday: ' + esc(holiday.name || '(unnamed)') + '">&#128197; ' + esc(holiday.name || 'Holiday') + '</div>';
+  } else if (totalHours > 0) {
     html += '<div class="hrs-day-total">' + _fmtHours(totalHours) +
             '<span class="hrs-day-total-unit">h</span></div>';
-    // Coloured stripe segmented by category proportions
     html += '<div class="hrs-day-stripe">';
     Object.keys(catHours).forEach(function(cat) {
       var pct = (catHours[cat] / totalHours) * 100;
@@ -272,6 +375,7 @@ function _hoursRenderDayCell(day, iso, isToday) {
 
 // ── render: day view (24-hour grid) ───────────────────────────────────────
 function _hoursRenderDayView(iso) {
+  var holiday = _hoursHolidayFor(iso);
   var dayEntries = _hoursEntries.filter(function(e) { return e.date_iso === iso; });
   // Map hour → entry that covers it (for the 24-cell grid). Overlapping
   // entries would be a data error but we don't prevent them at the DB level;
@@ -283,6 +387,10 @@ function _hoursRenderDayView(iso) {
 
   var html = '<div class="hrs-day-view">';
   html += '<h2>' + _fmtDateFull(iso) +
+          (holiday ? '<span class="hrs-day-holiday-badge" title="Holiday">&#128197; ' + esc(holiday.name || 'Holiday') + '</span>' : '') +
+          '<button class="hrs-day-holiday-toggle" onclick="_hoursToggleHoliday(\'' + iso + '\')">' +
+            (holiday ? 'Remove holiday' : 'Mark as holiday') +
+          '</button>' +
           '<button class="hrs-day-close" onclick="_hoursCloseDay()">Close</button>' +
           '</h2>';
 
@@ -363,6 +471,26 @@ function _hoursCloseDay() {
 function _hoursRerender() {
   var el = document.getElementById('content');
   if (el) el.innerHTML = '<div class="hrs-wrap">' + _hoursRenderWeekGrid() + '</div>';
+}
+
+// Toggle a date's holiday status. If already a holiday, delete it; else
+// prompt for an optional name and create. Reloads holidays + re-renders.
+async function _hoursToggleHoliday(iso) {
+  var existing = _hoursHolidayFor(iso);
+  try {
+    if (existing) {
+      await api('DELETE', '/api/hours/holidays/' + iso);
+      toast('Holiday removed');
+    } else {
+      var name = prompt('Holiday name (optional):', '') || '';
+      await api('POST', '/api/hours/holidays', { date_iso: iso, name: name.trim() });
+      toast('Holiday added');
+    }
+    await _hoursLoad();
+    _hoursRerender();
+  } catch (e) {
+    toast('Holiday toggle failed: ' + (e.message || e), true);
+  }
 }
 
 
@@ -510,6 +638,14 @@ async function _hoursRenderModal(entry) {
     '</div>' +
     '<label>Category</label>' +
     '<select id="hrs-mod-cat">' + catOpts + '</select>' +
+    // Secondary activities — per user spec, each has its own duration and
+    // contributes independently to category totals. Rendered as a list of
+    // rows below primary. The list itself lives in _hoursModalSecondary
+    // (module state) so add/remove clicks can mutate it without a full
+    // modal re-render; only the secondary-list container gets patched.
+    '<label>Secondary activities</label>' +
+    '<div id="hrs-mod-secondary-list"></div>' +
+    '<button type="button" class="hrs-mod-add-sec" onclick="_hoursSecAdd()">+ Add secondary</button>' +
     '<label>Notes</label>' +
     '<textarea id="hrs-mod-notes" placeholder="What did you do? Why does it matter?"></textarea>' +
     // Copy events from workflow day: pulls all time-events (workflow chips
@@ -543,8 +679,60 @@ async function _hoursRenderModal(entry) {
   document.getElementById('hrs-mod-end').value = data.end_hour;
   document.getElementById('hrs-mod-cat').value = (entry && entry.category) || 'research';
   document.getElementById('hrs-mod-notes').value = (entry && entry.notes) || '';
+  // Snapshot the entry's secondary list into module state so users can
+  // add/remove rows without triggering a full modal re-render.
+  _hoursModalSecondary = (entry && Array.isArray(entry.secondary))
+    ? entry.secondary.map(function(s) { return {category: s.category, minutes: s.minutes}; })
+    : [];
+  _hoursRenderSecondaryList();
   // Copy-workflow button is only useful when a workflow day is linked.
   _hoursUpdateCopyBtnState();
+}
+
+// Render the current _hoursModalSecondary as a list of rows into the
+// #hrs-mod-secondary-list container. Called on modal init and after each
+// add/remove/change so state and DOM stay in sync.
+function _hoursRenderSecondaryList() {
+  var el = document.getElementById('hrs-mod-secondary-list');
+  if (!el) return;
+  if (!_hoursModalSecondary.length) {
+    el.innerHTML = '<div class="hrs-mod-sec-empty">No secondary activities</div>';
+    return;
+  }
+  var catOpts = _hoursCategories.map(function(c) {
+    return '<option value="' + c.key + '">' + esc(c.label) + '</option>';
+  }).join('');
+  var html = '';
+  _hoursModalSecondary.forEach(function(s, i) {
+    html += '<div class="hrs-mod-sec-row">' +
+      '<select onchange="_hoursSecChange(' + i + ',\'category\',this.value)">' + catOpts + '</select>' +
+      '<input type="number" min="0" max="1440" step="5" value="' + (s.minutes || 0) + '" onchange="_hoursSecChange(' + i + ',\'minutes\',parseInt(this.value)||0)"/>' +
+      '<span class="hrs-mod-sec-unit">min</span>' +
+      '<button type="button" class="hrs-mod-sec-remove" onclick="_hoursSecRemove(' + i + ')">&times;</button>' +
+    '</div>';
+  });
+  el.innerHTML = html;
+  // Set select values after insert (setting via value attribute doesn't work)
+  _hoursModalSecondary.forEach(function(s, i) {
+    var selects = el.querySelectorAll('select');
+    if (selects[i]) selects[i].value = s.category;
+  });
+}
+
+function _hoursSecAdd() {
+  _hoursModalSecondary.push({ category: 'research', minutes: 30 });
+  _hoursRenderSecondaryList();
+}
+
+function _hoursSecRemove(i) {
+  _hoursModalSecondary.splice(i, 1);
+  _hoursRenderSecondaryList();
+}
+
+function _hoursSecChange(i, field, value) {
+  if (_hoursModalSecondary[i]) {
+    _hoursModalSecondary[i][field] = value;
+  }
 }
 
 // Reflect wf-link state on the copy button. Called after modal render and
@@ -623,12 +811,14 @@ async function _hoursSaveEntry() {
     if (_hoursEditingId) {
       await api('PATCH', '/api/hours/entries/' + _hoursEditingId, {
         start_hour: start, end_hour: end, category: category,
-        notes: notes, workflow_day_date: wfDate || ''
+        notes: notes, workflow_day_date: wfDate || '',
+        secondary: _hoursModalSecondary
       });
     } else {
       await api('POST', '/api/hours/entries', {
         date_iso: _hoursPendingNew.date_iso, start_hour: start, end_hour: end,
-        category: category, notes: notes, workflow_day_date: wfDate
+        category: category, notes: notes, workflow_day_date: wfDate,
+        secondary: _hoursModalSecondary
       });
     }
     _hoursCloseModal();

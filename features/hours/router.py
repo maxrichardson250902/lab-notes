@@ -18,6 +18,7 @@ categories POST and reflect it in the frontend colour map.
 """
 import os
 import uuid
+import json
 import mimetypes
 from pathlib import Path
 from datetime import datetime, date, timedelta
@@ -79,8 +80,43 @@ register_table("hours_attachments", """CREATE TABLE IF NOT EXISTS hours_attachme
     FOREIGN KEY(entry_id) REFERENCES hours_entries(id) ON DELETE CASCADE
 )""")
 
+# ── holidays ────────────────────────────────────────────────────────────────
+# One-off holiday dates blocked out on the week grid. Recurring patterns
+# (every Sunday, annual dates) not supported yet — flag if needed. `name`
+# is a free-text label ('Christmas', 'Conf travel'). Rendering treats these
+# as grey overlay in the week grid.
+register_table("hours_holidays", """CREATE TABLE IF NOT EXISTS hours_holidays (
+    date_iso  TEXT PRIMARY KEY,
+    name      TEXT NOT NULL DEFAULT '',
+    created   TEXT NOT NULL
+)""")
+
+
+def _ensure_hours_migrations():
+    """Add columns that predate ensure_column-style helpers. Called at the
+    top of every write endpoint so a fresh install and an upgrade both
+    end up at the same schema."""
+    with get_db() as conn:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(hours_entries)").fetchall()]
+        if "secondary_json" not in cols:
+            conn.execute(
+                "ALTER TABLE hours_entries ADD COLUMN secondary_json TEXT NOT NULL DEFAULT '[]'"
+            )
+            conn.commit()
+
 
 # ── models ──────────────────────────────────────────────────────────────────
+class SecondaryActivity(BaseModel):
+    """A supplementary label on an hours entry with its OWN duration.
+    Per user spec: 'secondary has its own time added when its added' — a
+    secondary contributes additional minutes to its category's total on top
+    of whatever the primary category earns. So a 3h entry tagged primary=
+    research + secondary=[{writing, 60min}] contributes 3h to research AND
+    1h to writing in the tally."""
+    category: str
+    minutes: int
+
+
 class EntryIn(BaseModel):
     date_iso: str
     start_hour: int
@@ -88,6 +124,7 @@ class EntryIn(BaseModel):
     category: str
     notes: Optional[str] = None
     workflow_day_date: Optional[str] = None
+    secondary: Optional[List[SecondaryActivity]] = None
 
 
 class EntryPatch(BaseModel):
@@ -96,6 +133,12 @@ class EntryPatch(BaseModel):
     category: Optional[str] = None
     notes: Optional[str] = None
     workflow_day_date: Optional[str] = None
+    secondary: Optional[List[SecondaryActivity]] = None
+
+
+class HolidayIn(BaseModel):
+    date_iso: str
+    name: Optional[str] = ""
 
 
 router = APIRouter(prefix="/api/hours", tags=["hours"])
@@ -128,7 +171,44 @@ def _entry_with_attachments(conn, row) -> dict:
         (e["id"],)
     ).fetchall()
     e["attachments"] = [dict(a) for a in atts]
+    # Parse secondary_json into a list on the way out. Missing / malformed
+    # yields empty list — never surface JSON quirks to the frontend.
+    raw = e.get("secondary_json") or "[]"
+    try:
+        e["secondary"] = json.loads(raw)
+        if not isinstance(e["secondary"], list):
+            e["secondary"] = []
+    except (ValueError, TypeError):
+        e["secondary"] = []
     return e
+
+
+def _validate_secondary(secondary) -> str:
+    """Round-trip a list of SecondaryActivity through JSON. Ensures each
+    item has an allowed category + a non-negative int minutes. Returns the
+    canonical JSON string ready for storage; raises HTTPException on any
+    problem. Empty list is fine."""
+    if secondary is None:
+        return "[]"
+    if not isinstance(secondary, list):
+        raise HTTPException(400, "secondary must be a list")
+    out = []
+    for s in secondary:
+        # s can be dict (from JSON body) or SecondaryActivity (from pydantic)
+        if hasattr(s, "model_dump"):
+            s = s.model_dump()
+        elif hasattr(s, "dict"):
+            s = s.dict()
+        cat = (s or {}).get("category")
+        mins = (s or {}).get("minutes")
+        if cat not in VALID_CATEGORIES:
+            raise HTTPException(400, f"secondary category must be one of {sorted(VALID_CATEGORIES)}, got {cat!r}")
+        if not isinstance(mins, int) or mins < 0:
+            raise HTTPException(400, f"secondary minutes must be a non-negative integer, got {mins!r}")
+        if mins > 24 * 60:
+            raise HTTPException(400, f"secondary minutes must be <= {24*60} (one day)")
+        out.append({"category": cat, "minutes": mins})
+    return json.dumps(out)
 
 
 # ── endpoints ───────────────────────────────────────────────────────────────
@@ -165,19 +245,21 @@ def get_entry(entry_id: int):
 
 @router.post("/entries")
 def create_entry(entry: EntryIn):
+    _ensure_hours_migrations()
     _validate_date(entry.date_iso)
     _validate_hours(entry.start_hour, entry.end_hour)
     if entry.category not in VALID_CATEGORIES:
         raise HTTPException(400, f"category must be one of {sorted(VALID_CATEGORIES)}")
     if entry.workflow_day_date:
         _validate_date(entry.workflow_day_date)
+    secondary_json = _validate_secondary(entry.secondary)
     now = datetime.utcnow().isoformat()
     with get_db() as conn:
         cur = conn.execute(
             "INSERT INTO hours_entries (date_iso, start_hour, end_hour, category, notes, "
-            "workflow_day_date, created) VALUES (?,?,?,?,?,?,?)",
+            "workflow_day_date, secondary_json, created) VALUES (?,?,?,?,?,?,?,?)",
             (entry.date_iso, entry.start_hour, entry.end_hour, entry.category,
-             entry.notes, entry.workflow_day_date, now)
+             entry.notes, entry.workflow_day_date, secondary_json, now)
         )
         conn.commit()
         row = conn.execute("SELECT * FROM hours_entries WHERE id=?", (cur.lastrowid,)).fetchone()
@@ -186,6 +268,7 @@ def create_entry(entry: EntryIn):
 
 @router.patch("/entries/{entry_id}")
 def update_entry(entry_id: int, patch: EntryPatch):
+    _ensure_hours_migrations()
     fields = []
     values: List = []
     if patch.start_hour is not None or patch.end_hour is not None:
@@ -205,12 +288,24 @@ def update_entry(entry_id: int, patch: EntryPatch):
     if patch.workflow_day_date is not None and patch.workflow_day_date != "":
         _validate_date(patch.workflow_day_date)
 
+    # Serialise `secondary` (list of pydantic models) into secondary_json
+    # before it hits the generic column-write loop below.
+    secondary_json_val = None
+    if patch.secondary is not None:
+        secondary_json_val = _validate_secondary(patch.secondary)
+
     for k, v in patch.model_dump(exclude_unset=True).items():
+        if k == "secondary":
+            # Handled below as secondary_json — skip the raw list here.
+            continue
         # Empty-string workflow_day_date is the "unset" signal — normalise to NULL.
         if k == "workflow_day_date" and v == "":
             v = None
         fields.append(f"{k}=?")
         values.append(v)
+    if secondary_json_val is not None:
+        fields.append("secondary_json=?")
+        values.append(secondary_json_val)
     if not fields:
         return get_entry(entry_id)  # no-op patch
     values.append(entry_id)
@@ -337,3 +432,52 @@ def workflow_day_suggestions(date: str):
         "exact": dict(exact) if exact else None,
         "nearby": [dict(r) for r in nearby]
     }
+
+
+# ── holidays ────────────────────────────────────────────────────────────────
+@router.get("/holidays")
+def list_holidays(start: Optional[str] = None, end: Optional[str] = None):
+    """List holidays in [start, end] if provided, or all if not. The week
+    grid fetches for its rolling range; date_iso is the primary key so a
+    range scan is cheap."""
+    with get_db() as conn:
+        if start and end:
+            _validate_date(start); _validate_date(end)
+            rows = conn.execute(
+                "SELECT * FROM hours_holidays WHERE date_iso >= ? AND date_iso <= ? "
+                "ORDER BY date_iso",
+                (start, end)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM hours_holidays ORDER BY date_iso").fetchall()
+    return {"holidays": [dict(r) for r in rows]}
+
+
+@router.post("/holidays")
+def upsert_holiday(holiday: HolidayIn):
+    """Mark a date as a holiday. Idempotent — repeat calls with the same
+    date_iso overwrite the name. To unmark, use DELETE."""
+    _validate_date(holiday.date_iso)
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO hours_holidays (date_iso, name, created) VALUES (?,?,?) "
+            "ON CONFLICT(date_iso) DO UPDATE SET name=excluded.name",
+            (holiday.date_iso, holiday.name or "", now)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM hours_holidays WHERE date_iso=?", (holiday.date_iso,)
+        ).fetchone()
+    return dict(row)
+
+
+@router.delete("/holidays/{date_iso}")
+def delete_holiday(date_iso: str):
+    _validate_date(date_iso)
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM hours_holidays WHERE date_iso=?", (date_iso,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "holiday not found")
+        conn.commit()
+    return {"deleted": date_iso}
