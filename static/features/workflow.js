@@ -921,7 +921,7 @@ function _wfDocKeydownExtras(e) {
          chip time in the doc. This means continuous typing never
          inserts more chips, and returning after a real break always
          gets one. */
-      var thresholdMin = (window.S && S.settings && S.settings.wf_chip_idle_minutes) || 5;
+      var thresholdMin = (typeof S !== 'undefined' && S.settings && S.settings.wf_chip_idle_minutes) || 5;
       var now = new Date();
       var idleMs = now.getTime() - _wfLastActivityAt;
       if (idleMs < thresholdMin * 60 * 1000) return;

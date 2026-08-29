@@ -313,15 +313,6 @@ body.auto-hide-sidebar .sidebar-peek-zone { position:fixed; top:0; left:0; width
 .tl-expanded-entry:last-child{border-bottom:none}
 .tl-expanded-title{font-weight:500;font-size:14px;margin-bottom:3px}
 .tl-expanded-notes{font-size:13px;color:var(--muted);line-height:1.6;white-space:pre-wrap;max-height:200px;overflow-y:auto}
-/* Predictions */
-.pred-card{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:14px 16px;margin-bottom:10px;transition:border-color .15s}
-.pred-card:hover{border-color:var(--border2)}
-.pred-group{font-family:var(--mono);font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--accent);margin-bottom:4px}
-.pred-text{font-size:15px;font-weight:500;color:var(--text);margin-bottom:6px;line-height:1.4}
-.pred-reasoning{font-size:13px;color:var(--muted);font-style:italic;line-height:1.5;margin-bottom:10px}
-.pred-actions{display:flex;gap:8px;align-items:center}
-.pred-edit-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-family:var(--sans);font-size:14px;padding:6px 10px;border-radius:4px;outline:none;width:100%;margin-bottom:8px}
-.pred-edit-input:focus{border-color:var(--accent)}
 /* Import */
 .import-dropzone{border:2px dashed var(--border2);border-radius:8px;padding:48px 24px;text-align:center;color:var(--muted);cursor:pointer;transition:all .15s;background:var(--surface);margin-bottom:20px}
 .import-dropzone:hover,.import-dropzone.dragover{border-color:var(--accent);background:var(--tag-bg);color:var(--accent)}
@@ -405,9 +396,6 @@ body.auto-hide-sidebar .sidebar-peek-zone { position:fixed; top:0; left:0; width
     </div>
     <div class="nav-item" id="nav-timeline" onclick="setView('timeline')">
       <span>&#128197;</span><span>Timeline</span>
-    </div>
-    <div class="nav-item" id="nav-predictions" onclick="setView('predictions')">
-      <span>&#128302;</span><span>Predictions</span><span class="count" id="cnt-predictions">0</span>
     </div>
     <div class="nav-item" id="nav-cloning" onclick="setView('cloning')">
       <span>&#129516;</span><span>Cloning</span>
@@ -536,7 +524,9 @@ async function api(method, path, body) {
   // Silent capability header: when the user has 'show_archived_items' on,
   // announce it so the backend can widen its WHERE clause on DNA list
   // endpoints. Almost every other endpoint ignores this header.
-  if (window.S && S.settings && S.settings.show_archived_items) {
+  // NOTE: `typeof S`, not `window.S` — S is a top-level `let` in this
+  // same file, so it lives in module scope, not on window.
+  if (typeof S !== 'undefined' && S.settings && S.settings.show_archived_items) {
     headers['X-Show-Archived'] = '1';
   }
   const opts = { method, headers };
@@ -949,11 +939,6 @@ async function load() {
       const rc = await api('GET', '/api/reminders');
       const cntR = document.getElementById('cnt-reminders');
       if (cntR) cntR.textContent = rc.reminders?.length || 0;
-      try {
-        const pc = await api('GET', '/api/predictions');
-        const cntP = document.getElementById('cnt-predictions');
-        if (cntP) cntP.textContent = pc.predictions?.length || 0;
-      } catch {}
     } catch {}
 
     // The counts and group-nav above already refreshed in place. We deliberately
@@ -986,7 +971,7 @@ function setView(v) {
     notebook: 'Notebook', protocols: 'Protocol Library', summaries: 'Project Summaries',
     workflow: 'Daily Workflow', scratch: 'Scratch Pad', reminders: 'Reminders',
     'import': 'Import from OneNote', timeline: 'Project Timelines',
-    predictions: 'Predicted Tasks', dilution: 'Dilution Calculator',
+    dilution: 'Dilution Calculator',
     DNAmanager: 'DNAmanager', settings: 'Settings',
   };
   document.getElementById('page-title').textContent = titles[v] || v;
@@ -1394,7 +1379,6 @@ async function renderNotebook(el){
       todayEntries.length+' entries today &middot; '+
       reminders.length+' reminder'+(reminders.length!==1?'s':'')+' &middot; '+
       (todayData.scratch_pending||0)+' scratch pending'+
-      (todayData.predictions_pending?' &middot; <span style="color:var(--accent)">'+todayData.predictions_pending+' predictions</span>':'')+
     '</div>';
 
     html+='<div class="dash-grid">';
@@ -3222,7 +3206,7 @@ function _wfDocKeydownExtras(e) {
          chip time in the doc. This means continuous typing never
          inserts more chips, and returning after a real break always
          gets one. */
-      var thresholdMin = (window.S && S.settings && S.settings.wf_chip_idle_minutes) || 5;
+      var thresholdMin = (typeof S !== 'undefined' && S.settings && S.settings.wf_chip_idle_minutes) || 5;
       var now = new Date();
       var idleMs = now.getTime() - _wfLastActivityAt;
       if (idleMs < thresholdMin * 60 * 1000) return;
@@ -7845,6 +7829,10 @@ var _hoursSelectedDate = null;  // 'YYYY-MM-DD' when day view active, else null
 var _hoursEntries = [];         // raw entry rows for the visible date range
 var _hoursCategories = [];      // fetched from /api/hours/categories
 var _hoursHolidays = [];        // fetched from /api/hours/holidays for the visible range
+// Known project names (union across workflow docs, entries, reminders).
+// Loaded lazily on first modal open; refreshed if the user creates a new
+// project through the modal's datalist. Cheap to keep in memory.
+var _hoursKnownProjects = [];
 var _hoursEditingId = null;     // id of entry being edited, null while creating
 var _hoursPendingNew = null;    // {date, startHour, endHour} for a click-to-create
 // Live-edited secondary array while the modal is open. Reset whenever the
@@ -8040,10 +8028,15 @@ async function _hoursLoad() {
 }
 
 // Compute total hours + per-category breakdown for a set of entries.
-// Primary contribution = end_hour - start_hour hours to entry.category.
-// Secondary contribution = each secondary's minutes/60 hours to its own
-// category. Secondaries add to the tally on top of primary — per user's
-// spec 'secondary has its own time added when its added'.
+//
+// Semantic model: primary time is the "clock", secondaries are things done
+// IN PARALLEL during the primary activity. Example: a 30-min transformation
+// wait during which you read for 30 min = 30 min total worked (not 60).
+//
+// - `total` counts primary hours ONLY. Represents actual time-at-work.
+// - `byCategory` includes both primary AND secondary contributions. This
+//   means the breakdown may sum to more than `total` — that's deliberate
+//   and honest: it reflects parallel activity. UI shows both truthfully.
 function _hoursComputeTally(entries) {
   var total = 0;
   var byCategory = {};
@@ -8053,7 +8046,8 @@ function _hoursComputeTally(entries) {
     byCategory[e.category] = (byCategory[e.category] || 0) + primaryHours;
     (e.secondary || []).forEach(function(s) {
       var h = (s.minutes || 0) / 60;
-      total += h;
+      // Deliberately NOT adding to total — secondaries are concurrent
+      // with the primary activity, not additive slots.
       byCategory[s.category] = (byCategory[s.category] || 0) + h;
     });
   });
@@ -8143,6 +8137,9 @@ function _hoursRenderWeekGrid() {
 function _hoursRenderDayCell(day, iso, isToday) {
   var dayEntries = _hoursEntries.filter(function(e) { return e.date_iso === iso; });
   var holiday = _hoursHolidayFor(iso);
+  // Stripe reflects PRIMARY time only. Secondaries are concurrent activity
+  // (done during the primary block) so they don't extend the day or claim
+  // stripe width — they're tracked in the tally text under each week.
   var totalHours = 0;
   var catHours = {};
   var attCount = 0;
@@ -8150,13 +8147,6 @@ function _hoursRenderDayCell(day, iso, isToday) {
     var h = e.end_hour - e.start_hour;
     totalHours += h;
     catHours[e.category] = (catHours[e.category] || 0) + h;
-    // Secondaries feed into the day's cat-mix stripe too so the visual
-    // heatmap reflects the full activity, not just primary time.
-    (e.secondary || []).forEach(function(s) {
-      var sh = (s.minutes || 0) / 60;
-      totalHours += sh;
-      catHours[s.category] = (catHours[s.category] || 0) + sh;
-    });
     attCount += (e.attachments || []).length;
   });
   var dayName = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][day.getDay()];
@@ -8459,6 +8449,13 @@ async function _hoursRenderModal(entry) {
     '</div>' +
     '<label>Category</label>' +
     '<select id="hrs-mod-cat">' + catOpts + '</select>' +
+    // Project — free-text with autocomplete against known workflow projects.
+    // Datalist ID references #hrs-mod-project-options populated at init time.
+    // Empty allowed; some categories (research/writing/learning) benefit from
+    // one but nothing's rejected.
+    '<label>Project <span style="color:#8a7f72;font-size:11px;font-weight:normal">(optional)</span></label>' +
+    '<input list="hrs-mod-project-options" id="hrs-mod-project" placeholder="e.g. Iron Binding, Pol I, ..."/>' +
+    '<datalist id="hrs-mod-project-options"></datalist>' +
     // Secondary activities — per user spec, each has its own duration and
     // contributes independently to category totals. Rendered as a list of
     // rows below primary. The list itself lives in _hoursModalSecondary
@@ -8500,6 +8497,14 @@ async function _hoursRenderModal(entry) {
   document.getElementById('hrs-mod-end').value = data.end_hour;
   document.getElementById('hrs-mod-cat').value = (entry && entry.category) || 'research';
   document.getElementById('hrs-mod-notes').value = (entry && entry.notes) || '';
+  // For an existing entry, use its stored project. For a new entry, use
+  // the auto-detected dominant project from the linked workflow day, if any.
+  var initialProject = (entry && entry.project) ||
+                       (isNew && wfSuggest && wfSuggest.exact && wfSuggest.exact.project) || '';
+  document.getElementById('hrs-mod-project').value = initialProject;
+  // Populate the datalist with known projects. Loaded lazily on first
+  // modal open — cheap enough to just do here rather than at boot.
+  _hoursPopulateProjectList();
   // Snapshot the entry's secondary list into module state so users can
   // add/remove rows without triggering a full modal re-render.
   _hoursModalSecondary = (entry && Array.isArray(entry.secondary))
@@ -8556,6 +8561,27 @@ function _hoursSecChange(i, field, value) {
   }
 }
 
+// Fetch known projects from workflow endpoint and render them into the
+// modal's <datalist>. Uses cached list unless empty. Silent on failure —
+// the input still works as a free-text field.
+async function _hoursPopulateProjectList() {
+  var dl = document.getElementById('hrs-mod-project-options');
+  if (!dl) return;
+  if (!_hoursKnownProjects.length) {
+    try {
+      var resp = await api('GET', '/api/workflow/projects');
+      _hoursKnownProjects = (resp.projects || []).map(function(p) {
+        return typeof p === 'string' ? p : p.name;
+      }).filter(Boolean);
+    } catch (e) {
+      _hoursKnownProjects = [];
+    }
+  }
+  dl.innerHTML = _hoursKnownProjects.map(function(p) {
+    return '<option value="' + esc(p) + '"></option>';
+  }).join('');
+}
+
 // Reflect wf-link state on the copy button. Called after modal render and
 // whenever _hoursSetWfDate changes the link.
 function _hoursUpdateCopyBtnState() {
@@ -8601,7 +8627,7 @@ function _hoursCloseModal() {
   _hoursPendingNew = null;
 }
 
-function _hoursSetWfDate(d) {
+async function _hoursSetWfDate(d) {
   document.getElementById('hrs-mod-wfdate').value = d;
   // Update the suggest banner text so user sees the change
   var banner = document.querySelector('.hrs-wf-suggest');
@@ -8614,6 +8640,21 @@ function _hoursSetWfDate(d) {
     }
   }
   _hoursUpdateCopyBtnState();
+  // Best-effort project auto-fill: if the user just linked a workflow day
+  // and the project input is empty, pull the day's dominant project (via
+  // /workflow-day-suggestions) and pre-populate. Never overwrites what
+  // the user already typed. Silent on failure.
+  if (d) {
+    var projInput = document.getElementById('hrs-mod-project');
+    if (projInput && !(projInput.value || '').trim()) {
+      try {
+        var resp = await api('GET', '/api/hours/workflow-day-suggestions?date=' + d);
+        if (resp && resp.exact && resp.exact.project) {
+          projInput.value = resp.exact.project;
+        }
+      } catch (e) { /* silent */ }
+    }
+  }
 }
 
 async function _hoursSaveEntry() {
@@ -8622,6 +8663,7 @@ async function _hoursSaveEntry() {
   var category = document.getElementById('hrs-mod-cat').value;
   var notes = document.getElementById('hrs-mod-notes').value.trim() || null;
   var wfDate = document.getElementById('hrs-mod-wfdate').value.trim() || null;
+  var project = (document.getElementById('hrs-mod-project').value || '').trim();
 
   if (end <= start) {
     toast('End time must be after start time', true);
@@ -8633,13 +8675,15 @@ async function _hoursSaveEntry() {
       await api('PATCH', '/api/hours/entries/' + _hoursEditingId, {
         start_hour: start, end_hour: end, category: category,
         notes: notes, workflow_day_date: wfDate || '',
-        secondary: _hoursModalSecondary
+        secondary: _hoursModalSecondary,
+        project: project
       });
     } else {
       await api('POST', '/api/hours/entries', {
         date_iso: _hoursPendingNew.date_iso, start_hour: start, end_hour: end,
         category: category, notes: notes, workflow_day_date: wfDate,
-        secondary: _hoursModalSecondary
+        secondary: _hoursModalSecondary,
+        project: project
       });
     }
     _hoursCloseModal();
@@ -10057,14 +10101,6 @@ async function renderTimeline(el){
     html+='</div>';
   });
 
-  // Generate predictions button
-  html+='<div style="margin-top:20px;text-align:center">'+
-    '<button class="btn primary" onclick="generatePredictions()" style="padding:10px 24px">'+
-      '&#9733; Predict next tasks from timelines'+
-    '</button>'+
-    '<div style="font-size:12px;color:var(--dim);margin-top:6px">Wakes the 3090, reads all project timelines, suggests upcoming tasks</div>'+
-  '</div>';
-
   el.innerHTML=html;
 
   // Bind node clicks
@@ -10119,131 +10155,7 @@ async function loadTimelineDetail(group,date){
   }
 }
 
-async function generatePredictions(){
-  toast('Waking 3090 — generating predictions...');
-  try{
-    var resp=await api('POST','/api/predictions/generate');
-    if(resp.error){toast(resp.error,true);return;}
-    toast('Generated '+resp.count+' predictions');
-    await load();
-    setView('predictions');
-  }catch(e){
-    toast('Failed: '+e.message,true);
-  }
-}
 registerView('timeline', renderTimeline, {wide:true});
-
-
-// ── predictions.js ──
-// ── PREDICTIONS ──────────────────────────────────────────────────────────────
-let _predEditing={};  // {id: true}
-
-async function renderPredictions(el){
-  var data=await api('GET','/api/predictions');
-  var preds=data.predictions||[];
-
-  var html='<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">'+
-    '<span style="font-size:13px;color:var(--muted)">'+(preds.length?preds.length+' pending prediction'+(preds.length>1?'s':''):'No pending predictions')+'</span>'+
-    '<button class="btn" onclick="generatePredictions()" style="margin-left:auto">&#9733; Generate new predictions</button>'+
-  '</div>';
-
-  if(!preds.length){
-    html+='<div class="empty"><big>&#9733;</big>No predicted tasks. Click the button above or use the Timeline view to generate predictions from your project history.</div>';
-    el.innerHTML=html;
-    return;
-  }
-
-  // Group by project
-  var byGroup={};
-  preds.forEach(function(p){
-    byGroup[p.group_name]=byGroup[p.group_name]||[];
-    byGroup[p.group_name].push(p);
-  });
-
-  Object.entries(byGroup).forEach(function(pair){
-    var g=pair[0],items=pair[1];
-    html+='<div class="section-label">'+esc(g)+'</div>';
-    items.forEach(function(p){
-      var isEditing=_predEditing[p.id];
-      html+='<div class="pred-card" id="pred-'+p.id+'">'+
-        '<div class="pred-group">'+esc(p.group_name)+'</div>';
-      if(isEditing){
-        html+='<input class="pred-edit-input" id="pred-edit-'+p.id+'" value="'+esc(p.text)+'"/>'+
-          '<div class="pred-actions">'+
-            '<button class="btn primary" onclick="predSaveEdit('+p.id+')">Save</button>'+
-            '<button class="btn" onclick="predCancelEdit('+p.id+')">Cancel</button>'+
-          '</div>';
-      } else {
-        html+='<div class="pred-text">'+esc(p.text)+'</div>'+
-          (p.reasoning?'<div class="pred-reasoning">'+esc(p.reasoning)+'</div>':'')+
-          '<div class="pred-actions">'+
-            '<button class="btn primary" onclick="predApprove('+p.id+')">&#10003; Approve &amp; add to tasks</button>'+
-            '<button class="btn" onclick="predEdit('+p.id+')">Edit</button>'+
-            '<button class="btn" style="color:var(--red)" onclick="predReject('+p.id+')">&#215; Reject</button>'+
-          '</div>';
-      }
-      html+='</div>';
-    });
-  });
-
-  el.innerHTML=html;
-
-  // Focus edit inputs
-  setTimeout(function(){
-    Object.keys(_predEditing).forEach(function(id){
-      var inp=document.getElementById('pred-edit-'+id);
-      if(inp){
-        inp.focus();
-        inp.addEventListener('keydown',function(e){
-          if(e.key==='Enter') predSaveEdit(parseInt(id));
-          if(e.key==='Escape') predCancelEdit(parseInt(id));
-        });
-      }
-    });
-  },50);
-}
-
-async function predApprove(id){
-  try{
-    var resp=await api('PUT','/api/predictions/'+id,{action:'approve'});
-    if(resp.error){toast(resp.error,true);return;}
-    toast('Approved — added to todo app');
-    await load();
-    await renderPredictions(document.getElementById('content'));
-  }catch(e){toast('Failed: '+e.message,true);}
-}
-
-async function predReject(id){
-  try{
-    await api('PUT','/api/predictions/'+id,{action:'reject'});
-    toast('Rejected');
-    await load();
-    await renderPredictions(document.getElementById('content'));
-  }catch(e){toast('Failed: '+e.message,true);}
-}
-
-function predEdit(id){
-  _predEditing[id]=true;
-  renderPredictions(document.getElementById('content'));
-}
-
-function predCancelEdit(id){
-  delete _predEditing[id];
-  renderPredictions(document.getElementById('content'));
-}
-
-async function predSaveEdit(id){
-  var inp=document.getElementById('pred-edit-'+id);
-  var text=inp?inp.value.trim():'';
-  if(!text){toast('Enter some text',true);return;}
-  try{
-    await api('PUT','/api/predictions/'+id,{action:'edit',text:text});
-    delete _predEditing[id];
-    await renderPredictions(document.getElementById('content'));
-    toast('Saved');
-  }catch(e){toast('Failed: '+e.message,true);}
-}
-registerView('predictions', renderPredictions, {wide:true});
 
 
 // ── plan_converter.js ──
@@ -21660,7 +21572,11 @@ var _DNA_ARCHIVE_TABLE_MAP = {
 };
 
 function _dnaArchiveModeOn() {
-  return !!(window.S && S.settings && S.settings.show_archived_items);
+  // S is a top-level let in core.js and lives in the same bundled scope
+  // as this file after build.py concatenates everything. window.S doesn't
+  // work because top-level let/const bindings aren't attached to the
+  // global object in browsers — that was the bug.
+  return !!(typeof S !== 'undefined' && S.settings && S.settings.show_archived_items);
 }
 
 // Returns HTML for the actions cell: delete button, plus archive toggle
@@ -25702,7 +25618,6 @@ async function renderSettings(el) {
     { value: 'summaries', label: 'Project Summaries' },
     { value: 'pipeline', label: 'Pipeline' },
     { value: 'timeline', label: 'Project Timelines' },
-    { value: 'predictions', label: 'Predicted Tasks' },
     { value: 'reminders', label: 'Reminders' },
     { value: 'cloning', label: 'Cloning Workbench' },
     { value: 'circuits', label: 'Circuits' },

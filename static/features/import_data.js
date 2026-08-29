@@ -578,6 +578,69 @@ function _dnaCheckboxTd(tab, id) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  ARCHIVE (private flag)
+// ══════════════════════════════════════════════════════════════════════════════
+// Individual DNA entries carry a `private` boolean. When
+// S.settings.show_archived_items is off, archived entries don't reach the
+// frontend (backend filters via X-Show-Archived header). When on, they
+// come through and each row gets a toggle to archive or unarchive.
+//
+// This is NOT security. Backend still trusts the header from the client,
+// and anyone technical can add the header manually via DevTools or curl.
+// It's a UX filter for hiding personal/IP-sensitive entries from a
+// non-technical viewer with app access.
+
+// Table-name mapping: some UI-side tabs use kebab-case while the backend
+// uses snake_case. The archive endpoint uses the backend name.
+var _DNA_ARCHIVE_TABLE_MAP = {
+  'primers':   'primers',
+  'plasmids':  'plasmids',
+  'gblocks':   'gblocks',
+  'kit-parts': 'kit_parts',
+  'parts':     'parts',
+};
+
+function _dnaArchiveModeOn() {
+  // S is a top-level let in core.js and lives in the same bundled scope
+  // as this file after build.py concatenates everything. window.S doesn't
+  // work because top-level let/const bindings aren't attached to the
+  // global object in browsers — that was the bug.
+  return !!(typeof S !== 'undefined' && S.settings && S.settings.show_archived_items);
+}
+
+// Returns HTML for the actions cell: delete button, plus archive toggle
+// when archive mode is on. Merged into one <td> so tables don't need a
+// new column header.
+function _dnaActionCell(uiTable, item) {
+  var html = '<td style="white-space:nowrap">';
+  if (_dnaArchiveModeOn()) {
+    var backendTable = _DNA_ARCHIVE_TABLE_MAP[uiTable] || uiTable;
+    var isPrivate = !!item.private;
+    var icon = isPrivate ? '&#128194;' : '&#128193;';  // folder / open folder
+    var title = isPrivate ? 'Unarchive (make visible)' : 'Archive (hide when Show archived is off)';
+    var cls = isPrivate ? 'dna-arch dna-arch-on' : 'dna-arch';
+    html += '<span class="' + cls + '" onclick="_dnaToggleArchived(\x27' + backendTable + '\x27,' + item.id + ',' + (!isPrivate) + ')" title="' + title + '">' + icon + '</span> ';
+  }
+  html += '<span class="dna-del" onclick="_dnaDeleteItem(\x27' + uiTable + '\x27,' + item.id + ')" title="Delete">\u00d7</span>';
+  html += '</td>';
+  return html;
+}
+
+async function _dnaToggleArchived(backendTable, itemId, newPrivate) {
+  try {
+    await api('POST', '/api/dna/toggle-archived/' + backendTable + '/' + itemId, {private: !!newPrivate});
+    // Refresh the local cache so the row's icon updates and, if the setting
+    // is off (never gets here in normal flow), the entry drops out on
+    // subsequent renders.
+    await _dnaLoadAll();
+    _dnaRender();
+    toast(newPrivate ? 'Archived' : 'Unarchived');
+  } catch (e) {
+    toast('Archive toggle failed: ' + (e.message || e), true);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  STOCK STATUS (traffic lights)
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -713,7 +776,7 @@ function _dnaPrimerTable() {
       row += '<td>' + _dnaStockCell('primers', p, ['stock_dna']) + '</td>';
       row += '<td>' + _dnaGbCell('primer', p) + '</td>';
       row += '<td>' + _dnaCrossLinks('primer', p) + '</td>';
-      row += '<td><span class="dna-del" onclick="_dnaDeleteItem(\x27primers\x27,' + p.id + ')" title="Delete">\u00d7</span></td>';
+      row += _dnaActionCell('primers', p);
       row += '</tr>';
       return row;
     });
@@ -889,7 +952,7 @@ function _dnaPlasmidTable() {
       row += '<td>' + _dnaStockCell('plasmids', p, ['stock_dna', 'stock_glycerol', 'stock_verified']) + '</td>';
       row += '<td>' + _dnaGbCell('plasmid', p) + '</td>';
       row += '<td>' + _dnaCrossLinks('plasmid', p) + '</td>';
-      row += '<td><span class="dna-del" onclick="_dnaDeleteItem(\x27plasmids\x27,' + p.id + ')" title="Delete">\u00d7</span></td>';
+      row += _dnaActionCell('plasmids', p);
       row += '</tr>';
       return row;
     });
@@ -1001,7 +1064,7 @@ function _dnaGblockTable() {
       row += '<td>' + _dnaStockCell('gblocks', g, ['stock_dna']) + '</td>';
       row += '<td>' + _dnaGbCell('gblock', g) + '</td>';
       row += '<td>' + _dnaCrossLinks('gblock', g) + '</td>';
-      row += '<td><span class="dna-del" onclick="_dnaDeleteItem(\x27gblocks\x27,' + g.id + ')" title="Delete">\u00d7</span></td>';
+      row += _dnaActionCell('gblocks', g);
       row += '</tr>';
       return row;
     });
@@ -1163,7 +1226,7 @@ function _dnaKitPartTable() {
       row += '<td>' + _dnaStockCell('kit-parts', p, ['stock_dna', 'stock_glycerol', 'stock_verified']) + '</td>';
       row += '<td>' + _dnaGbCell('kit-part', p, 'kitpart') + '</td>';
       row += '<td>' + _dnaCrossLinks('kit_part', p) + '</td>';
-      row += '<td><span class="dna-del" onclick="_dnaDeleteItem(\x27kit-parts\x27,' + p.id + ')" title="Delete">\u00d7</span></td>';
+      row += _dnaActionCell('kit-parts', p);
       row += '</tr>';
       return row;
     });
@@ -1301,7 +1364,7 @@ function _dnaPartsTable() {
       row += '<td>' + _dnaStockCell('parts', p, ['stock_dna', 'stock_glycerol', 'stock_verified']) + '</td>';
       row += '<td>' + _dnaGbCell('part', p) + '</td>';
       row += '<td>' + _dnaCrossLinks('part', p) + '</td>';
-      row += '<td><span class="dna-del" onclick="_dnaDeleteItem(\x27parts\x27,' + p.id + ')" title="Delete">\u00d7</span></td>';
+      row += _dnaActionCell('parts', p);
       row += '</tr>';
       return row;
     });
@@ -3043,6 +3106,10 @@ function _dnaStyles() {
     '.dna-input:focus { outline:none; border-color:#8a7f72; }' +
     '.dna-del { cursor:pointer; color:#b09e8e; font-size:1.1rem; line-height:1; }' +
     '.dna-del:hover { color:#c0392b; }' +
+    '.dna-arch { cursor:pointer; color:#b09e8e; font-size:1rem; line-height:1; margin-right:6px; }' +
+    '.dna-arch:hover { color:#4a6fa5; }' +
+    '.dna-arch-on { color:#4a6fa5; }' +
+    '.dna-arch-on:hover { color:#8a7f72; }' +
     '.dna-setting-label { display:flex; flex-direction:column; font-size:.82rem; color:#8a7f72; gap:.2rem; }' +
 
     /* project badge */

@@ -64,7 +64,16 @@ let S = {
 
 // ── API helper ───────────────────────────────────────────────────────────────
 async function api(method, path, body) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  const headers = { 'Content-Type': 'application/json' };
+  // Silent capability header: when the user has 'show_archived_items' on,
+  // announce it so the backend can widen its WHERE clause on DNA list
+  // endpoints. Almost every other endpoint ignores this header.
+  // NOTE: `typeof S`, not `window.S` — S is a top-level `let` in this
+  // same file, so it lives in module scope, not on window.
+  if (typeof S !== 'undefined' && S.settings && S.settings.show_archived_items) {
+    headers['X-Show-Archived'] = '1';
+  }
+  const opts = { method, headers };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(path, opts);
   if (!r.ok) throw new Error(await r.text());
@@ -474,11 +483,6 @@ async function load() {
       const rc = await api('GET', '/api/reminders');
       const cntR = document.getElementById('cnt-reminders');
       if (cntR) cntR.textContent = rc.reminders?.length || 0;
-      try {
-        const pc = await api('GET', '/api/predictions');
-        const cntP = document.getElementById('cnt-predictions');
-        if (cntP) cntP.textContent = pc.predictions?.length || 0;
-      } catch {}
     } catch {}
 
     // The counts and group-nav above already refreshed in place. We deliberately
@@ -511,7 +515,7 @@ function setView(v) {
     notebook: 'Notebook', protocols: 'Protocol Library', summaries: 'Project Summaries',
     workflow: 'Daily Workflow', scratch: 'Scratch Pad', reminders: 'Reminders',
     'import': 'Import from OneNote', timeline: 'Project Timelines',
-    predictions: 'Predicted Tasks', dilution: 'Dilution Calculator',
+    dilution: 'Dilution Calculator',
     DNAmanager: 'DNAmanager', settings: 'Settings',
   };
   document.getElementById('page-title').textContent = titles[v] || v;
