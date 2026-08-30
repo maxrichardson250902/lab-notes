@@ -7528,6 +7528,97 @@ let reminderGroups = [];
 let reminderFilterGroup = '__all__';
 let showDoneReminders = false;
 
+// Bulk-mode state for the composer's quick-date buttons. When set to
+// 'this_week' or 'next_week', submitReminder loops and posts one
+// reminder per day of that week. 'today' / 'tomorrow' / 'next_mon' /
+// 'custom' all resolve to a single date via _remComputeDates.
+let _remBulkMode = 'today';
+
+// LocalStorage key + slot cache for the notification poller. See
+// _remindersCheckAndNotify. Timestamp of the most recent slot for which
+// we've shown the pop-up, stored as ISO string. Persists across reloads
+// so the modal doesn't re-fire the moment you refresh the page after
+// dismissing it.
+const _REM_LAST_NOTIFY_KEY = '_lab_reminders_last_notify_ts';
+
+// Scheduled pop-up slots (24h clock, local time). User asked for
+// "every 6 hours from 7am". Adjust here if the pattern changes.
+const _REM_NOTIFY_SLOTS = [7, 13, 19];
+
+// ── date helpers ──────────────────────────────────────────────────────────
+function _remIso(d) {
+  return d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0');
+}
+function _remAdd(d, n) {
+  var out = new Date(d.getTime());
+  out.setDate(out.getDate() + n);
+  return out;
+}
+// The Monday strictly after `d`. If d IS a Monday, returns d + 7.
+function _remNextMon(d) {
+  var day = d.getDay();       // 0 = Sun, 1 = Mon, ...
+  var offset = (day === 1) ? 7 : ((8 - day) % 7);
+  if (offset === 0) offset = 7;
+  return _remAdd(d, offset);
+}
+// The Monday of the week containing d (this week's Monday).
+function _remMondayOf(d) {
+  var day = d.getDay();
+  var offset = (day === 0) ? -6 : (1 - day);  // Sunday counts as end-of-week
+  return _remAdd(d, offset);
+}
+
+// Resolve the current bulk mode into a list of ISO date strings. For
+// single modes returns one; for 'this_week' / 'next_week' returns 7.
+// 'custom' reads the raw date input.
+function _remComputeDates(mode) {
+  var now = new Date();
+  if (mode === 'custom') {
+    var v = document.getElementById('rem-date').value;
+    return v ? [v] : [];
+  }
+  if (mode === 'today')     return [_remIso(now)];
+  if (mode === 'tomorrow')  return [_remIso(_remAdd(now, 1))];
+  if (mode === 'next_mon')  return [_remIso(_remNextMon(now))];
+  if (mode === 'this_week' || mode === 'next_week') {
+    var start = (mode === 'this_week') ? _remMondayOf(now) : _remNextMon(now);
+    var out = [];
+    for (var i = 0; i < 7; i++) out.push(_remIso(_remAdd(start, i)));
+    return out;
+  }
+  return [];
+}
+
+// Called from the quick buttons and from the raw date input's onchange.
+// Updates the bulk-mode state, syncs the date field to reflect the
+// current choice, highlights the active button, and shows a hint below.
+function _remSetQuick(mode) {
+  _remBulkMode = mode;
+  var dates = _remComputeDates(mode);
+  var dateEl = document.getElementById('rem-date');
+  if (dateEl && mode !== 'custom' && dates.length === 1) {
+    dateEl.value = dates[0];
+  }
+  // Highlight the active button
+  document.querySelectorAll('.rem-quick').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-mode') === mode);
+  });
+  // Hint below the row
+  var hint = document.getElementById('rem-bulk-hint');
+  if (hint) {
+    if (dates.length === 0) {
+      hint.textContent = 'Pick a date or a quick option.';
+    } else if (dates.length === 1) {
+      hint.textContent = 'One reminder on ' + dates[0] + '.';
+    } else {
+      hint.textContent = dates.length + ' reminders — one per day from ' +
+                         dates[0] + ' to ' + dates[dates.length - 1] + '.';
+    }
+  }
+}
+
 async function loadReminderGroups() {
   var res = await api('GET', '/api/reminders/groups');
   reminderGroups = res.groups || [];
@@ -7561,15 +7652,37 @@ async function renderReminders(el) {
     filterOpts += '<option value="' + esc(fg) + '"' + (reminderFilterGroup === fg ? ' selected' : '') + '>' + esc(fg) + '</option>';
   }
 
-  // Add reminder form
-  var html = '<div id="add-reminder-form" style="display:none;background:var(--surface);border:1px solid var(--accent);border-radius:6px;padding:16px;margin-bottom:16px">' +
-    '<div class="field-grid">' +
-      '<div class="field full"><label>Reminder text</label><input type="text" id="rem-text" placeholder="What to remember..." spellcheck="false"/></div>' +
-      '<div class="field"><label>Due date (optional)</label><input type="date" id="rem-date" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/></div>' +
-      '<div class="field"><label>Project (optional)</label><input type="text" id="rem-group" list="global-projects" placeholder="e.g. NorV, Pol I..." style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/>' +
-        '<datalist id="rem-groups-dl">' + groupOpts + '</datalist></div>' +
+  // Always-visible reminder composer at the top. Landing on the Reminders
+  // view now shows a ready-to-type input rather than a "click to expand"
+  // button — user asked for this specifically. The date field is a plain
+  // <input type="date"> plus a row of quick-set buttons (Today, Tomorrow,
+  // Mon, This week, Next week) that either fill the single-date field or
+  // switch to bulk mode.
+  //
+  // The 'This week' / 'Next week' buttons put us into bulk mode: on
+  // submit, we POST one reminder per day of the target week. Bulk mode
+  // is tracked in the module var _remBulkMode ('none' | 'this_week' |
+  // 'next_week').
+  var todayIso = _remIso(new Date());
+  var tomorrowIso = _remIso(_remAdd(new Date(), 1));
+  var nextMonIso = _remIso(_remNextMon(new Date()));
+  var html = '<div class="rem-composer" style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 14px;margin-bottom:16px">' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">' +
+      '<input type="text" id="rem-text" placeholder="What to remember..." spellcheck="false" style="flex:1;min-width:200px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:4px;outline:none;font-family:var(--sans);font-size:14px" onkeydown="if(event.key===\'Enter\')submitReminder()"/>' +
+      '<input type="text" id="rem-group" list="rem-groups-dl" placeholder="Project (optional)" style="width:160px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 10px;border-radius:4px;outline:none;font-family:var(--sans);font-size:13px"/>' +
+      '<datalist id="rem-groups-dl">' + groupOpts + '</datalist>' +
+      '<button class="btn primary" onclick="submitReminder()" style="padding:8px 16px">Add</button>' +
     '</div>' +
-    '<div class="save-row"><button class="btn" onclick="closeReminderForm()">Cancel</button><button class="btn primary" onclick="submitReminder()">Add reminder</button></div>' +
+    '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+      '<span style="font-size:11px;color:var(--dim);margin-right:4px">When:</span>' +
+      '<button class="rem-quick" data-mode="today"     onclick="_remSetQuick(\'today\')">Today</button>' +
+      '<button class="rem-quick" data-mode="tomorrow"  onclick="_remSetQuick(\'tomorrow\')">Tomorrow</button>' +
+      '<button class="rem-quick" data-mode="next_mon"  onclick="_remSetQuick(\'next_mon\')">Next Mon</button>' +
+      '<button class="rem-quick" data-mode="this_week" onclick="_remSetQuick(\'this_week\')">Every day this week</button>' +
+      '<button class="rem-quick" data-mode="next_week" onclick="_remSetQuick(\'next_week\')">Every day next week</button>' +
+      '<input type="date" id="rem-date" value="" onchange="_remSetQuick(\'custom\')" style="margin-left:8px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;outline:none;font-family:var(--sans);font-size:12px"/>' +
+    '</div>' +
+    '<div id="rem-bulk-hint" style="font-size:11px;color:var(--dim);margin-top:6px;min-height:14px"></div>' +
   '</div>';
 
   // Filter bar
@@ -7608,6 +7721,14 @@ async function renderReminders(el) {
   }
 
   el.innerHTML = html;
+  // After render: seed the quick-mode state (defaults to 'today') so
+  // the button gets highlighted and the hint text is populated, and
+  // put focus in the text field so the user can start typing immediately.
+  _remSetQuick(_remBulkMode);
+  setTimeout(function() {
+    var t = document.getElementById('rem-text');
+    if (t) t.focus();
+  }, 0);
 }
 
 function renderReminderSection(title, items, today, isGeneral) {
@@ -7692,22 +7813,43 @@ function openReminderRefs(reminderId, btn) {
   window.papersOpenRefsModal('reminder', String(reminderId), titleText);
 }
 
-function closeReminderForm() { document.getElementById('add-reminder-form').style.display = 'none'; }
-function showAddReminder() {
-  document.getElementById('add-reminder-form').style.display = 'block';
-  document.getElementById('rem-text')?.focus();
-}
-
 async function submitReminder() {
-  var text = document.getElementById('rem-text')?.value.trim();
-  var date = document.getElementById('rem-date')?.value || null;
+  var textEl = document.getElementById('rem-text');
+  var text = textEl ? textEl.value.trim() : '';
   var group = document.getElementById('rem-group')?.value.trim() || null;
   if (!text) { toast('Add some text', true); return; }
-  await api('POST', '/api/reminders', { text: text, due_date: date, source: 'manual', group_name: group });
-  document.getElementById('add-reminder-form').style.display = 'none';
-  document.getElementById('rem-text').value = '';
-  document.getElementById('rem-group').value = '';
-  await load(); toast('Reminder added');
+
+  // Resolve dates from the current bulk mode. Empty list means no date
+  // picked and no quick option — post one dateless reminder.
+  var dates = _remComputeDates(_remBulkMode);
+  if (dates.length === 0) dates = [null];
+
+  try {
+    if (dates.length === 1) {
+      await api('POST', '/api/reminders', {
+        text: text, due_date: dates[0], source: 'manual', group_name: group
+      });
+      toast('Reminder added');
+    } else {
+      // Bulk: one POST per date. Small N (max 7), sequential is fine and
+      // avoids any race on the same table.
+      for (var i = 0; i < dates.length; i++) {
+        await api('POST', '/api/reminders', {
+          text: text, due_date: dates[i], source: 'manual', group_name: group
+        });
+      }
+      toast(dates.length + ' reminders added');
+    }
+  } catch (e) {
+    toast('Add failed: ' + (e.message || e), true);
+    return;
+  }
+
+  // Reset composer for the next entry but leave the bulk-mode/date
+  // selection as-is — user often adds several with the same schedule.
+  textEl.value = '';
+  textEl.focus();
+  await load();
 }
 
 async function toggleReminder(id, done, blocked) {
@@ -7800,6 +7942,198 @@ function toggleShowDone(val) {
 }
 
 registerView('reminders', renderReminders);
+
+// ── notifications ──────────────────────────────────────────────────────────
+// Two channels: an in-app modal that always fires (works while the site
+// is open, even if reminders isn't the current view) and a browser
+// Notification (best-effort — requires permission, works even when tab
+// is backgrounded).
+//
+// Firing rules:
+//   1. On site load, IF the current time is past today's most recent
+//      slot (7am/1pm/7pm) AND we haven't already notified for that
+//      slot, fire.
+//   2. Every minute a poller re-checks the same condition — this
+//      catches the boundary crossings during a long session.
+//
+// The "most recent slot" logic: at 08:00 the slot is today 07:00. At
+// 13:30 the slot is today 13:00. At 06:00 the slot is yesterday 19:00.
+// We store the ISO of the slot we last fired against, so reload doesn't
+// re-fire and we advance cleanly at each boundary.
+
+function _remMostRecentSlot(now) {
+  // Returns a Date object for the most recent scheduled slot <= now.
+  // If we're before today's first slot, returns yesterday's LAST slot.
+  var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  for (var i = _REM_NOTIFY_SLOTS.length - 1; i >= 0; i--) {
+    var candidate = new Date(today.getTime());
+    candidate.setHours(_REM_NOTIFY_SLOTS[i], 0, 0, 0);
+    if (candidate <= now) return candidate;
+  }
+  // Before today's earliest slot — reach back to yesterday's last one.
+  var yesterday = _remAdd(today, -1);
+  yesterday.setHours(_REM_NOTIFY_SLOTS[_REM_NOTIFY_SLOTS.length - 1], 0, 0, 0);
+  return yesterday;
+}
+
+async function _remindersCheckAndNotify() {
+  var now = new Date();
+  var slot = _remMostRecentSlot(now);
+  var slotIso = slot.toISOString();
+  // Have we already notified for this slot?
+  var lastIso;
+  try { lastIso = localStorage.getItem(_REM_LAST_NOTIFY_KEY); } catch (e) { lastIso = null; }
+  if (lastIso && lastIso >= slotIso) return;  // already notified this slot
+
+  // Fetch reminders and filter to due-today + overdue + not-done.
+  var todayIso = _remIso(now);
+  var payload;
+  try {
+    payload = await api('GET', '/api/reminders');
+  } catch (e) { return; }  // silent — network trouble shouldn't spam
+
+  var items = (payload.reminders || []).filter(function(r) {
+    if (r.done) return false;
+    if (!r.due_date) return false;
+    return r.due_date <= todayIso;  // today or earlier = due
+  });
+
+  if (!items.length) {
+    // Mark this slot as "handled" so we don't check again until next slot.
+    // Empty case still counts as handled: user has an empty list, no
+    // need to poll again for hours.
+    try { localStorage.setItem(_REM_LAST_NOTIFY_KEY, slotIso); } catch (e) {}
+    return;
+  }
+
+  _remShowNotifyModal(items);
+  _remFireBrowserNotification(items);
+  try { localStorage.setItem(_REM_LAST_NOTIFY_KEY, slotIso); } catch (e) {}
+}
+
+function _remShowNotifyModal(items) {
+  // If a modal already exists, don't stack. Just skip.
+  if (document.getElementById('rem-notify-modal')) return;
+
+  var overdue = items.filter(function(r) { return r.due_date < _remIso(new Date()); });
+  var today = items.filter(function(r) { return r.due_date === _remIso(new Date()); });
+
+  var listHtml = '';
+  function renderGroup(label, group) {
+    if (!group.length) return '';
+    var h = '<div class="rem-notify-group-label">' + label + '</div>';
+    group.forEach(function(r) {
+      h += '<div class="rem-notify-item" data-id="' + r.id + '">' +
+        '<input type="checkbox" onchange="_remindersNotifyToggle(' + r.id + ', this.checked)"/>' +
+        '<span>' + esc(r.text) + '</span>' +
+        (r.group_name ? '<span class="rem-notify-badge">' + esc(r.group_name) + '</span>' : '') +
+      '</div>';
+    });
+    return h;
+  }
+  listHtml += renderGroup('Overdue', overdue);
+  listHtml += renderGroup('Due today', today);
+
+  var modal = document.createElement('div');
+  modal.id = 'rem-notify-modal';
+  modal.className = 'rem-notify-backdrop';
+  modal.innerHTML =
+    '<div class="rem-notify-card">' +
+      '<div class="rem-notify-header">' +
+        '<h3>&#128276; ' + items.length + ' reminder' + (items.length === 1 ? '' : 's') + '</h3>' +
+        '<button onclick="_remindersNotifyDismiss()" title="Dismiss">&times;</button>' +
+      '</div>' +
+      '<div class="rem-notify-body">' + listHtml + '</div>' +
+      '<div class="rem-notify-footer">' +
+        '<button class="btn" onclick="_remindersNotifyDismiss()">Dismiss</button>' +
+        '<button class="btn primary" onclick="setView(\'reminders\');_remindersNotifyDismiss()">Open reminders</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+}
+
+function _remindersNotifyDismiss() {
+  var m = document.getElementById('rem-notify-modal');
+  if (m) m.remove();
+}
+
+async function _remindersNotifyToggle(id, done) {
+  // Mark done inline from the modal without navigating away. Silent on
+  // failure — user can retry from the main view.
+  try {
+    await api('PUT', '/api/reminders/' + id, { done: !!done });
+    var item = document.querySelector('#rem-notify-modal .rem-notify-item[data-id="' + id + '"]');
+    if (item) item.classList.toggle('done', !!done);
+    // If they check off the last visible one, close the modal.
+    var remaining = document.querySelectorAll('#rem-notify-modal .rem-notify-item:not(.done)');
+    if (remaining.length === 0) _remindersNotifyDismiss();
+  } catch (e) {
+    toast('Update failed', true);
+  }
+}
+
+function _remFireBrowserNotification(items) {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'granted') {
+    _remDoBrowserNotify(items);
+  } else if (Notification.permission !== 'denied') {
+    // Ask for permission. If granted, fire immediately.
+    Notification.requestPermission().then(function(perm) {
+      if (perm === 'granted') _remDoBrowserNotify(items);
+    });
+  }
+}
+
+function _remDoBrowserNotify(items) {
+  var title = items.length + ' reminder' + (items.length === 1 ? '' : 's') + ' due';
+  var body = items.slice(0, 3).map(function(r) { return r.text; }).join(' \u00b7 ');
+  if (items.length > 3) body += ' \u00b7 +' + (items.length - 3) + ' more';
+  var n = new Notification(title, {
+    body: body,
+    tag: 'lab-notes-reminders',  // replaces any prior notification, no stacking
+    icon: '/static/favicon.svg',
+  });
+  n.onclick = function() {
+    try { window.focus(); } catch (e) {}
+    setView('reminders');
+    n.close();
+  };
+}
+
+// ── boot hook + poller ──────────────────────────────────────────────────
+// Runs at module load (bundled scripts execute at page load). Kicks off
+// an initial check + a 60s poller. The poller is cheap: a localStorage
+// read and a fetch only when a slot boundary is crossed.
+(function _remindersBootstrap() {
+  // Initial check on next tick — gives core.js a moment to finish loading
+  // settings and setting up S, so api() calls have any needed context.
+  setTimeout(_remindersCheckAndNotify, 1500);
+  // Poll every minute
+  setInterval(_remindersCheckAndNotify, 60 * 1000);
+})();
+
+// CSS for the composer quick buttons + notification modal.
+(function _remInjectStyles() {
+  var css = [
+    '.rem-quick{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:14px;cursor:pointer;font-size:12px;font-family:var(--sans)}',
+    '.rem-quick:hover{border-color:var(--accent)}',
+    '.rem-quick.active{background:var(--accent);color:#fff;border-color:var(--accent)}',
+    '.rem-notify-backdrop{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:9999}',
+    '.rem-notify-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;width:min(480px,90vw);max-height:80vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.3)}',
+    '.rem-notify-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border)}',
+    '.rem-notify-header h3{margin:0;font-size:16px;font-weight:600}',
+    '.rem-notify-header button{background:none;border:none;font-size:22px;cursor:pointer;color:var(--dim);padding:0 4px}',
+    '.rem-notify-body{padding:12px 16px}',
+    '.rem-notify-group-label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin:8px 0 4px;font-weight:600}',
+    '.rem-notify-item{display:flex;align-items:center;gap:8px;padding:6px 0;font-size:14px}',
+    '.rem-notify-item.done{opacity:.5;text-decoration:line-through}',
+    '.rem-notify-badge{font-size:10px;background:var(--surface2);color:var(--accent);padding:1px 6px;border-radius:3px;margin-left:auto}',
+    '.rem-notify-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--border)}',
+  ].join('');
+  var s = document.createElement('style');
+  s.textContent = css;
+  document.head.appendChild(s);
+})();
 
 
 // ── hours.js ──
