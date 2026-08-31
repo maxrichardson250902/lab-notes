@@ -270,7 +270,17 @@ keep the format: one line per feature, short scope description.*
   annotated snapshot save (`annotated_file` column, client-rendered
   PNG upload) used by workflow gel links; well label orientation
   toggle (horizontal / diagonal 45° / vertical 90°) persisted in
-  annotations JSON as `labelOrientation`
+  annotations JSON as `labelOrientation`; **de-skew straighten** (click
+  two points that should be level, ±15° clamped, applied to rotation
+  stored in annotations JSON as `rotation`) and **non-destructive crop**
+  (drag rect, stored in annotations JSON as `crop:{x,y,w,h}` normalised
+  in rotated-frame coords). Coord system for stored annotations is
+  normalised 0..1 in the **rotated bounding box (uncropped)** — display
+  code remaps through the current crop and culls annotations that fall
+  outside. Image display uses a two-canvas stack: `<canvas id="gelBgCanvas">`
+  holds the rotated+cropped pre-render (rebuilt on rotation change via
+  `gelGetRotatedCanvas` cache), `<canvas id="gelCanvas">` holds
+  annotations. The `<img id="gelImg">` is a hidden loader only
 - **DNA Manager** — plasmids/primers/gblocks/kit_parts/parts CRUD;
   Show archived items setting toggles `X-Show-Archived` header;
   backend filters via WHERE clause; archive/unarchive per-row folder
@@ -289,7 +299,12 @@ keep the format: one line per feature, short scope description.*
 - `hours_entries(project TEXT NOT NULL DEFAULT '', secondary_json
   TEXT NOT NULL DEFAULT '[]')`
 - `hours_holidays(date_iso PK, name)`
-- `gels(annotated_file TEXT NULL)`
+- `gels(annotated_file TEXT NULL)` — plus `annotations TEXT` blob whose
+  shape is `{ladderMarks:[{y,size}], labelOrientation, rotation, crop}`.
+  `rotation` is degrees ∈ [-15, 15]; `crop` is `{x,y,w,h}` normalised
+  0..1 in rotated-frame coords or `null`. Lane `x_position` (in the
+  `lanes` table) and ladder mark `y` are normalised 0..1 in the same
+  rotated (uncropped) frame
 - DNA tables (`plasmids`, `primers`, `gblocks`, `kit_parts`, `parts`)
   all have `private INTEGER NOT NULL DEFAULT 0`
 - `predictions` table still exists (empty, deliberately not dropped)

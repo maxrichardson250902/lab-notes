@@ -9760,6 +9760,38 @@ var G = {
   showLadderMgr: false,
   ladderEdit: null,           // null | { id?, slug?, name, kind, sizes:[int], image_file?, _imgFile?:File, _clearImage?:bool }
   ladderRefImageOpen: false,  // toggle for inline reference-image popover
+
+  /* ── straighten (de-skew) ──
+     G.rotation is the current rotation in DEGREES, clamped [-15, 15].
+     Persisted in annotations.rotation. Applied by pre-rendering the raw
+     source image into an offscreen canvas (gelGetRotatedCanvas) that
+     the display/export code uses as the working image. All annotation
+     coords (lane x_position, ladder mark y) are normalised 0..1 in this
+     rotated view's bounding box, NOT in raw image pixels. This means
+     changing rotation after annotating leaves labels at the same
+     fractional position on the new bounding box — fine for small
+     de-skew deltas, tracked with a toast warning above 0.5°. */
+  rotation: 0,
+  straightenMode: false,      // toolbar toggle; when true, canvas clicks add straighten points
+  straightenPts: [],          // 0, 1, or 2 {x,y} in overlay-canvas display px
+  straightenMouse: null,      // {x,y} for live preview line from point 1 to cursor
+
+  /* ── crop ──
+     G.crop is null OR {x,y,w,h} normalised 0..1 in the rotated-view
+     coord space (uncropped). Applied at render time by resizing the
+     display canvases to the crop rect's aspect ratio and drawing only
+     that region of the rotated pre-render. Annotations outside the
+     crop are hidden (draw-time filter) but preserved in G.lanes /
+     G.annotations.ladderMarks so clearing the crop brings them back. */
+  crop: null,
+  cropMode: false,            // toolbar toggle; canvas drag defines a crop rect
+  cropDrag: null,             // {x0,y0,x1,y1} in overlay-canvas display px during drag
+  cropDragging: false,        // true while mouse is down building cropDrag
+
+  /* Rotated pre-render cache. Rebuilt only when G.rotation or the
+     source image dims change. Keyed by "<rotation>|<srcW>|<srcH>". */
+  _rotCanvas: null,
+  _rotCanvasKey: '',
 };
 
 /* ── helpers ── */
@@ -9796,6 +9828,92 @@ function gelSizeLabel(val, unit) {
   var u = unit || 'bp';
   if (u === 'kDa') return n + ' kDa';
   return n >= 1000 ? (n / 1000) + ' kb' : n + ' bp';
+}
+function gelClamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+/* ── straighten + crop coord helpers ──────────────────────────────────
+   Coordinate frames:
+   - "raw"       — the on-disk image pixels (img.naturalW × naturalH)
+   - "rotated"   — raw image rotated by G.rotation around its centre,
+                   in a bounding box that fits the whole rotated image.
+                   This is what the offscreen cache holds. All stored
+                   annotations are normalised 0..1 in this frame.
+   - "cropped"   — the crop rect within rotated frame. When G.crop is
+                   set, the display shows only this sub-rect scaled to
+                   the canvas.
+   - "display"   — the overlay canvas pixel coords (what mouse events
+                   give us via gelNormX/Y).                              */
+
+function gelInvalidateRotCache() {
+  G._rotCanvas = null;
+  G._rotCanvasKey = '';
+}
+
+// Builds (or returns cached) offscreen canvas containing the raw image
+// rotated by G.rotation. Bounding box grows to fit — corners of the
+// original image poke into the new corners; areas outside are
+// transparent. Returns null if the img element isn't ready yet.
+function gelGetRotatedCanvas() {
+  var img = document.getElementById('gelImg');
+  if (!img || !img.naturalWidth) return null;
+  var rot = G.rotation || 0;
+  var srcW = img.naturalWidth, srcH = img.naturalHeight;
+  var key = rot.toFixed(4) + '|' + srcW + '|' + srcH;
+  if (G._rotCanvas && G._rotCanvasKey === key) return G._rotCanvas;
+  var rad = rot * Math.PI / 180;
+  var cos = Math.abs(Math.cos(rad)), sin = Math.abs(Math.sin(rad));
+  var bboxW = Math.max(1, Math.ceil(srcW * cos + srcH * sin));
+  var bboxH = Math.max(1, Math.ceil(srcW * sin + srcH * cos));
+  var c = document.createElement('canvas');
+  c.width = bboxW; c.height = bboxH;
+  var ctx = c.getContext('2d');
+  ctx.translate(bboxW / 2, bboxH / 2);
+  ctx.rotate(rad);
+  ctx.drawImage(img, -srcW / 2, -srcH / 2);
+  G._rotCanvas = c;
+  G._rotCanvasKey = key;
+  return c;
+}
+
+// Returns the current view's rotated-frame rect being displayed:
+// { x, y, w, h } in rotated-frame pixels. Full bounding box when no
+// crop, sub-rect when cropped.
+function gelViewRect() {
+  var rc = gelGetRotatedCanvas();
+  if (!rc) return null;
+  if (G.crop) {
+    return {
+      x: G.crop.x * rc.width,
+      y: G.crop.y * rc.height,
+      w: G.crop.w * rc.width,
+      h: G.crop.h * rc.height
+    };
+  }
+  return { x: 0, y: 0, w: rc.width, h: rc.height };
+}
+
+// Map a normalised rotated-frame coord (0..1) to normalised display
+// coord (0..1) accounting for crop. Returns null if outside crop.
+function gelViewNXtoDispN(nx) {
+  if (!G.crop) return nx;
+  var dn = (nx - G.crop.x) / G.crop.w;
+  return (dn < 0 || dn > 1) ? null : dn;
+}
+function gelViewNYtoDispN(ny) {
+  if (!G.crop) return ny;
+  var dn = (ny - G.crop.y) / G.crop.h;
+  return (dn < 0 || dn > 1) ? null : dn;
+}
+// Inverse: display-normalised → rotated-frame-normalised. Used when the
+// user drags a crop rect in display coords and we store it in rotated
+// frame (composed with any existing crop).
+function gelDispNtoViewNX(dn) {
+  if (!G.crop) return dn;
+  return G.crop.x + dn * G.crop.w;
+}
+function gelDispNtoViewNY(dn) {
+  if (!G.crop) return dn;
+  return G.crop.y + dn * G.crop.h;
 }
 
 /* ── clipboard paste ── */
@@ -9876,6 +9994,22 @@ async function gelLoadGel(id) {
                         G.annotations.labelOrientation === 'vertical')
                        ? G.annotations.labelOrientation
                        : 'horizontal';
+  // Straighten: only hydrate if a sensible finite number in range.
+  var rot = parseFloat(G.annotations.rotation);
+  G.rotation = (isFinite(rot) ? gelClamp(rot, -15, 15) : 0);
+  // Crop: only hydrate if all four fields present and rect is inside 0..1.
+  var c = G.annotations.crop;
+  if (c && isFinite(c.x) && isFinite(c.y) && isFinite(c.w) && isFinite(c.h) &&
+      c.w > 0.02 && c.h > 0.02 &&
+      c.x >= 0 && c.y >= 0 && (c.x + c.w) <= 1.0001 && (c.y + c.h) <= 1.0001) {
+    G.crop = { x: c.x, y: c.y, w: c.w, h: c.h };
+  } else {
+    G.crop = null;
+  }
+  // Reset transient UI state
+  G.straightenMode = false; G.straightenPts = []; G.straightenMouse = null;
+  G.cropMode = false; G.cropDrag = null; G.cropDragging = false;
+  gelInvalidateRotCache();
   G.dirty = false;
 }
 
@@ -9896,6 +10030,11 @@ async function gelSave() {
     };
   });
   await api('POST', '/api/gels/' + G.gel.id + '/lanes', { lanes: lanesData });
+  // Mirror straighten + crop into the annotations blob (same pattern as
+  // labelOrientation) so they round-trip through save/load.
+  if (!G.annotations) G.annotations = { ladderMarks: [] };
+  G.annotations.rotation = G.rotation || 0;
+  G.annotations.crop = G.crop || null;
   await api('PUT', '/api/gels/' + G.gel.id, {
     ladder_type: G.gel.ladder_type || '',
     entry_id: G.gel.entry_id || null,
@@ -9906,22 +10045,32 @@ async function gelSave() {
   gelLoadList();
 }
 
+/* Render the current rotated+cropped view + annotation overlay into a
+   fresh canvas at natural resolution. Returns the canvas, or null if
+   the image isn't ready. Shared by gelExport (download) and
+   gelSaveAnnotated (upload) so both produce identical output. */
+function gelRenderComposite() {
+  var rc = gelGetRotatedCanvas();
+  if (!rc) return null;
+  var view = gelViewRect();
+  if (!view || view.w < 1 || view.h < 1) return null;
+  var exp = document.createElement('canvas');
+  exp.width = Math.round(view.w);
+  exp.height = Math.round(view.h);
+  var ctx = exp.getContext('2d');
+  // Draw the cropped sub-rect of the rotated canvas at 1:1.
+  ctx.drawImage(rc, view.x, view.y, view.w, view.h, 0, 0, exp.width, exp.height);
+  // Overlay: gelDrawOnCtx works in normalised display coords (which,
+  // when cropped, exclude annotations outside the crop). We pass the
+  // export canvas dims as the "display" size.
+  gelDrawOnCtx(ctx, exp.width, exp.height, { forExport: true });
+  return exp;
+}
+
 /* ── export ── */
 function gelExport() {
-  var img = document.getElementById('gelImg');
-  var canvas = document.getElementById('gelCanvas');
-  if (!img || !canvas) return;
-  var exp = document.createElement('canvas');
-  exp.width = img.naturalWidth;
-  exp.height = img.naturalHeight;
-  var ctx = exp.getContext('2d');
-  ctx.drawImage(img, 0, 0);
-  var scaleX = img.naturalWidth / canvas.width;
-  var scaleY = img.naturalHeight / canvas.height;
-  ctx.save();
-  ctx.scale(scaleX, scaleY);
-  gelDrawOnCtx(ctx, canvas.width, canvas.height);
-  ctx.restore();
+  var exp = gelRenderComposite();
+  if (!exp) { toast('Image not ready', true); return; }
   var link = document.createElement('a');
   link.download = (G.gel ? G.gel.title.replace(/[^a-z0-9]/gi, '_') : 'gel') + '_annotated.png';
   link.href = exp.toDataURL('image/png');
@@ -9934,6 +10083,137 @@ function gelExport() {
 function gelToggleGuides(on) {
   G.showGuides = !!on;
   gelDrawOverlay();
+}
+
+/* ── straighten actions ──
+   UX flow: user clicks "Straighten" → enters straighten mode. Two clicks
+   on the canvas define a line that SHOULD be horizontal. On the second
+   click the preview line is drawn (via gelDrawOverlay); Apply commits
+   the delta, Cancel discards the two points and stays in straighten
+   mode (click again).                                                */
+function gelEnterStraighten() {
+  // Turn off any other exclusive mode first so we don't stack them.
+  G.cropMode = false; G.cropDrag = null; G.cropDragging = false;
+  G.straightenMode = true;
+  G.straightenPts = [];
+  G.straightenMouse = null;
+  gelRenderFull();
+}
+function gelExitStraighten() {
+  G.straightenMode = false;
+  G.straightenPts = [];
+  G.straightenMouse = null;
+  gelRenderFull();
+}
+function gelStraightenCancel() {
+  // Discard the two-point preview but stay in straighten mode so the
+  // user can immediately click again without hitting Straighten twice.
+  G.straightenPts = [];
+  G.straightenMouse = null;
+  gelDrawOverlay();
+}
+function gelStraightenApply() {
+  if (G.straightenPts.length !== 2) return;
+  var canvas = document.getElementById('gelCanvas');
+  if (!canvas) return;
+  var p1 = G.straightenPts[0], p2 = G.straightenPts[1];
+  // Angle of the drawn line in display coords. Rotation and crop are
+  // just scale+translate — the angle in display space equals the angle
+  // in rotated-view space, so we can add directly to G.rotation.
+  var theta = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+  var delta = -theta * 180 / Math.PI;   // rotate opposite way so line → horizontal
+  var oldRot = G.rotation || 0;
+  var newRot = gelClamp(oldRot + delta, -15, 15);
+  var applied = newRot - oldRot;
+  if (Math.abs(applied) < 0.01) {
+    toast('Already level (or line was already horizontal)');
+    gelStraightenCancel();
+    return;
+  }
+  var hadAnn = G.lanes.length > 0 ||
+               (G.annotations.ladderMarks && G.annotations.ladderMarks.length > 0);
+  G.rotation = newRot;
+  G.dirty = true;
+  gelInvalidateRotCache();
+  G.straightenMode = false;
+  G.straightenPts = [];
+  G.straightenMouse = null;
+  // Clamp warning: if the two-point line implied more than the ±15° range.
+  if (Math.abs(applied) < Math.abs(delta) - 0.01) {
+    toast('Rotation clamped to ±15°', true);
+  } else if (hadAnn && Math.abs(applied) > 0.5) {
+    toast('Rotated ' + applied.toFixed(1) + '°; check annotations still align');
+  } else {
+    toast('Rotated by ' + applied.toFixed(1) + '°');
+  }
+  gelRenderFull();  // full re-render so toolbar shows new rotation + hides straighten controls
+}
+function gelStraightenReset() {
+  if (!G.rotation) { gelExitStraighten(); return; }
+  G.rotation = 0;
+  G.dirty = true;
+  gelInvalidateRotCache();
+  gelExitStraighten();
+}
+
+/* ── crop actions ──
+   Drag defines a rect in display coords. Apply converts it to
+   rotated-frame normalised coords (composing with any existing crop
+   so successive crops narrow the view further) and commits.        */
+function gelEnterCrop() {
+  G.straightenMode = false; G.straightenPts = []; G.straightenMouse = null;
+  G.cropMode = true;
+  G.cropDrag = null;
+  G.cropDragging = false;
+  gelRenderFull();
+}
+function gelExitCrop() {
+  G.cropMode = false;
+  G.cropDrag = null;
+  G.cropDragging = false;
+  gelRenderFull();
+}
+function gelCropCancel() {
+  G.cropDrag = null;
+  G.cropDragging = false;
+  gelDrawOverlay();
+}
+function gelCropApply() {
+  if (!G.cropDrag) return;
+  var canvas = document.getElementById('gelCanvas');
+  if (!canvas || !canvas.width || !canvas.height) return;
+  var d = G.cropDrag;
+  // Normalise to display coords 0..1
+  var dx0 = Math.min(d.x0, d.x1) / canvas.width;
+  var dy0 = Math.min(d.y0, d.y1) / canvas.height;
+  var dx1 = Math.max(d.x0, d.x1) / canvas.width;
+  var dy1 = Math.max(d.y0, d.y1) / canvas.height;
+  dx0 = gelClamp(dx0, 0, 1); dy0 = gelClamp(dy0, 0, 1);
+  dx1 = gelClamp(dx1, 0, 1); dy1 = gelClamp(dy1, 0, 1);
+  // Compose with any existing crop → rotated-frame coords.
+  var vx0 = gelDispNtoViewNX(dx0), vy0 = gelDispNtoViewNY(dy0);
+  var vx1 = gelDispNtoViewNX(dx1), vy1 = gelDispNtoViewNY(dy1);
+  var nc = { x: vx0, y: vy0, w: vx1 - vx0, h: vy1 - vy0 };
+  if (nc.w < 0.02 || nc.h < 0.02) {
+    toast('Crop too small — drag a larger rectangle', true);
+    G.cropDrag = null;
+    gelDrawOverlay();
+    return;
+  }
+  G.crop = nc;
+  G.dirty = true;
+  G.cropMode = false;
+  G.cropDrag = null;
+  G.cropDragging = false;
+  toast('Crop applied');
+  gelRenderFull();
+}
+function gelCropClear() {
+  G.crop = null;
+  G.cropDrag = null;
+  G.cropDragging = false;
+  G.dirty = true;
+  gelExitCrop();
 }
 
 // Change well-label orientation (horizontal / diagonal / vertical).
@@ -9955,20 +10235,9 @@ function gelSetLabelOrientation(value) {
 // gel link picker reads the resulting annotated_file so links can open
 // the labelled version rather than the raw thumbnail.
 async function gelSaveAnnotated() {
-  var img = document.getElementById('gelImg');
-  var canvas = document.getElementById('gelCanvas');
-  if (!img || !canvas || !G.gel) { toast('Nothing to save', true); return; }
-  var exp = document.createElement('canvas');
-  exp.width = img.naturalWidth;
-  exp.height = img.naturalHeight;
-  var ctx = exp.getContext('2d');
-  ctx.drawImage(img, 0, 0);
-  var scaleX = img.naturalWidth / canvas.width;
-  var scaleY = img.naturalHeight / canvas.height;
-  ctx.save();
-  ctx.scale(scaleX, scaleY);
-  gelDrawOnCtx(ctx, canvas.width, canvas.height);
-  ctx.restore();
+  if (!G.gel) { toast('Nothing to save', true); return; }
+  var exp = gelRenderComposite();
+  if (!exp) { toast('Nothing to save', true); return; }
   exp.toBlob(async function(blob) {
     if (!blob) { toast('Could not render image', true); return; }
     var fd = new FormData();
@@ -9998,12 +10267,20 @@ function gelDrawOverlay() {
   gelDrawOnCtx(ctx, canvas.width, canvas.height);
 }
 
-function gelDrawOnCtx(ctx, w, h) {
+function gelDrawOnCtx(ctx, w, h, opts) {
+  opts = opts || {};
   /* scale annotations so they stay readable at any image size */
   var baseFont = Math.max(11, Math.min(16, w / 45));
   var smallFont = Math.max(10, Math.min(14, w / 50));
   var handleR = Math.max(5, Math.min(9, w / 80));
   var labelTrunc = Math.max(8, Math.min(18, Math.floor(w / 40)));
+
+  /* Precompute display-x for each lane (null = outside crop, skip
+     drawing AND skip stagger accounting so remaining labels aren't
+     pushed into rows they don't need). */
+  var laneDispNX = G.lanes.map(function(lane) {
+    return gelViewNXtoDispN(lane.x_position);
+  });
 
   /* ── overlap-avoidance: pre-assign each label to a row ──────────────
      Labels used to draw all on row 0 with textAlign=center, so wide
@@ -10025,8 +10302,9 @@ function gelDrawOnCtx(ctx, w, h) {
     var label = lane.is_ladder ? 'L' : String(i + 1);
     if (lane.sample_name) label += ': ' + lane.sample_name.substring(0, labelTrunc);
     labelText[i] = label;
+    if (laneDispNX[i] === null) return;  // culled by crop
     var textW = ctx.measureText(label).width;
-    var x = lane.x_position * w;
+    var x = laneDispNX[i] * w;
     var left = x - textW / 2 - LABEL_PAD_PX;
     var right = x + textW / 2 + LABEL_PAD_PX;
     // Find lowest row where left > rightmost-in-row
@@ -10039,7 +10317,8 @@ function gelDrawOnCtx(ctx, w, h) {
 
   /* draw lanes */
   G.lanes.forEach(function(lane, i) {
-    var x = lane.x_position * w;
+    if (laneDispNX[i] === null) return;  // outside crop
+    var x = laneDispNX[i] * w;
     ctx.save();
     // Lane line + drag handle are "guide" chrome — hide when the user
     // turns off guides so the exported image has only labels + solid
@@ -10107,7 +10386,9 @@ function gelDrawOnCtx(ctx, w, h) {
     var ladder = gelActiveLadder();
     var unit = gelSizeUnit(ladder);
     G.annotations.ladderMarks.forEach(function(m, i) {
-      var y = m.y * h;
+      var dispNY = gelViewNYtoDispN(m.y);
+      if (dispNY === null) return;   // outside crop
+      var y = dispNY * h;
       var isSelected = G.markReplaceIdx === i;
       ctx.save();
       if (G.showGuides !== false || isSelected) {
@@ -10138,17 +10419,117 @@ function gelDrawOnCtx(ctx, w, h) {
       ctx.restore();
     });
   }
+
+  /* ── live-preview overlays (screen only, never in exports) ── */
+  if (opts.forExport) return;
+
+  // Straighten preview: point 1 as a dot; when point 2 exists, draw the
+  // line between them; while mouse is moving after point 1, draw a
+  // rubber-band line from p1 to cursor.
+  if (G.straightenMode && G.straightenPts.length > 0) {
+    var pts = G.straightenPts;
+    ctx.save();
+    ctx.fillStyle = '#e8a735';
+    ctx.strokeStyle = '#e8a735';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    // point 1 dot
+    ctx.beginPath();
+    ctx.arc(pts[0].x, pts[0].y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    var end = null;
+    if (pts.length === 2) {
+      end = pts[1];
+      ctx.beginPath();
+      ctx.arc(end.x, end.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (G.straightenMouse) {
+      end = G.straightenMouse;
+      ctx.setLineDash([4, 4]);   // rubber-band
+    }
+    if (end) {
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      ctx.lineTo(end.x, end.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Crop preview: dim everything outside the pending rect, draw a
+  // solid rect for the pending region. Only during active drag or with
+  // a completed drag awaiting Apply.
+  if (G.cropMode && G.cropDrag) {
+    var d = G.cropDrag;
+    var rx = Math.min(d.x0, d.x1), ry = Math.min(d.y0, d.y1);
+    var rw = Math.abs(d.x1 - d.x0), rh = Math.abs(d.y1 - d.y0);
+    ctx.save();
+    // dim outside
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.rect(0, 0, w, h);
+    ctx.rect(rx + rw, ry, -rw, rh);  // cut the crop rect (even-odd)
+    ctx.fill('evenodd');
+    // border
+    ctx.strokeStyle = '#e8a735';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(rx, ry, rw, rh);
+    ctx.restore();
+  }
+}
+
+// Client-event → canvas-pixel coord. Respects wrap's CSS transform:scale
+// (used for the zoom control) because rect.width != canvas.width once
+// scaled — we scale-correct explicitly.
+function gelCanvasPx(clientX, clientY, canvas) {
+  var rect = canvas.getBoundingClientRect();
+  return {
+    x: (clientX - rect.left) * canvas.width / Math.max(1, rect.width),
+    y: (clientY - rect.top) * canvas.height / Math.max(1, rect.height)
+  };
+}
+
+// Convert a lane's stored x_position (rotated-frame normalised) to
+// its display-normalised position, then to canvas pixel coord. Used
+// for hit-testing drag handles when a crop is active. Returns null
+// if the lane is outside the crop.
+function gelLanePx(laneIdx, canvas) {
+  var dn = gelViewNXtoDispN(G.lanes[laneIdx].x_position);
+  return dn === null ? null : dn * canvas.width;
 }
 
 function gelInitCanvas() {
   var img = document.getElementById('gelImg');
+  var bgCanvas = document.getElementById('gelBgCanvas');
   var canvas = document.getElementById('gelCanvas');
-  if (!img || !canvas) return;
+  if (!img || !bgCanvas || !canvas) return;
+
+  // Paint the rotated+cropped view into the background canvas. This
+  // canvas's intrinsic (attribute) size sets the aspect ratio for the
+  // CSS max-width/max-height sizing rule, so the wrap div lays out
+  // correctly. Returns false if img isn't loaded yet.
+  function paintBg() {
+    var rc = gelGetRotatedCanvas();
+    if (!rc) return false;
+    var view = gelViewRect();
+    if (!view || view.w < 1 || view.h < 1) return false;
+    bgCanvas.width = Math.round(view.w);
+    bgCanvas.height = Math.round(view.h);
+    var bctx = bgCanvas.getContext('2d');
+    bctx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
+    bctx.drawImage(rc, view.x, view.y, view.w, view.h,
+                       0, 0, bgCanvas.width, bgCanvas.height);
+    return true;
+  }
+
   function resize() {
-    canvas.width = img.clientWidth;
-    canvas.height = img.clientHeight;
-    G.imgW = img.clientWidth;
-    G.imgH = img.clientHeight;
+    if (!paintBg()) return;
+    // Overlay canvas matches bg canvas's rendered CSS size 1:1.
+    canvas.width = bgCanvas.clientWidth;
+    canvas.height = bgCanvas.clientHeight;
+    G.imgW = bgCanvas.clientWidth;
+    G.imgH = bgCanvas.clientHeight;
     gelDrawOverlay();
   }
   if (img.complete && img.naturalWidth) {
@@ -10159,12 +10540,37 @@ function gelInitCanvas() {
 
   canvas.onmousedown = function(e) {
     if (e.button !== 0) return;
+
+    // ── straighten mode: canvas clicks add up to 2 preview points.
+    if (G.straightenMode) {
+      if (G.straightenPts.length >= 2) return;  // waiting for Apply/Cancel
+      var p = gelCanvasPx(e.clientX, e.clientY, canvas);
+      G.straightenPts.push(p);
+      if (G.straightenPts.length === 2) {
+        gelRenderFull();  // rebuild toolbar so Apply/Cancel buttons appear
+      } else {
+        gelDrawOverlay();
+      }
+      return;
+    }
+
+    // ── crop mode: mousedown begins a drag; mousemove/up finish it.
+    if (G.cropMode) {
+      var pc = gelCanvasPx(e.clientX, e.clientY, canvas);
+      G.cropDragging = true;
+      G.cropDrag = { x0: pc.x, y0: pc.y, x1: pc.x, y1: pc.y };
+      gelDrawOverlay();
+      return;
+    }
+
     var nx = gelNormX(e.clientX, canvas);
     var ny = gelNormY(e.clientY, canvas);
-    /* check if clicking near existing lane handle */
+    /* check if clicking near existing lane handle. Compare in the same
+       (display) frame — remap stored x through crop, cull if hidden. */
     for (var i = 0; i < G.lanes.length; i++) {
-      var lx = G.lanes[i].x_position;
-      if (Math.abs(lx - nx) < 0.02) {
+      var lxDisp = gelViewNXtoDispN(G.lanes[i].x_position);
+      if (lxDisp === null) continue;
+      if (Math.abs(lxDisp - nx) < 0.02) {
         G.dragging = i;
         G.dragStartX = nx;
         G.selIdx = i;
@@ -10183,10 +10589,13 @@ function gelInitCanvas() {
         expected_size: '',
         observed_size: '',
         notes: '',
-        x_position: nx
+        // Store in rotated-frame coords (compose with any active crop)
+        // so lanes stay pinned to physical positions if the crop changes.
+        x_position: gelDispNtoViewNX(nx)
       });
       G.lanes.sort(function(a, b) { return a.x_position - b.x_position; });
-      G.selIdx = G.lanes.findIndex(function(l) { return l.x_position === nx; });
+      var newPos = gelDispNtoViewNX(nx);
+      G.selIdx = G.lanes.findIndex(function(l) { return l.x_position === newPos; });
       G.dirty = true;
       gelDrawOverlay();
       gelRenderLaneEditor();
@@ -10205,9 +10614,12 @@ function gelInitCanvas() {
       }
       if (!G.annotations.ladderMarks) G.annotations.ladderMarks = [];
 
+      // ladder-mark y is stored in rotated-frame coords, same reasoning
+      // as lane x_position above (survive crop / uncrop changes).
+      var storeY = gelDispNtoViewNY(ny);
       if (G.markReplaceIdx !== null && G.annotations.ladderMarks[G.markReplaceIdx]) {
         /* Re-place existing mark */
-        G.annotations.ladderMarks[G.markReplaceIdx].y = ny;
+        G.annotations.ladderMarks[G.markReplaceIdx].y = storeY;
         G.annotations.ladderMarks.sort(function(a, b) { return a.y - b.y; });
         G.markReplaceIdx = null;
       } else {
@@ -10217,7 +10629,7 @@ function gelInitCanvas() {
           return;
         }
         var nextSize = ladder.sizes[placedCount];
-        G.annotations.ladderMarks.push({ y: ny, size: nextSize });
+        G.annotations.ladderMarks.push({ y: storeY, size: nextSize });
         /* Keep marks sorted by y for clean display, but the "next size" logic
            above uses array length, not anything order-dependent, so this is
            cosmetic. */
@@ -10230,14 +10642,43 @@ function gelInitCanvas() {
   };
 
   canvas.onmousemove = function(e) {
+    // Straighten rubber-band: show a line from point 1 to the cursor
+    // until the second click lands.
+    if (G.straightenMode && G.straightenPts.length === 1) {
+      G.straightenMouse = gelCanvasPx(e.clientX, e.clientY, canvas);
+      gelDrawOverlay();
+      return;
+    }
+    // Active crop drag: extend the rect to the current cursor.
+    if (G.cropMode && G.cropDragging && G.cropDrag) {
+      var pc = gelCanvasPx(e.clientX, e.clientY, canvas);
+      G.cropDrag.x1 = pc.x;
+      G.cropDrag.y1 = pc.y;
+      gelDrawOverlay();
+      return;
+    }
     if (G.dragging < 0) return;
     var nx = gelNormX(e.clientX, canvas);
-    G.lanes[G.dragging].x_position = nx;
+    // Store in rotated-frame coords so drag while cropped composes correctly.
+    G.lanes[G.dragging].x_position = gelDispNtoViewNX(nx);
     G.dirty = true;
     gelDrawOverlay();
   };
 
   canvas.onmouseup = function() {
+    // Finish a crop drag — leave the rect in place awaiting Apply/Cancel.
+    if (G.cropMode && G.cropDragging) {
+      G.cropDragging = false;
+      // If it was effectively a click (no drag), clear the rect.
+      if (G.cropDrag) {
+        var d = G.cropDrag;
+        if (Math.abs(d.x1 - d.x0) < 3 && Math.abs(d.y1 - d.y0) < 3) {
+          G.cropDrag = null;
+        }
+      }
+      gelRenderFull();  // rebuild toolbar so Apply/Cancel buttons show
+      return;
+    }
     if (G.dragging >= 0) {
       G.lanes.sort(function(a, b) { return a.x_position - b.x_position; });
       var moved = G.lanes[G.dragging];
@@ -10249,6 +10690,12 @@ function gelInitCanvas() {
   };
 
   canvas.onmouseleave = function() {
+    // Cancel any in-progress crop drag when the mouse leaves the canvas.
+    // Don't clear straighten preview points — the user may want them to
+    // persist while they think.
+    if (G.cropMode && G.cropDragging) {
+      G.cropDragging = false;
+    }
     if (G.dragging >= 0) {
       G.dragging = -1;
       G.lanes.sort(function(a, b) { return a.x_position - b.x_position; });
@@ -11036,6 +11483,52 @@ function gelRenderFull() {
         '<option value="diagonal"'   + (G.labelOrientation === 'diagonal'   ? ' selected' : '') + '>diagonal 45°</option>' +
         '<option value="vertical"'   + (G.labelOrientation === 'vertical'   ? ' selected' : '') + '>vertical 90°</option>' +
       '</select></label>';
+    /* ── straighten / crop toolbar cluster ──
+       Straighten:
+         - default: shows "Straighten" button + rotation status (with Reset if !=0)
+         - in mode, 0-1 pts: shows "Click 2 points on a line that should be level" hint + Cancel
+         - in mode, 2 pts: shows Apply + Cancel
+       Crop:
+         - default: shows "Crop" button (or "Re-crop" if crop active) + Clear if a crop exists
+         - in mode, no drag: shows "Drag a rectangle" hint + Cancel
+         - in mode, drag committed: shows Apply + Cancel                */
+    // Straighten cluster
+    if (G.straightenMode) {
+      if (G.straightenPts.length === 2) {
+        html += '<span style="font-size:.75rem;color:#4a4139">Straighten preview:</span>';
+        html += '<button class="gel-btn-sm" onclick="gelStraightenApply()" style="background:#5b7a5e;color:#fff">Apply</button>';
+        html += '<button class="gel-btn-sm" onclick="gelStraightenCancel()">Cancel</button>';
+        html += '<button class="gel-btn-sm" onclick="gelExitStraighten()">Exit</button>';
+      } else {
+        html += '<span style="font-size:.75rem;color:#8a7f72">Click 2 points on a line that should be level' +
+                (G.straightenPts.length === 1 ? ' (1 more)' : '') + '</span>';
+        html += '<button class="gel-btn-sm" onclick="gelExitStraighten()">Cancel</button>';
+      }
+    } else {
+      html += '<button class="gel-btn-sm" onclick="gelEnterStraighten()" title="Click two points on a line that should be horizontal, e.g. two corners of the gel">Straighten</button>';
+      if (G.rotation) {
+        html += '<span style="font-size:.72rem;color:#8a7f72">' + G.rotation.toFixed(1) + '°</span>';
+        html += '<button class="gel-btn-sm" onclick="gelStraightenReset()" title="Reset rotation to 0°">Reset</button>';
+      }
+    }
+    // Crop cluster
+    if (G.cropMode) {
+      if (G.cropDrag && !G.cropDragging) {
+        html += '<span style="font-size:.75rem;color:#4a4139">Crop preview:</span>';
+        html += '<button class="gel-btn-sm" onclick="gelCropApply()" style="background:#5b7a5e;color:#fff">Apply</button>';
+        html += '<button class="gel-btn-sm" onclick="gelCropCancel()">Redo</button>';
+        html += '<button class="gel-btn-sm" onclick="gelExitCrop()">Exit</button>';
+      } else {
+        html += '<span style="font-size:.75rem;color:#8a7f72">Drag a rectangle over the region to keep</span>';
+        html += '<button class="gel-btn-sm" onclick="gelExitCrop()">Cancel</button>';
+      }
+    } else {
+      html += '<button class="gel-btn-sm" onclick="gelEnterCrop()" title="Drag a rectangle to crop the visible region non-destructively">' +
+              (G.crop ? 'Re-crop' : 'Crop') + '</button>';
+      if (G.crop) {
+        html += '<button class="gel-btn-sm" onclick="gelCropClear()" title="Remove crop, show full image">Clear crop</button>';
+      }
+    }
     html += '<button class="gel-btn" onclick="gelSave()">Save</button>';
     // Save annotated snapshot: flattens the current canvas view (image
     // + overlays) into a PNG and uploads it. Referenced by workflow
@@ -11046,10 +11539,16 @@ function gelRenderFull() {
     html += '<button class="gel-btn-sm gel-btn-danger" onclick="gelDelete(' + G.gel.id + ')" title="Delete gel">&times;</button>';
     html += '</div></div>';
 
-    /* canvas area */
+    /* canvas area
+       The <img> is a hidden loader only — its onload event drives the
+       bg-canvas paint (via gelInitCanvas → resize → paintBg). The bg
+       canvas holds the rotated+cropped image; the overlay canvas holds
+       annotations. Wrap sizing follows the bg canvas's intrinsic dims
+       under CSS max-width rules (same as the old img did).           */
     html += '<div class="gel-canvas-area"><div class="gel-canvas-scroll">';
     html += '<div id="gelCanvasWrap" class="gel-canvas-wrap" style="transform:scale(' + G.zoom + ')">';
-    html += '<img id="gelImg" src="/api/gel_images/' + encodeURIComponent(G.gel.image_file) + '" class="gel-img" draggable="false">';
+    html += '<img id="gelImg" src="/api/gel_images/' + encodeURIComponent(G.gel.image_file) + '" draggable="false" style="display:none">';
+    html += '<canvas id="gelBgCanvas" class="gel-bg-canvas"></canvas>';
     html += '<canvas id="gelCanvas" class="gel-canvas"></canvas>';
     html += '</div></div></div>';
 
@@ -11103,6 +11602,12 @@ function gelInjectStyles() {
     '.gel-canvas-scroll { padding:16px; display:flex; align-items:center; justify-content:center; width:100%; }',
     '.gel-canvas-wrap { position:relative; display:inline-block; transform-origin:center center; }',
     '.gel-img { display:block; max-width:100%; max-height:50vh; height:auto; user-select:none; -webkit-user-drag:none; }',
+    /* bg canvas replaces the visible <img> as the sizing element for the
+       wrap div. Same max sizing rules so layout matches what the old img
+       produced. display:block + width/height auto lets the intrinsic
+       canvas attributes (set by paintBg from the rotated-view dims)
+       drive aspect ratio; max-width/max-height scale it to fit. */
+    '.gel-bg-canvas { display:block; max-width:100%; max-height:50vh; width:auto; height:auto; user-select:none; background:#000; }',
     '.gel-canvas { position:absolute; top:0; left:0; width:100%; height:100%; cursor:crosshair; }',
     '.gel-controls { display:flex; gap:16px; padding:12px 14px; border-top:1px solid #d5cec0; background:#faf8f4; max-height:280px; overflow-y:auto; flex-wrap:wrap; }',
     '.gel-controls-left { flex:1; min-width:260px; }',
