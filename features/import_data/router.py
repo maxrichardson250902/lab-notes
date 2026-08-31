@@ -1,6 +1,6 @@
 """DNA Manager feature — primers, plasmids, gBlocks, kit parts, storage boxes, .gb files, and auto-linking."""
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Header
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -12,6 +12,24 @@ import os
 import uuid
 import re
 import json
+
+
+def _show_archived(header_value: Optional[str]) -> bool:
+    """Interpret the X-Show-Archived header. Anything truthy ('1', 'true',
+    'yes') = show. Missing / empty / '0' = hide. Deliberately permissive on
+    truthy values so the frontend implementation doesn't have to match an
+    exact string, but strict against absence so the default is 'hide'."""
+    if not header_value:
+        return False
+    return header_value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dna_where_private(header_value: Optional[str]) -> str:
+    """SQL fragment appended to WHERE clauses on DNA list endpoints.
+    Empty string when archived should be shown; ' AND private=0' otherwise.
+    Kept as a raw string because it interpolates a fixed constant into
+    static SQL — no user input flows through it."""
+    return "" if _show_archived(header_value) else " AND private=0"
 
 try:
     import openpyxl
@@ -286,6 +304,11 @@ def _ensure_migrations():
                 for _sc in ("stock_dna", "stock_glycerol", "stock_verified"):
                     if _sc not in _cols:
                         conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_sc} TEXT DEFAULT ''")
+                # Archived flag — hidden from lists unless X-Show-Archived
+                # header is set. See _show_archived_from_header. Default 0
+                # so existing rows stay visible.
+                if "private" not in _cols:
+                    conn.execute(f"ALTER TABLE {_tbl} ADD COLUMN private INTEGER NOT NULL DEFAULT 0")
             except Exception:
                 pass
         conn.commit()
@@ -441,10 +464,15 @@ class UpdatePrimer(BaseModel):
     stock_verified: Optional[str] = None
 
 @router.get("/primers")
-def list_primers():
+def list_primers(x_show_archived: Optional[str] = Header(None, alias="X-Show-Archived")):
     _ensure_migrations()
+    priv_clause = _dna_where_private(x_show_archived)
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM primers ORDER BY name ASC").fetchall()
+        # priv_clause is empty or " AND private=0"; safe because it comes from a fixed helper
+        # (no user input flows into the SQL string).
+        rows = conn.execute(
+            f"SELECT * FROM primers WHERE 1=1{priv_clause} ORDER BY name ASC"
+        ).fetchall()
     return {"items": [dict(r) for r in rows]}
 
 @router.post("/primers")
@@ -551,10 +579,15 @@ class UpdatePlasmid(BaseModel):
     stock_verified: Optional[str] = None
 
 @router.get("/plasmids")
-def list_plasmids():
+def list_plasmids(x_show_archived: Optional[str] = Header(None, alias="X-Show-Archived")):
     _ensure_migrations()
+    priv_clause = _dna_where_private(x_show_archived)
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM plasmids ORDER BY name ASC").fetchall()
+        # priv_clause is empty or " AND private=0"; safe because it comes from a fixed helper
+        # (no user input flows into the SQL string).
+        rows = conn.execute(
+            f"SELECT * FROM plasmids WHERE 1=1{priv_clause} ORDER BY name ASC"
+        ).fetchall()
     return {"items": [dict(r) for r in rows]}
 
 @router.post("/plasmids")
@@ -756,9 +789,15 @@ def _generate_gb_for_gblock(item_id: int, name: str, sequence: str):
 
 
 @router.get("/gblocks")
-def list_gblocks():
+def list_gblocks(x_show_archived: Optional[str] = Header(None, alias="X-Show-Archived")):
+    _ensure_migrations()
+    priv_clause = _dna_where_private(x_show_archived)
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM gblocks ORDER BY name ASC").fetchall()
+        # priv_clause is empty or " AND private=0"; safe because it comes from a fixed helper
+        # (no user input flows into the SQL string).
+        rows = conn.execute(
+            f"SELECT * FROM gblocks WHERE 1=1{priv_clause} ORDER BY name ASC"
+        ).fetchall()
     return {"items": [dict(r) for r in rows]}
 
 @router.get("/gblocks/next-name")
@@ -925,9 +964,13 @@ class UpdateKitPart(BaseModel):
     stock_verified: Optional[str] = None
 
 @router.get("/kit-parts")
-def list_kit_parts():
+def list_kit_parts(x_show_archived: Optional[str] = Header(None, alias="X-Show-Archived")):
+    _ensure_migrations()
+    priv_clause = _dna_where_private(x_show_archived)
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM kit_parts ORDER BY name ASC").fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM kit_parts WHERE 1=1{priv_clause} ORDER BY name ASC"
+        ).fetchall()
     return {"items": [dict(r) for r in rows]}
 
 @router.post("/kit-parts")
@@ -1048,10 +1091,53 @@ def _calc_part_length(seq: str) -> int:
     return len(re.sub(r'[^ACGTacgt]', '', seq))
 
 @router.get("/parts")
-def list_parts():
+def list_parts(x_show_archived: Optional[str] = Header(None, alias="X-Show-Archived")):
+    _ensure_migrations()
+    priv_clause = _dna_where_private(x_show_archived)
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM parts ORDER BY name ASC").fetchall()
+        # priv_clause is empty or " AND private=0"; safe because it comes from a fixed helper
+        # (no user input flows into the SQL string).
+        rows = conn.execute(
+            f"SELECT * FROM parts WHERE 1=1{priv_clause} ORDER BY name ASC"
+        ).fetchall()
     return {"items": [dict(r) for r in rows]}
+
+
+# ── Archive toggle (all DNA tables) ─────────────────────────────────────────
+# Flip the private flag on a single row. Requires the caller to already
+# be in "show archived" mode via header — otherwise the row wouldn't be
+# visible to toggle. This isn't a security check (client-side callers can
+# lie about the header), it's a UX guard: if the setting is off, we don't
+# want a stray API call to accidentally archive things.
+
+# Allowlist of tables that support the private flag. Keeps SQL injection
+# impossible even though the table name is interpolated — value can only
+# be one of these fixed strings.
+_ARCHIVABLE_TABLES = {"primers", "plasmids", "gblocks", "kit_parts", "parts"}
+
+
+class ToggleArchivedBody(BaseModel):
+    private: bool
+
+
+@router.post("/dna/toggle-archived/{table}/{item_id}")
+def toggle_archived(table: str, item_id: int, body: ToggleArchivedBody,
+                    x_show_archived: Optional[str] = Header(None, alias="X-Show-Archived")):
+    if table not in _ARCHIVABLE_TABLES:
+        raise HTTPException(400, f"table must be one of {sorted(_ARCHIVABLE_TABLES)}")
+    if not _show_archived(x_show_archived):
+        raise HTTPException(403, "archive mode not enabled")
+    val = 1 if body.private else 0
+    with get_db() as conn:
+        cur = conn.execute(
+            f"UPDATE {table} SET private=? WHERE id=?",
+            (val, item_id)
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, f"{table} id={item_id} not found")
+        conn.commit()
+    return {"table": table, "id": item_id, "private": bool(val)}
+
 
 @router.post("/parts")
 def create_part(body: CreatePart):

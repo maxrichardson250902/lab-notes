@@ -226,10 +226,6 @@ def get_today():
         reminders = [dict(r) for r in conn.execute(
             "SELECT * FROM reminders WHERE done=0 ORDER BY due_date ASC, created DESC").fetchall()]
         scratch_count = conn.execute("SELECT COUNT(*) FROM scratch WHERE processed=0").fetchone()[0]
-        try:
-            pred_count = conn.execute("SELECT COUNT(*) FROM predictions WHERE status='pending'").fetchone()[0]
-        except:
-            pred_count = 0
         workflow = [dict(r) for r in conn.execute(
             "SELECT * FROM workflow_entries WHERE date=? ORDER BY time ASC", (today_str,)).fetchall()]
     return {
@@ -238,7 +234,6 @@ def get_today():
         "recent_entries": recent,
         "reminders": reminders,
         "scratch_pending": scratch_count,
-        "predictions_pending": pred_count,
         "workflow": workflow,
     }
 

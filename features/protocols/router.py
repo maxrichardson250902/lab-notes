@@ -39,6 +39,26 @@ register_table("active_runs", """CREATE TABLE IF NOT EXISTS active_runs (
 register_seed(lambda conn: ensure_column(conn, "active_runs",
                                          "snoozed_until", "TEXT DEFAULT NULL"))
 
+# Protocol metadata schema: JSON blob describing custom fields the user
+# fills in when running this protocol (primers/temps for PCR, sample lists
+# for gels, etc). Null/empty = protocol has no schema; run panel skips the
+# metadata side-panel. Shape:
+#   {"fields": [
+#      {"id":"primer_fwd","label":"Forward primer","type":"text","default":""},
+#      {"id":"wells","label":"Wells","type":"table",
+#       "columns":[{"id":"lane","label":"Lane","type":"number"},
+#                  {"id":"sample","label":"Sample","type":"text"}]}
+#   ]}
+register_seed(lambda conn: ensure_column(conn, "protocols",
+                                         "metadata_schema", "TEXT DEFAULT NULL"))
+
+# Filled-in metadata values for a given run of a protocol. Shape matches
+# the schema — scalar fields get scalar values, table fields get a list
+# of row-dicts. Saved through the same PUT /active-runs/{id} flow as
+# steps_json / recipe_json.
+register_seed(lambda conn: ensure_column(conn, "active_runs",
+                                         "metadata_values", "TEXT DEFAULT NULL"))
+
 register_table("protocol_runs", """CREATE TABLE IF NOT EXISTS protocol_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     protocol_id  INTEGER NOT NULL,
@@ -207,6 +227,9 @@ class UpdateProtocol(BaseModel):
     steps:  Optional[str] = None
     recipe: Optional[str] = None
     auto_complete: Optional[str] = None
+    # JSON string. Frontend sends it pre-serialised so we don't need to
+    # dict-validate here (schema shape is a client-side concern).
+    metadata_schema: Optional[str] = None
 
 class ActiveRunCreate(BaseModel):
     run_id:       str
@@ -225,6 +248,10 @@ class ActiveRunUpdate(BaseModel):
     recipe_json:  Optional[str] = None
     scaling:      Optional[bool] = None
     scale_factor: Optional[float] = None
+    # Client-side JSON of filled-in schema values. Shape mirrors the
+    # protocol's metadata_schema — scalars for scalar fields, list of
+    # row-dicts for table fields.
+    metadata_values: Optional[str] = None
 
 class SaveRun(BaseModel):
     protocol_id: int
@@ -325,15 +352,16 @@ def update_active_run(run_id: str, body: ActiveRunUpdate):
         if not row:
             raise HTTPException(404, "Active run not found")
         r = dict(row)
-        if body.steps_json   is not None: r["steps_json"]   = body.steps_json
-        if body.recipe_json  is not None: r["recipe_json"]  = body.recipe_json
-        if body.scaling      is not None: r["scaling"]      = 1 if body.scaling else 0
-        if body.scale_factor is not None: r["scale_factor"] = body.scale_factor
+        if body.steps_json      is not None: r["steps_json"]      = body.steps_json
+        if body.recipe_json     is not None: r["recipe_json"]     = body.recipe_json
+        if body.scaling         is not None: r["scaling"]         = 1 if body.scaling else 0
+        if body.scale_factor    is not None: r["scale_factor"]    = body.scale_factor
+        if body.metadata_values is not None: r["metadata_values"] = body.metadata_values
         conn.execute("""UPDATE active_runs SET
-            steps_json=?, recipe_json=?, scaling=?, scale_factor=?, updated_at=?
+            steps_json=?, recipe_json=?, scaling=?, scale_factor=?, metadata_values=?, updated_at=?
             WHERE run_id=?""",
             (r["steps_json"], r["recipe_json"], r["scaling"],
-             r["scale_factor"], now, run_id))
+             r["scale_factor"], r.get("metadata_values"), now, run_id))
         conn.commit()
     return {"run_id": run_id}
 
@@ -560,10 +588,13 @@ async def update_protocol(protocol_id: int, body: UpdateProtocol):
         if body.recipe is not None: p["recipe"] = body.recipe
         if body.tags   is not None: p["tags"]   = json.dumps(body.tags)
         if body.auto_complete is not None: p["auto_complete"] = body.auto_complete
+        if body.metadata_schema is not None: p["metadata_schema"] = body.metadata_schema
         p["updated"] = datetime.utcnow().isoformat()
         conn.execute(
-            "UPDATE protocols SET title=?,notes=?,steps=?,recipe=?,tags=?,auto_complete=?,updated=? WHERE id=?",
-            (p["title"], p["notes"], p["steps"], p["recipe"], p["tags"], p.get("auto_complete", "manual"), p["updated"], protocol_id))
+            "UPDATE protocols SET title=?,notes=?,steps=?,recipe=?,tags=?,auto_complete=?,metadata_schema=?,updated=? WHERE id=?",
+            (p["title"], p["notes"], p["steps"], p["recipe"], p["tags"],
+             p.get("auto_complete", "manual"), p.get("metadata_schema"),
+             p["updated"], protocol_id))
         conn.commit()
     return p
 
@@ -695,3 +726,138 @@ def check_run_expiry():
         if completed:
             conn.commit()
     return {"completed": completed, "checked": len(runs) if 'runs' in dir() else 0}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# METADATA SCHEMA PRESETS
+# ══════════════════════════════════════════════════════════════════════════
+# Starter templates for common protocols. User picks one when creating /
+# editing a protocol; it seeds `metadata_schema` and they can then edit
+# fields freely. The library lives here (not in the DB) so version-
+# controlled changes ship with the code.
+#
+# Field types:
+#   text    — single-line free-text
+#   number  — numeric input (optional unit for display only, no coercion)
+#   table   — repeating rows with `columns`, each column is a text/number
+#             field. Values stored as list-of-dicts.
+#
+# `default` on scalar fields pre-fills the run's metadata_values when the
+# run is started. Tables start empty regardless.
+
+METADATA_PRESETS = {
+    "colony_pcr": {
+        "label": "Colony PCR",
+        "schema": {"fields": [
+            {"id": "primer_fwd",  "label": "Forward primer",  "type": "text"},
+            {"id": "primer_rev",  "label": "Reverse primer",  "type": "text"},
+            {"id": "template",    "label": "Template / expected product", "type": "text"},
+            {"id": "anneal_c",    "label": "Annealing (°C)",  "type": "number", "default": 55},
+            {"id": "extension_s", "label": "Extension (sec)", "type": "number", "default": 30},
+            {"id": "cycles",      "label": "Cycles",          "type": "number", "default": 30},
+            {"id": "polymerase",  "label": "Polymerase",      "type": "text",   "default": "Taq"},
+            {"id": "colonies",    "label": "Colonies screened", "type": "table",
+             "columns": [
+                {"id": "colony", "label": "Colony #",  "type": "number"},
+                {"id": "result", "label": "Result",    "type": "text"},
+                {"id": "notes",  "label": "Notes",     "type": "text"},
+             ]},
+        ]},
+    },
+    "standard_pcr": {
+        "label": "Standard PCR",
+        "schema": {"fields": [
+            {"id": "primer_fwd",   "label": "Forward primer", "type": "text"},
+            {"id": "primer_rev",   "label": "Reverse primer", "type": "text"},
+            {"id": "template",     "label": "Template",       "type": "text"},
+            {"id": "template_ng",  "label": "Template (ng)",  "type": "number"},
+            {"id": "anneal_c",     "label": "Annealing (°C)", "type": "number", "default": 60},
+            {"id": "extension_s",  "label": "Extension (sec)", "type": "number", "default": 60},
+            {"id": "cycles",       "label": "Cycles",         "type": "number", "default": 30},
+            {"id": "polymerase",   "label": "Polymerase",     "type": "text",   "default": "Q5"},
+            {"id": "expected_bp",  "label": "Expected size (bp)", "type": "number"},
+        ]},
+    },
+    "dna_gel": {
+        "label": "DNA gel",
+        "schema": {"fields": [
+            {"id": "agarose_pct", "label": "Agarose %",  "type": "number", "default": 1.0},
+            {"id": "buffer",      "label": "Buffer",     "type": "text",   "default": "TAE"},
+            {"id": "voltage",     "label": "Voltage",    "type": "number", "default": 100},
+            {"id": "time_min",    "label": "Run time (min)", "type": "number", "default": 30},
+            {"id": "ladder",      "label": "Ladder",     "type": "text",   "default": "1 kb Plus"},
+            {"id": "wells",       "label": "Wells",      "type": "table",
+             "columns": [
+                {"id": "lane",     "label": "Lane",      "type": "number"},
+                {"id": "sample",   "label": "Sample",    "type": "text"},
+                {"id": "vol_ul",   "label": "Volume (µL)", "type": "number"},
+                {"id": "expected", "label": "Expected size (bp)", "type": "text"},
+             ]},
+        ]},
+    },
+    "sds_page": {
+        "label": "SDS-PAGE gel",
+        "schema": {"fields": [
+            {"id": "gel_pct",     "label": "Gel %",       "type": "number", "default": 12},
+            {"id": "buffer",      "label": "Running buffer", "type": "text", "default": "MES"},
+            {"id": "voltage",     "label": "Voltage",     "type": "number", "default": 200},
+            {"id": "time_min",    "label": "Run time (min)", "type": "number", "default": 35},
+            {"id": "ladder",      "label": "Ladder",      "type": "text",   "default": "PageRuler Plus"},
+            {"id": "stain",       "label": "Stain",       "type": "text",   "default": "Coomassie"},
+            {"id": "wells",       "label": "Wells",       "type": "table",
+             "columns": [
+                {"id": "lane",   "label": "Lane",         "type": "number"},
+                {"id": "sample", "label": "Sample",       "type": "text"},
+                {"id": "vol_ul", "label": "Volume (µL)",  "type": "number"},
+                {"id": "notes",  "label": "Notes",        "type": "text"},
+             ]},
+        ]},
+    },
+    "transformation": {
+        "label": "Bacterial transformation",
+        "schema": {"fields": [
+            {"id": "strain",       "label": "Competent strain", "type": "text", "default": "DH5α"},
+            {"id": "plasmid",      "label": "Plasmid",       "type": "text"},
+            {"id": "dna_ng",       "label": "DNA (ng)",      "type": "number"},
+            {"id": "antibiotic",   "label": "Selection",     "type": "text",   "default": "Amp"},
+            {"id": "recovery_min", "label": "Recovery (min)", "type": "number", "default": 60},
+            {"id": "vol_plated",   "label": "Plated (µL)",   "type": "number", "default": 100},
+            {"id": "colonies_obs", "label": "Colonies observed", "type": "number"},
+        ]},
+    },
+    "miniprep": {
+        "label": "Miniprep",
+        "schema": {"fields": [
+            {"id": "kit",           "label": "Kit",            "type": "text", "default": "Monarch"},
+            {"id": "culture_ml",    "label": "Culture volume (mL)", "type": "number", "default": 5},
+            {"id": "samples",       "label": "Samples",        "type": "table",
+             "columns": [
+                {"id": "id",       "label": "Sample ID",       "type": "text"},
+                {"id": "yield",    "label": "Yield (ng/µL)",   "type": "number"},
+                {"id": "a260_280", "label": "A260/A280",       "type": "number"},
+                {"id": "a260_230", "label": "A260/A230",       "type": "number"},
+             ]},
+        ]},
+    },
+    "restriction_digest": {
+        "label": "Restriction digest",
+        "schema": {"fields": [
+            {"id": "enzyme_1",   "label": "Enzyme 1",         "type": "text"},
+            {"id": "enzyme_2",   "label": "Enzyme 2",         "type": "text"},
+            {"id": "buffer",     "label": "Buffer",           "type": "text",   "default": "CutSmart"},
+            {"id": "template",   "label": "Template",         "type": "text"},
+            {"id": "template_ng", "label": "Template (ng)",   "type": "number", "default": 500},
+            {"id": "temp_c",     "label": "Incubation (°C)",  "type": "number", "default": 37},
+            {"id": "time_min",   "label": "Time (min)",       "type": "number", "default": 60},
+            {"id": "final_vol_ul", "label": "Final volume (µL)", "type": "number", "default": 20},
+        ]},
+    },
+}
+
+
+@router.get("/protocol-metadata-presets")
+def list_metadata_presets():
+    """Return the metadata schema preset library. Frontend uses this to
+    populate the 'Load from preset ▼' dropdown in the protocol edit view.
+    Presets are starter schemas — user adopts one then edits fields."""
+    return {"presets": METADATA_PRESETS}

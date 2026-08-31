@@ -73,14 +73,6 @@ async function renderTimeline(el){
     html+='</div>';
   });
 
-  // Generate predictions button
-  html+='<div style="margin-top:20px;text-align:center">'+
-    '<button class="btn primary" onclick="generatePredictions()" style="padding:10px 24px">'+
-      '&#9733; Predict next tasks from timelines'+
-    '</button>'+
-    '<div style="font-size:12px;color:var(--dim);margin-top:6px">Wakes the 3090, reads all project timelines, suggests upcoming tasks</div>'+
-  '</div>';
-
   el.innerHTML=html;
 
   // Bind node clicks
@@ -135,16 +127,4 @@ async function loadTimelineDetail(group,date){
   }
 }
 
-async function generatePredictions(){
-  toast('Waking 3090 — generating predictions...');
-  try{
-    var resp=await api('POST','/api/predictions/generate');
-    if(resp.error){toast(resp.error,true);return;}
-    toast('Generated '+resp.count+' predictions');
-    await load();
-    setView('predictions');
-  }catch(e){
-    toast('Failed: '+e.message,true);
-  }
-}
 registerView('timeline', renderTimeline, {wide:true});

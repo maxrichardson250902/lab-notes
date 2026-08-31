@@ -40,7 +40,11 @@ async function _saveRunToDb(run) {
       steps_json:   JSON.stringify(run.steps),
       recipe_json:  JSON.stringify(run.recipe),
       scaling:      run.scaling || false,
-      scale_factor: run.scaleFactor || 1.0
+      scale_factor: run.scaleFactor || 1.0,
+      // Metadata values (side-panel form). Send even when empty ({}) so
+      // clearing a field actually persists rather than reverting to
+      // whatever was on disk. run.metadata is a plain object.
+      metadata_values: JSON.stringify(run.metadata || {})
     });
   } catch(e) {
     // record may not exist yet - create it
@@ -71,6 +75,8 @@ async function _getAllRuns() {
   try {
     var data = await api('GET', '/api/active-runs');
     var dbRuns = (data.runs || []).map(function(r) {
+      var meta = {};
+      try { meta = JSON.parse(r.metadata_values || '{}') || {}; } catch (e) { meta = {}; }
       return {
         runId:       r.run_id,
         protocol:    JSON.parse(r.protocol_json),
@@ -80,7 +86,10 @@ async function _getAllRuns() {
         scaleFactor: r.scale_factor || 1.0,
         group_name:  r.group_name || 'Protocols',
         subgroup:    r.subgroup || '',
-        startedAt:   r.started_at
+        startedAt:   r.started_at,
+        // Filled-in metadata values (side-panel form). Empty object when
+        // the run is new or the schema was blank.
+        metadata:    meta
       };
     });
     try { localStorage.setItem(_RUNS_KEY, JSON.stringify(dbRuns)); } catch(e) {}
@@ -697,7 +706,11 @@ function spLaunchRunDirect(p, group, subgroup) {
     scaleFactor: 1,
     group_name:  group || 'Protocols',
     subgroup:    subgroup || '',
-    startedAt:   new Date().toISOString()
+    startedAt:   new Date().toISOString(),
+    // Seed metadata with defaults from the protocol's schema so scalar
+    // fields with a default show pre-filled in the side panel. Table
+    // fields start empty (the "Add row" button is how they grow).
+    metadata:    _spSeedMetadataFromSchema(p.metadata_schema)
   };
 
   // create in DB immediately (non-blocking)
@@ -730,6 +743,8 @@ async function spResumeRunById(runId) {
     var data = await api('GET', '/api/active-runs');
     var dbRun = (data.runs || []).find(function(r) { return r.run_id === runId; });
     if (dbRun) {
+      var meta = {};
+      try { meta = JSON.parse(dbRun.metadata_values || '{}') || {}; } catch(e) { meta = {}; }
       _scratchProtoRun = {
         runId:       dbRun.run_id,
         protocol:    JSON.parse(dbRun.protocol_json),
@@ -739,7 +754,8 @@ async function spResumeRunById(runId) {
         scaleFactor: dbRun.scale_factor || 1.0,
         group_name:  dbRun.group_name || 'Protocols',
         subgroup:    dbRun.subgroup || '',
-        startedAt:   dbRun.started_at
+        startedAt:   dbRun.started_at,
+        metadata:    meta
       };
       _saveLocalOnly(_scratchProtoRun);
       if (typeof setView === 'function') setView('scratch');
@@ -798,30 +814,255 @@ function _renderProtoRunInScratch(el) {
   var groupLabel = rs.group_name + (rs.subgroup ? ' / ' + rs.subgroup : '');
   el.innerHTML =
     _renderRunTabs() +
-    '<div style="padding:0 0 24px">' +
-      '<div class="sp-run-header">' +
-        '<div>' +
-          '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) + '</div>' +
-          '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;&#183;&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '</div>' +
-          '<span class="sp-run-group-badge">&#128193; ' + esc(groupLabel) + '</span>' +
+    '<div class="sp-run-layout" style="display:grid;grid-template-columns:1fr 340px;gap:20px;padding:0 0 24px;align-items:start">' +
+      '<div class="sp-run-main">' +
+        '<div class="sp-run-header">' +
+          '<div>' +
+            '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) + '</div>' +
+            '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;&#183;&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '</div>' +
+            '<span class="sp-run-group-badge">&#128193; ' + esc(groupLabel) + '</span>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px">' +
+            '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
+            '<button class="btn" style="color:#c0392b" onclick="spAbandonRun()">&#215; Abandon</button>' +
+          '</div>' +
         '</div>' +
-        '<div style="display:flex;gap:6px">' +
+        '<div class="sp-progress"><div class="sp-progress-fill" id="sp-pfill" style="width:' + pct + '%"></div></div>' +
+        '<div id="sp-recipe-wrap">' + _renderRunRecipe() + '</div>' +
+        '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Steps</div>' +
+        '<div id="sp-steps-list">' + stepsHtml + '</div>' +
+        '<div id="sp-summary-wrap"></div>' +
+        '<div class="sp-run-footer">' +
+          '<button class="btn" onclick="spShowSummary()">View summary</button>' +
           '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
-          '<button class="btn" style="color:#c0392b" onclick="spAbandonRun()">&#215; Abandon</button>' +
+          '<button class="btn primary sp-finish-btn" data-sp-finish="1" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
         '</div>' +
       '</div>' +
-      '<div class="sp-progress"><div class="sp-progress-fill" id="sp-pfill" style="width:' + pct + '%"></div></div>' +
-      '<div id="sp-recipe-wrap">' + _renderRunRecipe() + '</div>' +
-      '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Steps</div>' +
-      '<div id="sp-steps-list">' + stepsHtml + '</div>' +
-      '<div id="sp-summary-wrap"></div>' +
-      '<div class="sp-run-footer">' +
-        '<button class="btn" onclick="spShowSummary()">View summary</button>' +
-        '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
-        '<button class="btn primary sp-finish-btn" data-sp-finish="1" onclick="spSaveToEntry()">&#10003; Save to Entry &amp; finish</button>' +
-      '</div>' +
+      '<aside class="sp-meta-panel" id="sp-meta-panel">' +
+        _spRenderMetaPanel(rs) +
+      '</aside>' +
     '</div>';
 }
+
+// ── Metadata side panel (protocol-run details) ───────────────────────────
+// Renders the protocol's metadata_schema as form inputs, bound to
+// _scratchProtoRun.metadata. On any change: _saveRun() writes the whole
+// run object to /active-runs/{id}, which now accepts metadata_values.
+// If the protocol has no schema, panel shows a "no fields defined" hint
+// with a link to the protocol edit view.
+function _spRenderMetaPanel(rs) {
+  var schema = _spParseSchema(rs.protocol && rs.protocol.metadata_schema);
+  var h = '<div class="sp-meta-h">Run details</div>';
+  if (!schema || !schema.fields || !schema.fields.length) {
+    h += '<div class="sp-meta-empty">' +
+      'This protocol has no metadata fields defined.' +
+      '<br><br>' +
+      '<a href="#" onclick="event.preventDefault();spEditProtocol(' + (rs.protocol.id || 0) + ')" style="color:#5b7a5e;text-decoration:underline">Edit protocol</a> to add a schema, or pick a preset (Colony PCR, Gel, etc).' +
+    '</div>';
+    return h;
+  }
+  if (!rs.metadata) rs.metadata = {};
+  schema.fields.forEach(function(f) {
+    h += _spRenderMetaField(f, rs.metadata);
+  });
+  return h;
+}
+
+// Parse metadata_schema — protocols API returns it as a JSON string,
+// but tolerate a pre-parsed object too (in case something upstream
+// deserialised for us). Returns null on any failure.
+function _spParseSchema(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+// Seed a run.metadata object from a schema's defaults. Scalars with a
+// `default` get pre-filled; table fields start as empty arrays. Fields
+// without a default and non-table fields are omitted (frontend renders
+// them as empty inputs).
+function _spSeedMetadataFromSchema(rawSchema) {
+  var schema = _spParseSchema(rawSchema);
+  var out = {};
+  if (!schema || !schema.fields) return out;
+  schema.fields.forEach(function(f) {
+    if (f.type === 'table') out[f.id] = [];
+    else if (f.default !== undefined) out[f.id] = f.default;
+  });
+  return out;
+}
+
+// Render a run's filled-in metadata as HTML for the workflow log. Called
+// during Save-to-Entry so the workflow doc records what the run actually
+// used (primers/temps/samples). Skipped silently if schema or metadata
+// are empty — no visual clutter when there's nothing to say.
+function _spRenderMetaForWorkflow(rs) {
+  var schema = _spParseSchema(rs.protocol && rs.protocol.metadata_schema);
+  var meta = rs.metadata || {};
+  if (!schema || !schema.fields || !schema.fields.length) return '';
+  // Split into scalars (rendered as inline definition list) and tables
+  // (rendered as HTML tables). Skip fields the user didn't fill.
+  var scalarRows = [];
+  var tableBlocks = [];
+  schema.fields.forEach(function(f) {
+    var v = meta[f.id];
+    if (v == null || v === '') return;  // unfilled — omit
+    if (f.type === 'table') {
+      if (!Array.isArray(v) || v.length === 0) return;
+      var cols = f.columns || [];
+      var thead = '<tr>' + cols.map(function(c) {
+        return '<th style="text-align:left;font-size:11px;color:#6a5f52;font-weight:600;padding:3px 8px;border-bottom:1px solid #d5cec0">' + _gelEsc(c.label || c.id) + '</th>';
+      }).join('') + '</tr>';
+      var tbody = v.map(function(row) {
+        return '<tr>' + cols.map(function(c) {
+          return '<td style="padding:3px 8px;font-size:12px">' + _gelEsc(row[c.id] == null ? '' : String(row[c.id])) + '</td>';
+        }).join('') + '</tr>';
+      }).join('');
+      tableBlocks.push(
+        '<div style="margin-top:6px"><strong style="font-size:12px;color:#6a5f52">' + _gelEsc(f.label || f.id) + '</strong>' +
+        '<table style="border-collapse:collapse;margin-top:2px"><thead>' + thead + '</thead><tbody>' + tbody + '</tbody></table></div>'
+      );
+    } else {
+      scalarRows.push(
+        '<span style="margin-right:14px"><strong style="color:#6a5f52">' + _gelEsc(f.label || f.id) + ':</strong> ' + _gelEsc(String(v)) + '</span>'
+      );
+    }
+  });
+  if (!scalarRows.length && !tableBlocks.length) return '';
+  var out = '<div class="wf-block wf-proto-meta" style="margin:6px 0 8px;padding:8px 12px;background:#faf8f4;border-left:3px solid #5b7aa0;border-radius:0 4px 4px 0;font-family:inherit">';
+  if (scalarRows.length) out += '<div style="font-size:12px;line-height:1.7">' + scalarRows.join('') + '</div>';
+  tableBlocks.forEach(function(t) { out += t; });
+  out += '</div>';
+  return out;
+}
+
+function _spRenderMetaField(f, values) {
+  var cur = values[f.id];
+  if (cur === undefined && f.default !== undefined) {
+    cur = f.default;
+    values[f.id] = cur;
+  }
+  if (f.type === 'table') {
+    return _spRenderMetaTable(f, values);
+  }
+  var inputType = (f.type === 'number') ? 'number' : 'text';
+  var val = cur == null ? '' : String(cur);
+  return '<div class="sp-meta-field">' +
+    '<label>' + esc(f.label || f.id) + '</label>' +
+    '<input type="' + inputType + '" value="' + esc(val) +
+      '" oninput="_spMetaSet(\'' + esc(f.id) + '\', this.value, \'' + inputType + '\')"/>' +
+  '</div>';
+}
+
+function _spRenderMetaTable(f, values) {
+  if (!Array.isArray(values[f.id])) values[f.id] = [];
+  var rows = values[f.id];
+  var cols = f.columns || [];
+  var h = '<div class="sp-meta-field sp-meta-table">' +
+    '<label>' + esc(f.label || f.id) + ' <span style="color:#8a7f72;font-weight:normal">(' + rows.length + ' row' + (rows.length === 1 ? '' : 's') + ')</span></label>' +
+    '<table><thead><tr>';
+  cols.forEach(function(c) {
+    h += '<th>' + esc(c.label || c.id) + '</th>';
+  });
+  h += '<th style="width:20px"></th></tr></thead><tbody>';
+  rows.forEach(function(row, ri) {
+    h += '<tr>';
+    cols.forEach(function(c) {
+      var v = row[c.id] == null ? '' : String(row[c.id]);
+      var t = (c.type === 'number') ? 'number' : 'text';
+      h += '<td><input type="' + t + '" value="' + esc(v) +
+           '" oninput="_spMetaSetTableCell(\'' + esc(f.id) + '\',' + ri + ',\'' + esc(c.id) + '\', this.value, \'' + t + '\')"/></td>';
+    });
+    h += '<td><button class="sp-meta-x" onclick="_spMetaTableRemoveRow(\'' + esc(f.id) + '\',' + ri + ')" title="Remove row">&times;</button></td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table>' +
+    '<button class="sp-meta-addrow" onclick="_spMetaTableAddRow(\'' + esc(f.id) + '\')">+ Add row</button>' +
+  '</div>';
+  return h;
+}
+
+// State mutations — all funnel through _saveRun so debounce handles
+// batching, and the same code path handles disk persistence.
+function _spMetaSet(fieldId, value, inputType) {
+  var rs = _scratchProtoRun; if (!rs) return;
+  if (!rs.metadata) rs.metadata = {};
+  var v = value;
+  if (inputType === 'number' && v !== '') {
+    var n = parseFloat(v);
+    v = isNaN(n) ? value : n;
+  }
+  rs.metadata[fieldId] = v;
+  _saveRun(rs);
+}
+
+function _spMetaTableAddRow(fieldId) {
+  var rs = _scratchProtoRun; if (!rs) return;
+  if (!rs.metadata) rs.metadata = {};
+  if (!Array.isArray(rs.metadata[fieldId])) rs.metadata[fieldId] = [];
+  rs.metadata[fieldId].push({});
+  _saveRun(rs);
+  // Re-render just the meta panel so the new row appears.
+  var el = document.getElementById('sp-meta-panel');
+  if (el) el.innerHTML = _spRenderMetaPanel(rs);
+}
+
+function _spMetaTableRemoveRow(fieldId, rowIdx) {
+  var rs = _scratchProtoRun; if (!rs) return;
+  if (!rs.metadata || !Array.isArray(rs.metadata[fieldId])) return;
+  rs.metadata[fieldId].splice(rowIdx, 1);
+  _saveRun(rs);
+  var el = document.getElementById('sp-meta-panel');
+  if (el) el.innerHTML = _spRenderMetaPanel(rs);
+}
+
+function _spMetaSetTableCell(fieldId, rowIdx, colId, value, inputType) {
+  var rs = _scratchProtoRun; if (!rs) return;
+  if (!rs.metadata || !Array.isArray(rs.metadata[fieldId])) return;
+  var v = value;
+  if (inputType === 'number' && v !== '') {
+    var n = parseFloat(v); v = isNaN(n) ? value : n;
+  }
+  if (!rs.metadata[fieldId][rowIdx]) rs.metadata[fieldId][rowIdx] = {};
+  rs.metadata[fieldId][rowIdx][colId] = v;
+  _saveRun(rs);
+}
+
+// Navigate to protocol edit — called from the empty-state link.
+function spEditProtocol(protocolId) {
+  if (!protocolId) return;
+  if (typeof setView === 'function') {
+    setView('protocols');
+    // Best-effort: signal the protocols view to open this protocol's edit.
+    setTimeout(function() {
+      if (typeof _openProtocolEdit === 'function') _openProtocolEdit(protocolId);
+    }, 100);
+  }
+}
+
+// Inject side-panel CSS once at module load.
+(function _spInjectMetaCss() {
+  var css = [
+    '.sp-meta-panel{background:#faf8f4;border:1px solid #e8e2d8;border-radius:6px;padding:12px 14px;position:sticky;top:12px;max-height:calc(100vh - 40px);overflow-y:auto;font-size:12px}',
+    '.sp-meta-h{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #e8e2d8}',
+    '.sp-meta-empty{color:#8a7f72;line-height:1.5}',
+    '.sp-meta-field{margin-bottom:10px}',
+    '.sp-meta-field label{display:block;font-size:11px;color:#6a5f52;font-weight:600;margin-bottom:3px}',
+    '.sp-meta-field input{width:100%;box-sizing:border-box;padding:5px 8px;border:1px solid #d5cec0;border-radius:3px;background:#fff;font-size:12px;color:#4a4139;font-family:inherit}',
+    '.sp-meta-field input:focus{outline:none;border-color:#5b7a5e}',
+    '.sp-meta-table table{width:100%;border-collapse:collapse;margin-top:4px}',
+    '.sp-meta-table th{font-size:10px;color:#8a7f72;text-transform:uppercase;letter-spacing:.05em;font-weight:600;padding:2px 4px;text-align:left;border-bottom:1px solid #e8e2d8}',
+    '.sp-meta-table td{padding:2px}',
+    '.sp-meta-table input{padding:3px 6px;font-size:11px}',
+    '.sp-meta-x{background:none;border:none;color:#c0796a;cursor:pointer;font-size:14px;padding:0}',
+    '.sp-meta-addrow{margin-top:6px;padding:4px 10px;font-size:11px;background:#fff;border:1px solid #d5cec0;border-radius:3px;color:#5b7a5e;cursor:pointer}',
+    '.sp-meta-addrow:hover{background:#5b7a5e;color:#fff}',
+    '@media (max-width:1000px){.sp-run-layout{grid-template-columns:1fr !important}.sp-meta-panel{position:static;max-height:none}}',
+  ].join('');
+  var s = document.createElement('style');
+  s.textContent = css;
+  document.head.appendChild(s);
+})();
 
 // ── multi-run tabs ─────────────────────────────────────────────────────
 // The scratch pad historically showed ONE run at a time — you had to save
@@ -1141,7 +1382,7 @@ async function spSaveRunToEntry(runId) {
           ' (' + doneSteps.length + ' / ' + rs.steps.length + ' steps' +
           (devSteps.length ? ', ' + devSteps.length + ' deviation' + (devSteps.length > 1 ? 's' : '') : '') +
           ')' +
-        '</p>' + stepHtml;
+        '</p>' + _spRenderMetaForWorkflow(rs) + stepHtml;
       await api('POST', '/api/workflow/document/append', {
         date: today,
         html: completionHtml,

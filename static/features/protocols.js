@@ -1098,17 +1098,199 @@ function protoEdit(pid) {
   var p=(S.protocols||[]).find(function(x){return x.id===pid;}); if(!p)return;
   var panel=document.getElementById('pp-'+pid); if(!panel)return;
   var steps=[]; try{var parsed=JSON.parse(p.steps||'[]');if(Array.isArray(parsed)&&parsed.length&&typeof parsed[0].text!=='undefined')steps=parsed;}catch(e){}
-  _editState[pid]={title:p.title,steps:steps.map(function(s){return{text:s.text,note:s.note||''};})};
+  // Seed schema too. Falls back to {fields:[]} for a blank protocol.
+  var mschema = {fields: []};
+  try { if (p.metadata_schema) { var parsed_s = JSON.parse(p.metadata_schema); if (parsed_s && Array.isArray(parsed_s.fields)) mschema = parsed_s; } } catch(e) {}
+  _editState[pid]={
+    title:p.title,
+    steps:steps.map(function(s){return{text:s.text,note:s.note||''};}),
+    metadata_schema: mschema
+  };
   if(!_editState[pid].steps.length) _editState[pid].steps=[{text:'',note:''}];
   var h='<div class="proto-edit-mode-banner">&#9998; <strong>Editing mode</strong> — drag steps to reorder, edit inline</div>';
   h+='<div style="margin-bottom:12px"><input id="pe-title-'+pid+'" type="text" value="'+esc(p.title)+'" style="font-weight:700;font-size:16px;color:#4a4139;border:none;border-bottom:2px solid #5b7a5e;background:transparent;outline:none;width:100%" oninput="_editState['+pid+'].title=this.value"/></div>';
   h+='<div id="pe-steps-'+pid+'">'+_buildEditStepsHTML(pid)+'</div>';
   h+='<div class="recipe-section" style="margin-top:16px"><div class="recipe-section-head"><span>Reaction Tables</span><div class="recipe-edit-actions" id="recipe-actions-'+pid+'"><button class="btn" onclick="protoRecipeEdit('+pid+')">Edit tables</button></div></div><div id="recipe-body-'+pid+'">'+_recipeDisplayHTML(p.recipe)+'</div></div>';
+  // ── Metadata schema editor ──────────────────────────────────────────
+  // Custom fields the user fills in per run (primers/temps for PCR,
+  // sample list for gels, etc). Loaded into the scratch side panel.
+  // Presets seed the schema — user then edits.
+  h+='<div class="recipe-section" style="margin-top:16px" id="ms-section-'+pid+'">' +
+     '<div class="recipe-section-head"><span>Run metadata schema</span>' +
+     '<div style="display:flex;gap:6px;align-items:center">' +
+       '<select id="ms-preset-'+pid+'" style="font-size:12px;padding:4px 8px;border:1px solid #d5cec0;border-radius:3px;background:#fff">' +
+         '<option value="">Load from preset…</option>' +
+       '</select>' +
+       '<button class="btn" onclick="_msAddField('+pid+',\'text\')">+ Text</button>' +
+       '<button class="btn" onclick="_msAddField('+pid+',\'number\')">+ Number</button>' +
+       '<button class="btn" onclick="_msAddField('+pid+',\'table\')">+ Table</button>' +
+     '</div></div>' +
+     '<div id="ms-body-'+pid+'">'+_msRenderBody(pid)+'</div>' +
+     '</div>';
   // auto-complete setting
   h+='<div style="margin-top:16px;display:flex;align-items:center;gap:10px"><span style="font-size:12px;font-weight:600;color:#8a7f72">Auto-complete runs:</span>'+_acDropdownHTML('pe-ac-'+pid, p.auto_complete||'manual')+'</div>';
   h+='<div style="display:flex;gap:8px;margin-top:16px;border-top:1px solid #e8e2d8;padding-top:12px"><button class="btn primary" onclick="protoSaveEdit('+pid+')">&#10003; Save all</button><button class="btn" onclick="protoCancelEdit('+pid+')">Cancel</button></div>';
   panel.innerHTML=h;
   _attachEditStepListeners(pid); _attachDragHandlers(pid);
+  _msLoadPresets(pid);
+}
+
+// ── Metadata schema editor helpers ────────────────────────────────────────
+// _editState[pid].metadata_schema = {fields: [...]}. Each field: {id, label,
+// type, default?, columns?}. Table fields have columns [{id, label, type}].
+// IDs are auto-slugged from labels; users only see labels in the UI.
+
+async function _msLoadPresets(pid) {
+  try {
+    var r = await api('GET', '/api/protocol-metadata-presets');
+    var sel = document.getElementById('ms-preset-'+pid);
+    if (!sel) return;
+    var keys = Object.keys(r.presets || {}).sort();
+    keys.forEach(function(k) {
+      var opt = document.createElement('option');
+      opt.value = k;
+      opt.textContent = r.presets[k].label || k;
+      sel.appendChild(opt);
+    });
+    sel.onchange = function() {
+      if (!this.value) return;
+      if (_editState[pid].metadata_schema && _editState[pid].metadata_schema.fields.length) {
+        if (!confirm('Replace current metadata fields with the ' + r.presets[this.value].label + ' preset?')) {
+          this.value = '';
+          return;
+        }
+      }
+      _editState[pid].metadata_schema = JSON.parse(JSON.stringify(r.presets[this.value].schema));
+      _msRefresh(pid);
+      this.value = '';
+    };
+  } catch (e) { /* silent — dropdown just won't populate */ }
+}
+
+function _msRefresh(pid) {
+  var body = document.getElementById('ms-body-'+pid);
+  if (body) body.innerHTML = _msRenderBody(pid);
+}
+
+function _msRenderBody(pid) {
+  var es = _editState[pid]; if (!es || !es.metadata_schema) return '';
+  var fields = es.metadata_schema.fields || [];
+  if (!fields.length) {
+    return '<div style="color:#8a7f72;font-size:12px;padding:8px 0">No metadata fields defined. Pick a preset above, or add a Text/Number/Table field.</div>';
+  }
+  return '<div class="ms-fields">' + fields.map(function(f, i) {
+    return _msRenderField(pid, f, i);
+  }).join('') + '</div>';
+}
+
+function _msRenderField(pid, f, i) {
+  var h = '<div class="ms-field" style="border:1px solid #e8e2d8;border-radius:4px;padding:8px 10px;margin-bottom:6px;background:#faf8f4">' +
+    '<div style="display:flex;gap:6px;align-items:center;margin-bottom:4px">' +
+      '<span style="font-size:10px;text-transform:uppercase;color:#8a7f72;font-weight:600;letter-spacing:.05em">' + esc(f.type) + '</span>' +
+      '<input type="text" value="' + esc(f.label || '') + '" placeholder="Field label" oninput="_msFieldSet(' + pid + ',' + i + ',\'label\',this.value)" style="flex:1;padding:3px 8px;border:1px solid #d5cec0;border-radius:3px;font-size:12px"/>' +
+      (f.type === 'number' ? '<input type="number" value="' + (f.default == null ? '' : esc(String(f.default))) + '" placeholder="default" oninput="_msFieldSet(' + pid + ',' + i + ',\'default\',this.value,\'number\')" style="width:80px;padding:3px 8px;border:1px solid #d5cec0;border-radius:3px;font-size:12px"/>' : '') +
+      (f.type === 'text'   ? '<input type="text" value="' + esc(f.default == null ? '' : String(f.default)) + '" placeholder="default" oninput="_msFieldSet(' + pid + ',' + i + ',\'default\',this.value)" style="width:120px;padding:3px 8px;border:1px solid #d5cec0;border-radius:3px;font-size:12px"/>' : '') +
+      '<button class="btn" onclick="_msMoveField(' + pid + ',' + i + ',-1)" title="Move up">&#9650;</button>' +
+      '<button class="btn" onclick="_msMoveField(' + pid + ',' + i + ',1)" title="Move down">&#9660;</button>' +
+      '<button class="btn" style="color:#c0392b" onclick="_msRemoveField(' + pid + ',' + i + ')" title="Remove">&times;</button>' +
+    '</div>';
+  if (f.type === 'table') {
+    var cols = f.columns || [];
+    h += '<div style="margin-top:6px;padding-left:12px;border-left:2px solid #d5cec0">' +
+      '<div style="font-size:11px;color:#8a7f72;margin-bottom:4px">Columns:</div>';
+    cols.forEach(function(c, ci) {
+      h += '<div style="display:flex;gap:4px;align-items:center;margin-bottom:3px">' +
+        '<input type="text" value="' + esc(c.label || '') + '" placeholder="Column" oninput="_msColSet(' + pid + ',' + i + ',' + ci + ',\'label\',this.value)" style="flex:1;padding:2px 6px;border:1px solid #d5cec0;border-radius:3px;font-size:11px"/>' +
+        '<select onchange="_msColSet(' + pid + ',' + i + ',' + ci + ',\'type\',this.value)" style="padding:2px 6px;border:1px solid #d5cec0;border-radius:3px;font-size:11px">' +
+          '<option value="text"' +   (c.type === 'text' ? ' selected' : '')   + '>text</option>' +
+          '<option value="number"' + (c.type === 'number' ? ' selected' : '') + '>number</option>' +
+        '</select>' +
+        '<button class="btn" style="color:#c0392b" onclick="_msRemoveCol(' + pid + ',' + i + ',' + ci + ')">&times;</button>' +
+      '</div>';
+    });
+    h += '<button class="btn" onclick="_msAddCol(' + pid + ',' + i + ')" style="font-size:11px;padding:2px 8px;margin-top:3px">+ Column</button>' +
+    '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+
+function _msSlug(label, existingIds) {
+  var base = String(label || 'field').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'field';
+  var id = base, n = 1;
+  while (existingIds.indexOf(id) !== -1) { n++; id = base + '_' + n; }
+  return id;
+}
+
+function _msAddField(pid, type) {
+  var es = _editState[pid]; if (!es) return;
+  if (!es.metadata_schema) es.metadata_schema = {fields: []};
+  var existingIds = es.metadata_schema.fields.map(function(f) { return f.id; });
+  var f = {id: _msSlug('field', existingIds), label: '', type: type};
+  if (type === 'table') f.columns = [{id: 'col1', label: '', type: 'text'}];
+  es.metadata_schema.fields.push(f);
+  _msRefresh(pid);
+}
+
+function _msRemoveField(pid, i) {
+  var es = _editState[pid]; if (!es || !es.metadata_schema) return;
+  es.metadata_schema.fields.splice(i, 1);
+  _msRefresh(pid);
+}
+
+function _msMoveField(pid, i, dir) {
+  var es = _editState[pid]; if (!es || !es.metadata_schema) return;
+  var arr = es.metadata_schema.fields;
+  var j = i + dir;
+  if (j < 0 || j >= arr.length) return;
+  var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+  _msRefresh(pid);
+}
+
+function _msFieldSet(pid, i, key, value, coerceType) {
+  var es = _editState[pid]; if (!es || !es.metadata_schema) return;
+  var f = es.metadata_schema.fields[i]; if (!f) return;
+  if (key === 'label') {
+    f.label = value;
+    // Re-slug id from label if id looks auto-generated (matches label pattern).
+    var existingIds = es.metadata_schema.fields.filter(function(_, k) { return k !== i; }).map(function(g) { return g.id; });
+    f.id = _msSlug(value, existingIds);
+  } else if (key === 'default') {
+    if (coerceType === 'number' && value !== '') {
+      var n = parseFloat(value); f.default = isNaN(n) ? value : n;
+    } else f.default = value;
+  } else {
+    f[key] = value;
+  }
+}
+
+function _msAddCol(pid, fi) {
+  var es = _editState[pid]; if (!es || !es.metadata_schema) return;
+  var f = es.metadata_schema.fields[fi]; if (!f || f.type !== 'table') return;
+  if (!f.columns) f.columns = [];
+  var existingIds = f.columns.map(function(c) { return c.id; });
+  f.columns.push({id: _msSlug('col', existingIds), label: '', type: 'text'});
+  _msRefresh(pid);
+}
+
+function _msRemoveCol(pid, fi, ci) {
+  var es = _editState[pid]; if (!es || !es.metadata_schema) return;
+  var f = es.metadata_schema.fields[fi]; if (!f || !f.columns) return;
+  f.columns.splice(ci, 1);
+  _msRefresh(pid);
+}
+
+function _msColSet(pid, fi, ci, key, value) {
+  var es = _editState[pid]; if (!es || !es.metadata_schema) return;
+  var f = es.metadata_schema.fields[fi]; if (!f || !f.columns) return;
+  var c = f.columns[ci]; if (!c) return;
+  if (key === 'label') {
+    c.label = value;
+    var existingIds = f.columns.filter(function(_, k) { return k !== ci; }).map(function(x) { return x.id; });
+    c.id = _msSlug(value, existingIds);
+  } else {
+    c[key] = value;
+  }
 }
 
 function _buildEditStepsHTML(pid) {
@@ -1160,9 +1342,15 @@ async function protoSaveEdit(pid) {
   var rj=_serializeRecipeState(_recipeState[pid]);
   var acSel=document.getElementById('pe-ac-'+pid);
   var ac=acSel?acSel.value:'manual';
-  await api('PUT','/api/protocols/'+pid,{title:title,steps:sj,recipe:rj,auto_complete:ac});
+  // Serialize metadata schema. Send null when empty (no fields) so
+  // the run panel treats the protocol as "no schema" cleanly.
+  var msObj = es.metadata_schema && es.metadata_schema.fields && es.metadata_schema.fields.length
+              ? es.metadata_schema
+              : null;
+  var msj = msObj ? JSON.stringify(msObj) : null;
+  await api('PUT','/api/protocols/'+pid,{title:title,steps:sj,recipe:rj,auto_complete:ac,metadata_schema:msj});
   var p=(S.protocols||[]).find(function(x){return x.id===pid;});
-  if(p){p.title=title;p.steps=sj;p.recipe=rj;p.auto_complete=ac;}
+  if(p){p.title=title;p.steps=sj;p.recipe=rj;p.auto_complete=ac;p.metadata_schema=msj;}
   delete _editState[pid];
   if(p){var panel=document.getElementById('pp-'+pid);if(panel){panel.innerHTML=_panelBody(p);protoLoadRunHistory(pid);}}
   _reloadProtocol(pid); _refreshPanelTab(pid); toast('Protocol updated');
@@ -1175,3 +1363,13 @@ async function protoCancelEdit(pid) {
 }
 
 registerView('protocols', renderProtocols);
+
+// Exposed alias used by the scratch metadata side-panel's empty-state link
+// so users can jump straight to editing a protocol's schema when their
+// current run has no fields defined.
+window._openProtocolEdit = function(pid) {
+  // Best-effort — the panel needs to be expanded for protoEdit to have a
+  // container. Try to expand first, then edit.
+  if (typeof protoTogglePanel === 'function') protoTogglePanel(pid);
+  setTimeout(function() { if (typeof protoEdit === 'function') protoEdit(pid); }, 120);
+};

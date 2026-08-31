@@ -16,7 +16,7 @@ OUT_HTML = STATIC / "index.html"
 FEATURE_ORDER = [
     "notebook", "wf_editor", "workflow",  "protocols", "summaries","pipeline" ,"addform",
      "scratch", "reminders", "hours", "gel_annotation", "timeline",
-    "predictions","plan_converter","circuits","cloning","sanger", "papers", "dilution","import_data","backup","tm_calc",  "import", "enrichment",
+    "plan_converter","circuits","cloning","sanger", "papers", "dilution","import_data","backup","tm_calc",  "import", "enrichment",
     "settings",
     "projects",
 ]

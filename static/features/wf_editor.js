@@ -171,12 +171,16 @@ async function _wfOpenGelPicker(editor) {
     }
     var html = '';
     gels.forEach(function(g) {
-      var thumb = '/api/gel_images/' + encodeURIComponent(g.image_file);
-      html += '<div class="wf-gel-pick" onclick="_wfPickGel(' + g.id + ',\'' + (g.image_file || '').replace(/[\\\'"]/g, '') + '\',\'' + (g.title || '').replace(/[\\\'"]/g, '') + '\')">';
+      // Prefer the annotated snapshot for the thumb — user sees exactly
+      // what the workflow link will open. Fall back to raw upload if no
+      // snapshot has been saved yet.
+      var thumbFile = g.annotated_file || g.image_file;
+      var thumb = '/api/gel_images/' + encodeURIComponent(thumbFile);
+      html += '<div class="wf-gel-pick" onclick="_wfPickGel(' + g.id + ',\'' + (g.image_file || '').replace(/[\\\'"]/g, '') + '\',\'' + (g.title || '').replace(/[\\\'"]/g, '') + '\',\'' + (g.annotated_file || '').replace(/[\\\'"]/g, '') + '\')">';
       html += '<img class="wf-gel-pick-thumb" src="' + thumb + '" alt="">';
       html += '<div style="flex:1;min-width:0">';
       html += '<div style="font-weight:500">' + _wfEsc(g.title || ('Gel ' + g.id)) + '</div>';
-      html += '<div style="font-size:.72rem;color:#8a7f72">' + (g.lane_count || 0) + ' lanes</div>';
+      html += '<div style="font-size:.72rem;color:#8a7f72">' + (g.lane_count || 0) + ' lanes' + (g.annotated_file ? ' \u00b7 annotated saved' : '') + '</div>';
       html += '</div></div>';
     });
     body.innerHTML = html;
@@ -190,17 +194,57 @@ function _wfCloseGelPicker() {
   if (m) m.remove();
   _wfGelPickerOpenFor = null;
 }
-function _wfPickGel(gelId, imageFile, title) {
+function _wfPickGel(gelId, imageFile, title, annotatedFile) {
   if (!_wfGelPickerOpenFor) { _wfCloseGelPicker(); return; }
   /* Restore the editor's caret BEFORE insertion — opening the modal moved focus. */
   _wfGelPickerOpenFor.focus();
   var safeTitle = _wfEsc(title || ('Gel ' + gelId));
-  var thumb = '/api/gel_images/' + encodeURIComponent(imageFile);
-  var html = '<a class="wf-gel-link" data-gel-id="' + gelId + '" href="#gel-' + gelId + '" title="Open in Gel view">' +
+  // Thumb shows the annotated version if saved, else raw. Same for the
+  // full-size click target (data-full).
+  var displayFile = annotatedFile || imageFile;
+  var thumb = '/api/gel_images/' + encodeURIComponent(displayFile);
+  // The <a> stops the browser navigating; onclick opens a lightbox at
+  // the same URL. data-full carries the target so _wfGelLightbox picks
+  // it up cleanly without re-parsing href.
+  var html = '<a class="wf-gel-link" data-gel-id="' + gelId +
+             '" data-full="' + thumb +
+             '" href="' + thumb +
+             '" onclick="_wfGelLightbox(event, \'' + displayFile + '\', \'' + safeTitle + '\')" ' +
+             'title="Click to view full annotated image">' +
              '<img class="wf-gel-thumb" src="' + thumb + '" alt="">' +
              '<span>' + safeTitle + '</span></a>&nbsp;';
   _wfInsertHtmlAtCaret(html);
   _wfCloseGelPicker();
+}
+
+// Lightbox for inline gel thumbnails. Full-page overlay with the image
+// centered; click anywhere or press Escape to close. Called by the
+// onclick on wf-gel-link anchors. Prevents default navigation so the
+// link doesn't leave the workflow page.
+function _wfGelLightbox(ev, filename, title) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  var existing = document.getElementById('wf-gel-lightbox');
+  if (existing) existing.remove();
+  var overlay = document.createElement('div');
+  overlay.id = 'wf-gel-lightbox';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.85);z-index:10000;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;cursor:zoom-out';
+  var titleEl = document.createElement('div');
+  titleEl.style.cssText = 'color:#fff;font-family:sans-serif;font-size:14px;margin-bottom:12px;text-align:center';
+  titleEl.textContent = title || 'Gel';
+  var img = document.createElement('img');
+  img.src = '/api/gel_images/' + encodeURIComponent(filename);
+  img.style.cssText = 'max-width:calc(100vw - 48px);max-height:calc(100vh - 100px);object-fit:contain;box-shadow:0 4px 32px rgba(0,0,0,.5);background:#fff';
+  overlay.appendChild(titleEl);
+  overlay.appendChild(img);
+  var close = function() {
+    overlay.remove();
+    document.removeEventListener('keydown', escHandler);
+  };
+  var escHandler = function(e) { if (e.key === 'Escape') close(); };
+  overlay.addEventListener('click', close);
+  document.addEventListener('keydown', escHandler);
+  document.body.appendChild(overlay);
 }
 
 function _wfEsc(s) {

@@ -45,7 +45,6 @@ async function renderNotebook(el){
       todayEntries.length+' entries today &middot; '+
       reminders.length+' reminder'+(reminders.length!==1?'s':'')+' &middot; '+
       (todayData.scratch_pending||0)+' scratch pending'+
-      (todayData.predictions_pending?' &middot; <span style="color:var(--accent)">'+todayData.predictions_pending+' predictions</span>':'')+
     '</div>';
 
     html+='<div class="dash-grid">';

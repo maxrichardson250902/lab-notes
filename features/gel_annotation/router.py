@@ -88,7 +88,19 @@ def _seed_ladders(conn):
         )
 
 
+def _migrate_gels(conn):
+    """Add columns that predate ensure_column-style helpers. The
+    annotated_file column stores the filename of a client-rendered
+    snapshot of the gel (image + lane labels + ladder marks baked
+    together). When null, no snapshot has been saved yet — use raw
+    image_file as fallback."""
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(gels)").fetchall()]
+    if "annotated_file" not in cols:
+        conn.execute("ALTER TABLE gels ADD COLUMN annotated_file TEXT DEFAULT NULL")
+
+
 register_seed(_seed_ladders)
+register_seed(_migrate_gels)
 
 
 router = APIRouter(prefix="/api", tags=["gel_annotation"])
@@ -176,6 +188,47 @@ def update_gel(gel_id: int, body: dict):
             conn.commit()
         row = dict(conn.execute("SELECT * FROM gels WHERE id=?", (gel_id,)).fetchone())
     return row
+
+
+@router.post("/gels/{gel_id}/save-annotated")
+async def save_annotated_snapshot(gel_id: int, image: UploadFile = File(...)):
+    """Save a client-rendered snapshot of a gel (image + lane labels +
+    ladder marks flattened together into one PNG). Called from the gel
+    view when the user clicks 'Save annotated image'. Replaces any prior
+    snapshot for this gel; old file is deleted from disk.
+
+    The PNG must be produced client-side because the annotation math
+    (label stagger, drag handles, per-user 'show guides' preference,
+    etc.) all lives in cloning.js — recreating it in Pillow would be a
+    lot of code duplication."""
+    with get_db() as conn:
+        existing = conn.execute("SELECT annotated_file FROM gels WHERE id=?", (gel_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "Gel not found")
+        old = existing["annotated_file"]
+
+    # New filename — timestamp keeps cache from serving stale content
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    filename = f"gel_{gel_id}_annotated_{stamp}.png"
+    dest = os.path.join(UPLOAD_DIR, filename)
+    with open(dest, "wb") as f:
+        f.write(await image.read())
+
+    # Update row + remove old snapshot (best-effort, silent on failure)
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE gels SET annotated_file=?, updated=? WHERE id=?",
+            (filename, now, gel_id),
+        )
+        conn.commit()
+    if old and old != filename:
+        try:
+            os.remove(os.path.join(UPLOAD_DIR, old))
+        except (FileNotFoundError, PermissionError):
+            pass
+
+    return {"annotated_file": filename}
 
 
 @router.post("/gels/{gel_id}/lanes")

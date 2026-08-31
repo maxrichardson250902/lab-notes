@@ -17,6 +17,7 @@ lookup call. If you need custom categories later, expose an /api/hours/
 categories POST and reflect it in the frontend colour map.
 """
 import os
+import re
 import uuid
 import json
 import mimetypes
@@ -49,7 +50,6 @@ CATEGORIES = [
     {"key": "research",    "label": "Research (lab)",      "color": "#5b7a5e"},
     {"key": "learning",    "label": "Learning / reading",  "color": "#4a6fa5"},
     {"key": "writing",     "label": "Writing",             "color": "#8a6fb8"},
-    {"key": "experiments", "label": "Experiments",         "color": "#c98a4a"},
     {"key": "meetings",    "label": "Meetings",            "color": "#7a7268"},
     {"key": "admin",       "label": "Admin",               "color": "#b8a047"},
     {"key": "other",       "label": "Other",               "color": "#9a8a7c"},
@@ -103,6 +103,23 @@ def _ensure_hours_migrations():
                 "ALTER TABLE hours_entries ADD COLUMN secondary_json TEXT NOT NULL DEFAULT '[]'"
             )
             conn.commit()
+        # Project field — free-text tag, empty string = untagged. Used by
+        # the frontend to answer 'hours per project per week' (replaces
+        # what Timeline was giving us for entry counts).
+        if "project" not in cols:
+            conn.execute(
+                "ALTER TABLE hours_entries ADD COLUMN project TEXT NOT NULL DEFAULT ''"
+            )
+            conn.commit()
+        # One-time consolidation: the 'experiments' category was collapsed
+        # into 'research' after user feedback ('these should be combined
+        # anyway as default'). Migrate existing rows so their category
+        # matches the new dropdown; safe to run repeatedly (no-op after
+        # first pass).
+        conn.execute(
+            "UPDATE hours_entries SET category='research' WHERE category='experiments'"
+        )
+        conn.commit()
 
 
 # ── models ──────────────────────────────────────────────────────────────────
@@ -125,6 +142,7 @@ class EntryIn(BaseModel):
     notes: Optional[str] = None
     workflow_day_date: Optional[str] = None
     secondary: Optional[List[SecondaryActivity]] = None
+    project: Optional[str] = None
 
 
 class EntryPatch(BaseModel):
@@ -134,6 +152,7 @@ class EntryPatch(BaseModel):
     notes: Optional[str] = None
     workflow_day_date: Optional[str] = None
     secondary: Optional[List[SecondaryActivity]] = None
+    project: Optional[str] = None
 
 
 class HolidayIn(BaseModel):
@@ -253,13 +272,14 @@ def create_entry(entry: EntryIn):
     if entry.workflow_day_date:
         _validate_date(entry.workflow_day_date)
     secondary_json = _validate_secondary(entry.secondary)
+    project = (entry.project or "").strip()
     now = datetime.utcnow().isoformat()
     with get_db() as conn:
         cur = conn.execute(
             "INSERT INTO hours_entries (date_iso, start_hour, end_hour, category, notes, "
-            "workflow_day_date, secondary_json, created) VALUES (?,?,?,?,?,?,?,?)",
+            "workflow_day_date, secondary_json, project, created) VALUES (?,?,?,?,?,?,?,?,?)",
             (entry.date_iso, entry.start_hour, entry.end_hour, entry.category,
-             entry.notes, entry.workflow_day_date, secondary_json, now)
+             entry.notes, entry.workflow_day_date, secondary_json, project, now)
         )
         conn.commit()
         row = conn.execute("SELECT * FROM hours_entries WHERE id=?", (cur.lastrowid,)).fetchone()
@@ -411,13 +431,18 @@ def workflow_day_suggestions(date: str):
     """Given a date, tell the client whether a workflow day exists for it.
     Frontend uses this to auto-fill the workflow_day_date field. Also
     returns nearby dates (±3 days) that have workflow days, in case the
-    user was writing up work from an adjacent day."""
+    user was writing up work from an adjacent day.
+    Also returns the exact day's dominant project (majority of blocks'
+    data-groups attribute) so the hours modal can pre-fill the project
+    field when copying from that workflow day."""
     _validate_date(date)
     with get_db() as conn:
-        # Exact match
+        # Exact match — content is used for project inference too, not
+        # just the size.
         exact = conn.execute(
-            "SELECT date, LENGTH(content) AS size FROM day_documents WHERE date=?", (date,)
+            "SELECT date, content, LENGTH(content) AS size FROM day_documents WHERE date=?", (date,)
         ).fetchone()
+        exact_project = _dominant_project(exact["content"]) if exact else ""
         # Nearby (±3 days), excluding exact
         from datetime import date as _d, timedelta as _td
         anchor = _d.fromisoformat(date)
@@ -429,9 +454,37 @@ def workflow_day_suggestions(date: str):
             (window_start, window_end, date)
         ).fetchall()
     return {
-        "exact": dict(exact) if exact else None,
+        "exact": {"date": exact["date"], "size": exact["size"], "project": exact_project} if exact else None,
         "nearby": [dict(r) for r in nearby]
     }
+
+
+# Extract the majority-project from a workflow day's HTML content by
+# tallying data-groups attributes across blocks. Returns the most common
+# project name, or empty string if none tagged. Used by the hours modal to
+# pre-fill project when copying from a workflow day.
+_DATA_GROUPS_RE = re.compile(r'data-groups="([^"]+)"')
+
+def _dominant_project(html: Optional[str]) -> str:
+    if not html:
+        return ""
+    counts: dict = {}
+    for match in _DATA_GROUPS_RE.finditer(html):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+        # Blocks can carry multiple groups comma-separated; each contributes
+        # one vote.
+        for grp in raw.split(","):
+            g = grp.strip()
+            if g:
+                counts[g] = counts.get(g, 0) + 1
+    if not counts:
+        return ""
+    # Deterministic tie-break: alphabetic order among most-common
+    top_count = max(counts.values())
+    winners = sorted(g for g, c in counts.items() if c == top_count)
+    return winners[0]
 
 
 # ── holidays ────────────────────────────────────────────────────────────────

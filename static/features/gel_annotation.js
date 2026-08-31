@@ -19,6 +19,10 @@ var G = {
   dirty: false,
   showUpload: false,
   pastedFile: null,
+  // Toggled by the Guides checkbox in the toolbar. When false the
+  // dashed lane lines / drag handles / dashed ladder rules are
+  // suppressed, leaving just labels + short solid ladder ticks.
+  showGuides: true,
   _dropdowns: {},
   /* Ladder catalogue — loaded from /api/ladders on render. Each entry:
      { id, slug, name, kind, sizes:[int], image_file, is_preset } */
@@ -191,6 +195,54 @@ function gelExport() {
   link.click();
 }
 
+// Toggle guide chrome (dashed lane lines, drag handles, dashed ladder
+// rules). Labels + solid ladder marks always draw. Selected items still
+// get their highlight so editing works even in "clean" mode.
+function gelToggleGuides(on) {
+  G.showGuides = !!on;
+  gelDrawOverlay();
+}
+
+// Save the current annotated view as a snapshot on the server. Wired to
+// the "Save annotated" toolbar button. Uses the same flatten-canvas
+// trick as gelExport but uploads instead of downloading. The workflow
+// gel link picker reads the resulting annotated_file so links can open
+// the labelled version rather than the raw thumbnail.
+async function gelSaveAnnotated() {
+  var img = document.getElementById('gelImg');
+  var canvas = document.getElementById('gelCanvas');
+  if (!img || !canvas || !G.gel) { toast('Nothing to save', true); return; }
+  var exp = document.createElement('canvas');
+  exp.width = img.naturalWidth;
+  exp.height = img.naturalHeight;
+  var ctx = exp.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  var scaleX = img.naturalWidth / canvas.width;
+  var scaleY = img.naturalHeight / canvas.height;
+  ctx.save();
+  ctx.scale(scaleX, scaleY);
+  gelDrawOnCtx(ctx, canvas.width, canvas.height);
+  ctx.restore();
+  exp.toBlob(async function(blob) {
+    if (!blob) { toast('Could not render image', true); return; }
+    var fd = new FormData();
+    fd.append('image', blob, 'gel_' + G.gel.id + '_annotated.png');
+    try {
+      var resp = await fetch('/api/gels/' + G.gel.id + '/save-annotated', {
+        method: 'POST',
+        body: fd
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      var data = await resp.json();
+      // Update local state so the picker in workflow reflects the new file
+      G.gel.annotated_file = data.annotated_file;
+      toast('Annotated snapshot saved');
+    } catch (e) {
+      toast('Save failed: ' + (e.message || e), true);
+    }
+  }, 'image/png');
+}
+
 /* ── canvas drawing ── */
 function gelDrawOverlay() {
   var canvas = document.getElementById('gelCanvas');
@@ -243,14 +295,20 @@ function gelDrawOnCtx(ctx, w, h) {
   G.lanes.forEach(function(lane, i) {
     var x = lane.x_position * w;
     ctx.save();
-    ctx.setLineDash(i === G.selIdx ? [6, 3] : [4, 4]);
-    ctx.strokeStyle = lane.is_ladder ? '#e8a735' : (i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.6)');
-    ctx.lineWidth = i === G.selIdx ? 2.5 : 1.5;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    // Lane line + drag handle are "guide" chrome — hide when the user
+    // turns off guides so the exported image has only labels + solid
+    // ladder marks. Selected lane always shows its guide though so you
+    // can still see what's active while editing.
+    if (G.showGuides !== false || i === G.selIdx) {
+      ctx.setLineDash(i === G.selIdx ? [6, 3] : [4, 4]);
+      ctx.strokeStyle = lane.is_ladder ? '#e8a735' : (i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.6)');
+      ctx.lineWidth = i === G.selIdx ? 2.5 : 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     /* lane label — y is offset by the assigned row so overlapping labels
        stack downward instead of clipping into each other */
     ctx.font = baseFont + 'px "SF Mono", Monaco, Consolas, monospace';
@@ -258,14 +316,17 @@ function gelDrawOnCtx(ctx, w, h) {
     ctx.textAlign = 'center';
     var labelY = baseFont + 4 + labelRow[i] * (baseFont + 2);
     ctx.fillText(labelText[i], x, labelY);
-    /* drag handle */
-    ctx.fillStyle = i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.5)';
-    ctx.beginPath();
-    ctx.arc(x, h - handleR - 4, handleR, 0, Math.PI * 2);
-    ctx.fill();
+    /* drag handle — only when guides on */
+    if (G.showGuides !== false || i === G.selIdx) {
+      ctx.fillStyle = i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.5)';
+      ctx.beginPath();
+      ctx.arc(x, h - handleR - 4, handleR, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.restore();
   });
-  /* draw ladder marks */
+  /* draw ladder marks — when guides off, draw solid horizontal rules
+     with size labels (no dashes). Selected mark still gets highlighted. */
   if (G.annotations.ladderMarks) {
     var ladder = gelActiveLadder();
     var unit = gelSizeUnit(ladder);
@@ -273,14 +334,27 @@ function gelDrawOnCtx(ctx, w, h) {
       var y = m.y * h;
       var isSelected = G.markReplaceIdx === i;
       ctx.save();
-      ctx.strokeStyle = isSelected ? '#5b7a5e' : 'rgba(232,167,53,0.7)';
-      ctx.lineWidth = isSelected ? 2 : 1;
-      ctx.setLineDash(isSelected ? [] : [3, 3]);
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(w, y);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      if (G.showGuides !== false || isSelected) {
+        ctx.strokeStyle = isSelected ? '#5b7a5e' : 'rgba(232,167,53,0.7)';
+        ctx.lineWidth = isSelected ? 2 : 1;
+        // Guides-off: draw solid short tick from left edge instead of a
+        // full dashed rule across the gel — cleaner and points at the
+        // labelled size without cluttering the band area.
+        if (G.showGuides === false) {
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(Math.min(24, w * 0.05), y);
+        } else {
+          ctx.setLineDash(isSelected ? [] : [3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(w, y);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      // Size label always drawn — that's the point of the mark.
       ctx.font = smallFont + 'px "SF Mono", Monaco, Consolas, monospace';
       ctx.fillStyle = isSelected ? '#5b7a5e' : '#e8a735';
       ctx.textAlign = 'left';
@@ -1170,7 +1244,17 @@ function gelRenderFull() {
     html += '<button class="gel-btn-sm" onclick="gelZoom(0.25)" title="Zoom in">+</button>';
     html += '<button class="gel-btn-sm" onclick="gelZoom(-0.25)" title="Zoom out">−</button>';
     html += '<span style="font-size:.75rem;color:#8a7f72;min-width:40px;text-align:center">' + Math.round(G.zoom * 100) + '%</span>';
+    // Show-guides toggle — hides dashed lane lines and dashed ladder rules
+    // for a clean look (labels + solid ladder marks only). Default ON.
+    // State lives on G so it persists across redraws within the session.
+    html += '<label class="gel-btn-sm" style="display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none">' +
+      '<input type="checkbox" ' + (G.showGuides !== false ? 'checked' : '') + ' onchange="gelToggleGuides(this.checked)" style="margin:0"/>' +
+      'Guides</label>';
     html += '<button class="gel-btn" onclick="gelSave()">Save</button>';
+    // Save annotated snapshot: flattens the current canvas view (image
+    // + overlays) into a PNG and uploads it. Referenced by workflow
+    // gel links so 'open the annotated version' becomes 'serve this file'.
+    html += '<button class="gel-btn-sm" onclick="gelSaveAnnotated()" title="Save a snapshot with labels + markers baked in (used by workflow links)">Save annotated</button>';
     html += '<button class="gel-btn-sm" onclick="gelExport()" title="Export PNG">Export</button>';
     if (G.lanes.length) html += '<button class="gel-btn-sm gel-btn-danger" onclick="gelClearAllLanes()" title="Remove all lanes">Clear lanes</button>';
     html += '<button class="gel-btn-sm gel-btn-danger" onclick="gelDelete(' + G.gel.id + ')" title="Delete gel">&times;</button>';

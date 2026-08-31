@@ -24,6 +24,10 @@ var _hoursSelectedDate = null;  // 'YYYY-MM-DD' when day view active, else null
 var _hoursEntries = [];         // raw entry rows for the visible date range
 var _hoursCategories = [];      // fetched from /api/hours/categories
 var _hoursHolidays = [];        // fetched from /api/hours/holidays for the visible range
+// Known project names (union across workflow docs, entries, reminders).
+// Loaded lazily on first modal open; refreshed if the user creates a new
+// project through the modal's datalist. Cheap to keep in memory.
+var _hoursKnownProjects = [];
 var _hoursEditingId = null;     // id of entry being edited, null while creating
 var _hoursPendingNew = null;    // {date, startHour, endHour} for a click-to-create
 // Live-edited secondary array while the modal is open. Reset whenever the
@@ -219,10 +223,15 @@ async function _hoursLoad() {
 }
 
 // Compute total hours + per-category breakdown for a set of entries.
-// Primary contribution = end_hour - start_hour hours to entry.category.
-// Secondary contribution = each secondary's minutes/60 hours to its own
-// category. Secondaries add to the tally on top of primary — per user's
-// spec 'secondary has its own time added when its added'.
+//
+// Semantic model: primary time is the "clock", secondaries are things done
+// IN PARALLEL during the primary activity. Example: a 30-min transformation
+// wait during which you read for 30 min = 30 min total worked (not 60).
+//
+// - `total` counts primary hours ONLY. Represents actual time-at-work.
+// - `byCategory` includes both primary AND secondary contributions. This
+//   means the breakdown may sum to more than `total` — that's deliberate
+//   and honest: it reflects parallel activity. UI shows both truthfully.
 function _hoursComputeTally(entries) {
   var total = 0;
   var byCategory = {};
@@ -232,7 +241,8 @@ function _hoursComputeTally(entries) {
     byCategory[e.category] = (byCategory[e.category] || 0) + primaryHours;
     (e.secondary || []).forEach(function(s) {
       var h = (s.minutes || 0) / 60;
-      total += h;
+      // Deliberately NOT adding to total — secondaries are concurrent
+      // with the primary activity, not additive slots.
       byCategory[s.category] = (byCategory[s.category] || 0) + h;
     });
   });
@@ -322,6 +332,9 @@ function _hoursRenderWeekGrid() {
 function _hoursRenderDayCell(day, iso, isToday) {
   var dayEntries = _hoursEntries.filter(function(e) { return e.date_iso === iso; });
   var holiday = _hoursHolidayFor(iso);
+  // Stripe reflects PRIMARY time only. Secondaries are concurrent activity
+  // (done during the primary block) so they don't extend the day or claim
+  // stripe width — they're tracked in the tally text under each week.
   var totalHours = 0;
   var catHours = {};
   var attCount = 0;
@@ -329,13 +342,6 @@ function _hoursRenderDayCell(day, iso, isToday) {
     var h = e.end_hour - e.start_hour;
     totalHours += h;
     catHours[e.category] = (catHours[e.category] || 0) + h;
-    // Secondaries feed into the day's cat-mix stripe too so the visual
-    // heatmap reflects the full activity, not just primary time.
-    (e.secondary || []).forEach(function(s) {
-      var sh = (s.minutes || 0) / 60;
-      totalHours += sh;
-      catHours[s.category] = (catHours[s.category] || 0) + sh;
-    });
     attCount += (e.attachments || []).length;
   });
   var dayName = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][day.getDay()];
@@ -638,6 +644,13 @@ async function _hoursRenderModal(entry) {
     '</div>' +
     '<label>Category</label>' +
     '<select id="hrs-mod-cat">' + catOpts + '</select>' +
+    // Project — free-text with autocomplete against known workflow projects.
+    // Datalist ID references #hrs-mod-project-options populated at init time.
+    // Empty allowed; some categories (research/writing/learning) benefit from
+    // one but nothing's rejected.
+    '<label>Project <span style="color:#8a7f72;font-size:11px;font-weight:normal">(optional)</span></label>' +
+    '<input list="hrs-mod-project-options" id="hrs-mod-project" placeholder="e.g. Iron Binding, Pol I, ..."/>' +
+    '<datalist id="hrs-mod-project-options"></datalist>' +
     // Secondary activities — per user spec, each has its own duration and
     // contributes independently to category totals. Rendered as a list of
     // rows below primary. The list itself lives in _hoursModalSecondary
@@ -679,6 +692,14 @@ async function _hoursRenderModal(entry) {
   document.getElementById('hrs-mod-end').value = data.end_hour;
   document.getElementById('hrs-mod-cat').value = (entry && entry.category) || 'research';
   document.getElementById('hrs-mod-notes').value = (entry && entry.notes) || '';
+  // For an existing entry, use its stored project. For a new entry, use
+  // the auto-detected dominant project from the linked workflow day, if any.
+  var initialProject = (entry && entry.project) ||
+                       (isNew && wfSuggest && wfSuggest.exact && wfSuggest.exact.project) || '';
+  document.getElementById('hrs-mod-project').value = initialProject;
+  // Populate the datalist with known projects. Loaded lazily on first
+  // modal open — cheap enough to just do here rather than at boot.
+  _hoursPopulateProjectList();
   // Snapshot the entry's secondary list into module state so users can
   // add/remove rows without triggering a full modal re-render.
   _hoursModalSecondary = (entry && Array.isArray(entry.secondary))
@@ -735,6 +756,27 @@ function _hoursSecChange(i, field, value) {
   }
 }
 
+// Fetch known projects from workflow endpoint and render them into the
+// modal's <datalist>. Uses cached list unless empty. Silent on failure —
+// the input still works as a free-text field.
+async function _hoursPopulateProjectList() {
+  var dl = document.getElementById('hrs-mod-project-options');
+  if (!dl) return;
+  if (!_hoursKnownProjects.length) {
+    try {
+      var resp = await api('GET', '/api/workflow/projects');
+      _hoursKnownProjects = (resp.projects || []).map(function(p) {
+        return typeof p === 'string' ? p : p.name;
+      }).filter(Boolean);
+    } catch (e) {
+      _hoursKnownProjects = [];
+    }
+  }
+  dl.innerHTML = _hoursKnownProjects.map(function(p) {
+    return '<option value="' + esc(p) + '"></option>';
+  }).join('');
+}
+
 // Reflect wf-link state on the copy button. Called after modal render and
 // whenever _hoursSetWfDate changes the link.
 function _hoursUpdateCopyBtnState() {
@@ -780,7 +822,7 @@ function _hoursCloseModal() {
   _hoursPendingNew = null;
 }
 
-function _hoursSetWfDate(d) {
+async function _hoursSetWfDate(d) {
   document.getElementById('hrs-mod-wfdate').value = d;
   // Update the suggest banner text so user sees the change
   var banner = document.querySelector('.hrs-wf-suggest');
@@ -793,6 +835,21 @@ function _hoursSetWfDate(d) {
     }
   }
   _hoursUpdateCopyBtnState();
+  // Best-effort project auto-fill: if the user just linked a workflow day
+  // and the project input is empty, pull the day's dominant project (via
+  // /workflow-day-suggestions) and pre-populate. Never overwrites what
+  // the user already typed. Silent on failure.
+  if (d) {
+    var projInput = document.getElementById('hrs-mod-project');
+    if (projInput && !(projInput.value || '').trim()) {
+      try {
+        var resp = await api('GET', '/api/hours/workflow-day-suggestions?date=' + d);
+        if (resp && resp.exact && resp.exact.project) {
+          projInput.value = resp.exact.project;
+        }
+      } catch (e) { /* silent */ }
+    }
+  }
 }
 
 async function _hoursSaveEntry() {
@@ -801,6 +858,7 @@ async function _hoursSaveEntry() {
   var category = document.getElementById('hrs-mod-cat').value;
   var notes = document.getElementById('hrs-mod-notes').value.trim() || null;
   var wfDate = document.getElementById('hrs-mod-wfdate').value.trim() || null;
+  var project = (document.getElementById('hrs-mod-project').value || '').trim();
 
   if (end <= start) {
     toast('End time must be after start time', true);
@@ -812,13 +870,15 @@ async function _hoursSaveEntry() {
       await api('PATCH', '/api/hours/entries/' + _hoursEditingId, {
         start_hour: start, end_hour: end, category: category,
         notes: notes, workflow_day_date: wfDate || '',
-        secondary: _hoursModalSecondary
+        secondary: _hoursModalSecondary,
+        project: project
       });
     } else {
       await api('POST', '/api/hours/entries', {
         date_iso: _hoursPendingNew.date_iso, start_hour: start, end_hour: end,
         category: category, notes: notes, workflow_day_date: wfDate,
-        secondary: _hoursModalSecondary
+        secondary: _hoursModalSecondary,
+        project: project
       });
     }
     _hoursCloseModal();
