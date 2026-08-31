@@ -268,7 +268,9 @@ keep the format: one line per feature, short scope description.*
   handles; well labels stagger vertically when overlap detected via
   greedy interval scheduling; Guides toggle hides dashed lines;
   annotated snapshot save (`annotated_file` column, client-rendered
-  PNG upload) used by workflow gel links
+  PNG upload) used by workflow gel links; well label orientation
+  toggle (horizontal / diagonal 45° / vertical 90°) persisted in
+  annotations JSON as `labelOrientation`
 - **DNA Manager** — plasmids/primers/gblocks/kit_parts/parts CRUD;
   Show archived items setting toggles `X-Show-Archived` header;
   backend filters via WHERE clause; archive/unarchive per-row folder

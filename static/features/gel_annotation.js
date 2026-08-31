@@ -23,6 +23,13 @@ var G = {
   // dashed lane lines / drag handles / dashed ladder rules are
   // suppressed, leaving just labels + short solid ladder ticks.
   showGuides: true,
+  // How well labels tilt. 'horizontal' = current (readable across),
+  // 'diagonal' = 45° tilt reading bottom-left to top-right (classic
+  // gel-photo style; fits narrow wells), 'vertical' = 90° reading
+  // bottom-to-top (fits very narrow wells; longest names still fit).
+  // Value lives on G so it persists in memory; also mirrored into
+  // G.annotations.labelOrientation for save/load round-trip.
+  labelOrientation: 'horizontal',
   _dropdowns: {},
   /* Ladder catalogue — loaded from /api/ladders on render. Each entry:
      { id, slug, name, kind, sizes:[int], image_file, is_preset } */
@@ -143,6 +150,13 @@ async function gelLoadGel(id) {
   var ann = d.annotations;
   if (typeof ann === 'string') { try { ann = JSON.parse(ann); } catch (e) { ann = {}; } }
   G.annotations = ann && ann.ladderMarks ? ann : { ladderMarks: [] };
+  // Restore label orientation from the annotations blob if the gel
+  // was previously saved with a non-default value; otherwise fall
+  // back to horizontal.
+  G.labelOrientation = (G.annotations.labelOrientation === 'diagonal' ||
+                        G.annotations.labelOrientation === 'vertical')
+                       ? G.annotations.labelOrientation
+                       : 'horizontal';
   G.dirty = false;
 }
 
@@ -200,6 +214,19 @@ function gelExport() {
 // get their highlight so editing works even in "clean" mode.
 function gelToggleGuides(on) {
   G.showGuides = !!on;
+  gelDrawOverlay();
+}
+
+// Change well-label orientation (horizontal / diagonal / vertical).
+// Mirrors onto G.annotations so it round-trips through save/load. The
+// draw code reads G.labelOrientation directly (not annotations) so a
+// mid-session change re-renders immediately.
+function gelSetLabelOrientation(value) {
+  var v = (value === 'diagonal' || value === 'vertical') ? value : 'horizontal';
+  G.labelOrientation = v;
+  if (!G.annotations) G.annotations = {};
+  G.annotations.labelOrientation = v;
+  G.dirty = true;
   gelDrawOverlay();
 }
 
@@ -309,13 +336,43 @@ function gelDrawOnCtx(ctx, w, h) {
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    /* lane label — y is offset by the assigned row so overlapping labels
-       stack downward instead of clipping into each other */
+    /* lane label — orientation-aware.
+       - horizontal: current behaviour, stagger by row to avoid clipping
+       - diagonal:   rotated -45° at anchor near well top, no stagger
+                     needed (labels extend up-and-right so horizontal
+                     overlap is naturally minimised)
+       - vertical:   rotated -90°, reads bottom-to-top from just above
+                     the well
+       In all cases the label anchors at the LANE X so the reader can
+       trace a diagonal/vertical label straight down to its well. */
     ctx.font = baseFont + 'px "SF Mono", Monaco, Consolas, monospace';
     ctx.fillStyle = lane.is_ladder ? '#e8a735' : '#5b7a5e';
-    ctx.textAlign = 'center';
-    var labelY = baseFont + 4 + labelRow[i] * (baseFont + 2);
-    ctx.fillText(labelText[i], x, labelY);
+    var orient = G.labelOrientation || 'horizontal';
+    if (orient === 'diagonal') {
+      ctx.save();
+      // Anchor a few pixels above the well top edge; rotate -45° so the
+      // text goes up and to the right (reads bottom-left → top-right,
+      // the classic gel-photo convention).
+      ctx.translate(x, baseFont + 4);
+      ctx.rotate(-Math.PI / 4);
+      ctx.textAlign = 'left';
+      // Small +ve x offset so the leftmost character isn't touching
+      // the pivot point (which sits over the lane).
+      ctx.fillText(labelText[i], 4, 0);
+      ctx.restore();
+    } else if (orient === 'vertical') {
+      ctx.save();
+      ctx.translate(x, baseFont + 4);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'left';
+      ctx.fillText(labelText[i], 4, baseFont / 3);  // baseline nudge
+      ctx.restore();
+    } else {
+      // horizontal — the current staggered behaviour
+      ctx.textAlign = 'center';
+      var labelY = baseFont + 4 + labelRow[i] * (baseFont + 2);
+      ctx.fillText(labelText[i], x, labelY);
+    }
     /* drag handle — only when guides on */
     if (G.showGuides !== false || i === G.selIdx) {
       ctx.fillStyle = i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.5)';
@@ -1250,6 +1307,16 @@ function gelRenderFull() {
     html += '<label class="gel-btn-sm" style="display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none">' +
       '<input type="checkbox" ' + (G.showGuides !== false ? 'checked' : '') + ' onchange="gelToggleGuides(this.checked)" style="margin:0"/>' +
       'Guides</label>';
+    // Label orientation dropdown — how well labels tilt above the lanes.
+    // Diagonal fits classic gel-photo look; vertical helps when lanes
+    // are very narrow and names would still clip in diagonal.
+    html += '<label class="gel-btn-sm" style="display:flex;align-items:center;gap:4px;user-select:none">' +
+      'Labels:' +
+      '<select onchange="gelSetLabelOrientation(this.value)" style="padding:2px 4px;font-size:.75rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#4a4139">' +
+        '<option value="horizontal"' + (G.labelOrientation === 'horizontal' || !G.labelOrientation ? ' selected' : '') + '>horizontal</option>' +
+        '<option value="diagonal"'   + (G.labelOrientation === 'diagonal'   ? ' selected' : '') + '>diagonal 45°</option>' +
+        '<option value="vertical"'   + (G.labelOrientation === 'vertical'   ? ' selected' : '') + '>vertical 90°</option>' +
+      '</select></label>';
     html += '<button class="gel-btn" onclick="gelSave()">Save</button>';
     // Save annotated snapshot: flattens the current canvas view (image
     // + overlays) into a PNG and uploads it. Referenced by workflow

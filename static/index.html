@@ -6611,8 +6611,20 @@ async function _saveRunToDb(run) {
       // Metadata values (side-panel form). Send even when empty ({}) so
       // clearing a field actually persists rather than reverting to
       // whatever was on disk. run.metadata is a plain object.
-      metadata_values: JSON.stringify(run.metadata || {})
+      metadata_values: JSON.stringify(run.metadata || {}),
+      // Linked-run group id. Empty string = unlink. null / undefined =
+      // leave as-is (Pydantic Optional[str] treats missing key as None).
+      // Only send it when it's actually set on the run object.
+      ...(run.linkedGroupId !== undefined ? {linked_group_id: run.linkedGroupId || ''} : {})
     });
+    // ── Local sibling propagation ────────────────────────────────
+    // Backend already fanned out to sibling rows in DB, but the local
+    // cache (_getAllRunsLocal) for other tabs is stale until reload.
+    // Mirror the shared fields onto every locally-known sibling so tab
+    // switches show current state without a reload.
+    if (run.linkedGroupId) {
+      _spPropagateToLocalSiblings(run);
+    }
   } catch(e) {
     // record may not exist yet - create it
     try {
@@ -6656,7 +6668,11 @@ async function _getAllRuns() {
         startedAt:   r.started_at,
         // Filled-in metadata values (side-panel form). Empty object when
         // the run is new or the schema was blank.
-        metadata:    meta
+        metadata:    meta,
+        // Linked-run group id — string when this run is linked to others,
+        // null when standalone. Used for tab-icon rendering + local
+        // propagation of ticks/deviations/scaling to sibling runs.
+        linkedGroupId: r.linked_group_id || null
       };
     });
     try { localStorage.setItem(_RUNS_KEY, JSON.stringify(dbRuns)); } catch(e) {}
@@ -7322,7 +7338,8 @@ async function spResumeRunById(runId) {
         group_name:  dbRun.group_name || 'Protocols',
         subgroup:    dbRun.subgroup || '',
         startedAt:   dbRun.started_at,
-        metadata:    meta
+        metadata:    meta,
+        linkedGroupId: dbRun.linked_group_id || null
       };
       _saveLocalOnly(_scratchProtoRun);
       if (typeof setView === 'function') setView('scratch');
@@ -7385,11 +7402,18 @@ function _renderProtoRunInScratch(el) {
       '<div class="sp-run-main">' +
         '<div class="sp-run-header">' +
           '<div>' +
-            '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) + '</div>' +
-            '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;&#183;&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '</div>' +
+            '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) +
+              (rs.linkedGroupId ? ' <span style="color:hsl(' + _spLinkedGroupHue(rs.linkedGroupId) + ',55%,42%);font-size:14px" title="Linked to other runs — steps/deviations/scaling propagate">&#128279;</span>' : '') +
+            '</div>' +
+            '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;&#183;&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) +
+              (rs.linkedGroupId ? ' &nbsp;&#183;&nbsp; <span style="color:hsl(' + _spLinkedGroupHue(rs.linkedGroupId) + ',55%,35%)">linked group</span>' : '') +
+            '</div>' +
             '<span class="sp-run-group-badge">&#128193; ' + esc(groupLabel) + '</span>' +
           '</div>' +
-          '<div style="display:flex;gap:6px">' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+            (rs.linkedGroupId
+              ? '<button class="btn" onclick="spUnlinkRun()" title="Break the link — this run becomes independent">&#128279;&#10060; Unlink</button>'
+              : '<button class="btn" onclick="spDuplicateAsLinked()" title="Create a linked copy — step ticks propagate, metadata stays separate">&#128279;+ Duplicate as linked</button>') +
             '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
             '<button class="btn" style="color:#c0392b" onclick="spAbandonRun()">&#215; Abandon</button>' +
           '</div>' +
@@ -7409,6 +7433,86 @@ function _renderProtoRunInScratch(el) {
         _spRenderMetaPanel(rs) +
       '</aside>' +
     '</div>';
+}
+
+// ── Linked-runs handlers ──────────────────────────────────────────────────
+// Steps + deviations + recipe + scaling propagate; metadata_values stays
+// per-run. Backend enforces the propagation authoritatively (see the
+// PUT /active-runs/{id} handler); this client-side mirror keeps the
+// local run cache in sync so tab-switches don't show stale data
+// between saves.
+
+// After a save on a linked run, update the locally-cached copies of
+// every sibling run to match the shared fields. Doesn't touch metadata.
+function _spPropagateToLocalSiblings(sourceRun) {
+  if (!sourceRun.linkedGroupId) return;
+  var runs = _getAllRunsLocal();
+  var changed = false;
+  runs.forEach(function(r) {
+    if (r.runId === sourceRun.runId) return;
+    if (r.linkedGroupId !== sourceRun.linkedGroupId) return;
+    r.steps       = JSON.parse(JSON.stringify(sourceRun.steps));
+    r.recipe      = JSON.parse(JSON.stringify(sourceRun.recipe));
+    r.scaling     = sourceRun.scaling;
+    r.scaleFactor = sourceRun.scaleFactor;
+    changed = true;
+  });
+  if (changed) {
+    try { localStorage.setItem(_RUNS_KEY, JSON.stringify(runs)); } catch (e) {}
+    // If one of the affected siblings happens to also be _scratchProtoRun
+    // (rare — same tab, but possible if the user duplicated then switched)
+    // its in-memory copy stays stale until next _saveRun. Not worth
+    // syncing here; the switch path already re-hydrates.
+  }
+}
+
+async function spDuplicateAsLinked() {
+  var rs = _scratchProtoRun; if (!rs) { toast('No active run', true); return; }
+  // Save current state first so the duplicate copies the latest ticks.
+  await _saveRunToDb(rs);
+  try {
+    var resp = await api('POST', '/api/active-runs/' + encodeURIComponent(rs.runId) + '/duplicate-linked');
+    // Refresh runs from server so both source (now with linkedGroupId)
+    // and the new run appear correctly in the tab bar.
+    var all = await _getAllRuns();
+    var newRun = all.find(function(r) { return r.runId === resp.new_run_id; });
+    var srcRun = all.find(function(r) { return r.runId === rs.runId; });
+    // Update the in-memory active run so the header re-renders with the
+    // new linkedGroupId (source got it too when backend created group).
+    if (srcRun) _scratchProtoRun = srcRun;
+    toast('Linked run created');
+    // Switch to the new run so user starts filling its metadata.
+    if (newRun) {
+      await spSwitchRun(newRun.runId);
+    } else {
+      // Fallback: just re-render.
+      var el = document.getElementById('scratch-view');
+      if (el && typeof _renderScratchProtoRun === 'function') _renderScratchProtoRun(el);
+      else if (typeof setView === 'function') setView('scratch');
+    }
+  } catch (e) {
+    toast('Duplicate failed: ' + (e.message || e), true);
+  }
+}
+
+async function spUnlinkRun() {
+  var rs = _scratchProtoRun; if (!rs || !rs.linkedGroupId) return;
+  if (!confirm('Unlink this run? Future changes will no longer propagate to its linked siblings.')) return;
+  var prevGid = rs.linkedGroupId;
+  rs.linkedGroupId = null;
+  try {
+    await api('PUT', '/api/active-runs/' + encodeURIComponent(rs.runId), {
+      linked_group_id: ''  // empty string = unlink
+    });
+    // Also strip the local cache copy so tabs render with the link
+    // indicator removed on next redraw.
+    _saveLocalOnly(rs);
+    toast('Unlinked');
+    if (typeof setView === 'function') setView('scratch');
+  } catch (e) {
+    rs.linkedGroupId = prevGid;  // rollback
+    toast('Unlink failed: ' + (e.message || e), true);
+  }
 }
 
 // ── Metadata side panel (protocol-run details) ───────────────────────────
@@ -7656,10 +7760,17 @@ function _renderRunTabs() {
     var doneCount = (r.steps || []).filter(function(s){return s.done;}).length;
     var total = (r.steps || []).length;
     var title = (r.protocol && r.protocol.title) || 'Untitled';
+    // Linked-run indicator: chain-link glyph tinted by the group id
+    // (deterministic colour hash — same colour for all runs in one group).
+    var linkChip = '';
+    if (r.linkedGroupId) {
+      var hue = _spLinkedGroupHue(r.linkedGroupId);
+      linkChip = ' <span class="sp-runtab-link" style="color:hsl(' + hue + ',55%,42%)" title="Linked to other runs — step ticks propagate">&#128279;</span>';
+    }
     return '<div class="sp-runtab' + (isActive ? ' active' : '') + '" ' +
                 'onclick="spSwitchRun(\'' + esc(r.runId) + '\')" ' +
-                'title="' + esc(title) + ' — ' + doneCount + '/' + total + ' steps">' +
-      '<span class="sp-runtab-title">' + esc(title) + '</span>' +
+                'title="' + esc(title) + ' — ' + doneCount + '/' + total + ' steps' + (r.linkedGroupId ? ' (linked)' : '') + '">' +
+      '<span class="sp-runtab-title">' + esc(title) + '</span>' + linkChip +
       '<span class="sp-runtab-count">' + doneCount + '/' + total + '</span>' +
       '<button class="sp-runtab-x" onclick="event.stopPropagation();spDiscardRunTab(\'' + esc(r.runId) + '\')" title="Discard this run">&#215;</button>' +
     '</div>';
@@ -7668,6 +7779,15 @@ function _renderRunTabs() {
     '<button class="sp-runtab sp-runtab-add" onclick="spShowRunPickerInline()" title="Start another run alongside this one">+ Run another</button>' +
     '<div id="sp-runpicker-inline" style="flex-basis:100%"></div>' +
     '</div>';
+}
+
+// Deterministic hue (0–360) for a linked_group_id, so all runs in the
+// same group get the same chain-link colour. Just sums char codes;
+// collisions are visually fine (different groups may share a hue).
+function _spLinkedGroupHue(gid) {
+  var h = 0;
+  for (var i = 0; i < gid.length; i++) h = (h + gid.charCodeAt(i) * 13) % 360;
+  return h;
 }
 
 async function spSwitchRun(runId) {
@@ -9622,6 +9742,13 @@ var G = {
   // dashed lane lines / drag handles / dashed ladder rules are
   // suppressed, leaving just labels + short solid ladder ticks.
   showGuides: true,
+  // How well labels tilt. 'horizontal' = current (readable across),
+  // 'diagonal' = 45° tilt reading bottom-left to top-right (classic
+  // gel-photo style; fits narrow wells), 'vertical' = 90° reading
+  // bottom-to-top (fits very narrow wells; longest names still fit).
+  // Value lives on G so it persists in memory; also mirrored into
+  // G.annotations.labelOrientation for save/load round-trip.
+  labelOrientation: 'horizontal',
   _dropdowns: {},
   /* Ladder catalogue — loaded from /api/ladders on render. Each entry:
      { id, slug, name, kind, sizes:[int], image_file, is_preset } */
@@ -9742,6 +9869,13 @@ async function gelLoadGel(id) {
   var ann = d.annotations;
   if (typeof ann === 'string') { try { ann = JSON.parse(ann); } catch (e) { ann = {}; } }
   G.annotations = ann && ann.ladderMarks ? ann : { ladderMarks: [] };
+  // Restore label orientation from the annotations blob if the gel
+  // was previously saved with a non-default value; otherwise fall
+  // back to horizontal.
+  G.labelOrientation = (G.annotations.labelOrientation === 'diagonal' ||
+                        G.annotations.labelOrientation === 'vertical')
+                       ? G.annotations.labelOrientation
+                       : 'horizontal';
   G.dirty = false;
 }
 
@@ -9799,6 +9933,19 @@ function gelExport() {
 // get their highlight so editing works even in "clean" mode.
 function gelToggleGuides(on) {
   G.showGuides = !!on;
+  gelDrawOverlay();
+}
+
+// Change well-label orientation (horizontal / diagonal / vertical).
+// Mirrors onto G.annotations so it round-trips through save/load. The
+// draw code reads G.labelOrientation directly (not annotations) so a
+// mid-session change re-renders immediately.
+function gelSetLabelOrientation(value) {
+  var v = (value === 'diagonal' || value === 'vertical') ? value : 'horizontal';
+  G.labelOrientation = v;
+  if (!G.annotations) G.annotations = {};
+  G.annotations.labelOrientation = v;
+  G.dirty = true;
   gelDrawOverlay();
 }
 
@@ -9908,13 +10055,43 @@ function gelDrawOnCtx(ctx, w, h) {
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    /* lane label — y is offset by the assigned row so overlapping labels
-       stack downward instead of clipping into each other */
+    /* lane label — orientation-aware.
+       - horizontal: current behaviour, stagger by row to avoid clipping
+       - diagonal:   rotated -45° at anchor near well top, no stagger
+                     needed (labels extend up-and-right so horizontal
+                     overlap is naturally minimised)
+       - vertical:   rotated -90°, reads bottom-to-top from just above
+                     the well
+       In all cases the label anchors at the LANE X so the reader can
+       trace a diagonal/vertical label straight down to its well. */
     ctx.font = baseFont + 'px "SF Mono", Monaco, Consolas, monospace';
     ctx.fillStyle = lane.is_ladder ? '#e8a735' : '#5b7a5e';
-    ctx.textAlign = 'center';
-    var labelY = baseFont + 4 + labelRow[i] * (baseFont + 2);
-    ctx.fillText(labelText[i], x, labelY);
+    var orient = G.labelOrientation || 'horizontal';
+    if (orient === 'diagonal') {
+      ctx.save();
+      // Anchor a few pixels above the well top edge; rotate -45° so the
+      // text goes up and to the right (reads bottom-left → top-right,
+      // the classic gel-photo convention).
+      ctx.translate(x, baseFont + 4);
+      ctx.rotate(-Math.PI / 4);
+      ctx.textAlign = 'left';
+      // Small +ve x offset so the leftmost character isn't touching
+      // the pivot point (which sits over the lane).
+      ctx.fillText(labelText[i], 4, 0);
+      ctx.restore();
+    } else if (orient === 'vertical') {
+      ctx.save();
+      ctx.translate(x, baseFont + 4);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = 'left';
+      ctx.fillText(labelText[i], 4, baseFont / 3);  // baseline nudge
+      ctx.restore();
+    } else {
+      // horizontal — the current staggered behaviour
+      ctx.textAlign = 'center';
+      var labelY = baseFont + 4 + labelRow[i] * (baseFont + 2);
+      ctx.fillText(labelText[i], x, labelY);
+    }
     /* drag handle — only when guides on */
     if (G.showGuides !== false || i === G.selIdx) {
       ctx.fillStyle = i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.5)';
@@ -10849,6 +11026,16 @@ function gelRenderFull() {
     html += '<label class="gel-btn-sm" style="display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none">' +
       '<input type="checkbox" ' + (G.showGuides !== false ? 'checked' : '') + ' onchange="gelToggleGuides(this.checked)" style="margin:0"/>' +
       'Guides</label>';
+    // Label orientation dropdown — how well labels tilt above the lanes.
+    // Diagonal fits classic gel-photo look; vertical helps when lanes
+    // are very narrow and names would still clip in diagonal.
+    html += '<label class="gel-btn-sm" style="display:flex;align-items:center;gap:4px;user-select:none">' +
+      'Labels:' +
+      '<select onchange="gelSetLabelOrientation(this.value)" style="padding:2px 4px;font-size:.75rem;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#4a4139">' +
+        '<option value="horizontal"' + (G.labelOrientation === 'horizontal' || !G.labelOrientation ? ' selected' : '') + '>horizontal</option>' +
+        '<option value="diagonal"'   + (G.labelOrientation === 'diagonal'   ? ' selected' : '') + '>diagonal 45°</option>' +
+        '<option value="vertical"'   + (G.labelOrientation === 'vertical'   ? ' selected' : '') + '>vertical 90°</option>' +
+      '</select></label>';
     html += '<button class="gel-btn" onclick="gelSave()">Save</button>';
     // Save annotated snapshot: flattens the current canvas view (image
     // + overlays) into a PNG and uploads it. Referenced by workflow
