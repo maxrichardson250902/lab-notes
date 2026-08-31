@@ -9916,6 +9916,65 @@ function gelDispNtoViewNY(dn) {
   return G.crop.y + dn * G.crop.h;
 }
 
+/* ── canvas padding ───────────────────────────────────────────────────
+   The display / snapshot canvas is larger than the image content so
+   labels have somewhere to sit that isn't over the bands. Without this
+   pad, cropping tight to the bands puts the lane labels (which anchor
+   near the top of the canvas) on top of the gel and ladder size
+   labels (which anchor near the left) over the leftmost lane.
+
+   Approach: bg canvas is (viewW+padL+padR) × (viewH+padT+padB) pixels.
+   Image is drawn at (padL, padT) with its original view size. The
+   overlay canvas has the same aspect (CSS scales both to the same
+   client size) so pad *fractions* are preserved. G._padF stores those
+   fractions so gelDrawOnCtx can compute the content rect regardless
+   of what canvas it's rendering to (screen or export).                 */
+function gelPadFor(viewW, viewH) {
+  var padL = Math.round(gelClamp(viewW * 0.06, 30, 60));
+  var padR = 8;
+  var padT = Math.round(gelClamp(viewH * 0.10, 34, 90));
+  var padB = 8;
+  var totalW = viewW + padL + padR;
+  var totalH = viewH + padT + padB;
+  return {
+    padL: padL, padR: padR, padT: padT, padB: padB,
+    viewW: viewW, viewH: viewH,
+    canvasW: totalW, canvasH: totalH,
+    // fractions (used by gelDrawOnCtx which only sees final canvas dims)
+    fLeft: padL / totalW,
+    fRight: padR / totalW,
+    fTop: padT / totalH,
+    fBottom: padB / totalH
+  };
+}
+// Content rect in the current draw-target canvas's pixel coords.
+// Uses G._padF (set by paintBg / gelRenderComposite) — falls back to
+// no-pad if not set (e.g. very first render before img loads).
+function gelContent(canvasW, canvasH) {
+  var f = G._padF || { fLeft: 0, fRight: 0, fTop: 0, fBottom: 0 };
+  return {
+    left: canvasW * f.fLeft,
+    top: canvasH * f.fTop,
+    w: canvasW * (1 - f.fLeft - f.fRight),
+    h: canvasH * (1 - f.fTop - f.fBottom)
+  };
+}
+// Convert a client (mouse) coord to {cx, cy} canvas-px and {nx, ny}
+// content-normalised (0..1 inside content area; <0 or >1 if in pad
+// zone). Respects the wrap's CSS transform:scale.
+function gelClientToNorm(clientX, clientY, canvas) {
+  var rect = canvas.getBoundingClientRect();
+  var cx = (clientX - rect.left) * canvas.width / Math.max(1, rect.width);
+  var cy = (clientY - rect.top) * canvas.height / Math.max(1, rect.height);
+  var cr = gelContent(canvas.width, canvas.height);
+  return {
+    cx: cx, cy: cy,
+    nx: (cx - cr.left) / Math.max(1, cr.w),
+    ny: (cy - cr.top) / Math.max(1, cr.h),
+    content: cr
+  };
+}
+
 /* ── clipboard paste ── */
 function gelInitPaste() {
   if (G._pasteListenerAdded) return;
@@ -10054,15 +10113,18 @@ function gelRenderComposite() {
   if (!rc) return null;
   var view = gelViewRect();
   if (!view || view.w < 1 || view.h < 1) return null;
+  var pad = gelPadFor(view.w, view.h);
+  G._padF = pad;
   var exp = document.createElement('canvas');
-  exp.width = Math.round(view.w);
-  exp.height = Math.round(view.h);
+  exp.width = pad.canvasW;
+  exp.height = pad.canvasH;
   var ctx = exp.getContext('2d');
-  // Draw the cropped sub-rect of the rotated canvas at 1:1.
-  ctx.drawImage(rc, view.x, view.y, view.w, view.h, 0, 0, exp.width, exp.height);
-  // Overlay: gelDrawOnCtx works in normalised display coords (which,
-  // when cropped, exclude annotations outside the crop). We pass the
-  // export canvas dims as the "display" size.
+  // Off-white pad zone — same tone as the app background so the label
+  // frame doesn't look like a hard letterbox.
+  ctx.fillStyle = '#faf8f4';
+  ctx.fillRect(0, 0, exp.width, exp.height);
+  ctx.drawImage(rc, view.x, view.y, view.w, view.h,
+                    pad.padL, pad.padT, view.w, view.h);
   gelDrawOnCtx(ctx, exp.width, exp.height, { forExport: true });
   return exp;
 }
@@ -10182,14 +10244,14 @@ function gelCropApply() {
   if (!G.cropDrag) return;
   var canvas = document.getElementById('gelCanvas');
   if (!canvas || !canvas.width || !canvas.height) return;
+  var cr = gelContent(canvas.width, canvas.height);
+  if (cr.w < 1 || cr.h < 1) return;
   var d = G.cropDrag;
-  // Normalise to display coords 0..1
-  var dx0 = Math.min(d.x0, d.x1) / canvas.width;
-  var dy0 = Math.min(d.y0, d.y1) / canvas.height;
-  var dx1 = Math.max(d.x0, d.x1) / canvas.width;
-  var dy1 = Math.max(d.y0, d.y1) / canvas.height;
-  dx0 = gelClamp(dx0, 0, 1); dy0 = gelClamp(dy0, 0, 1);
-  dx1 = gelClamp(dx1, 0, 1); dy1 = gelClamp(dy1, 0, 1);
+  // Convert canvas-px → content-normalised 0..1, clamped to content area.
+  var dx0 = gelClamp((Math.min(d.x0, d.x1) - cr.left) / cr.w, 0, 1);
+  var dy0 = gelClamp((Math.min(d.y0, d.y1) - cr.top)  / cr.h, 0, 1);
+  var dx1 = gelClamp((Math.max(d.x0, d.x1) - cr.left) / cr.w, 0, 1);
+  var dy1 = gelClamp((Math.max(d.y0, d.y1) - cr.top)  / cr.h, 0, 1);
   // Compose with any existing crop → rotated-frame coords.
   var vx0 = gelDispNtoViewNX(dx0), vy0 = gelDispNtoViewNY(dy0);
   var vx1 = gelDispNtoViewNX(dx1), vy1 = gelDispNtoViewNY(dy1);
@@ -10269,30 +10331,31 @@ function gelDrawOverlay() {
 
 function gelDrawOnCtx(ctx, w, h, opts) {
   opts = opts || {};
-  /* scale annotations so they stay readable at any image size */
-  var baseFont = Math.max(11, Math.min(16, w / 45));
-  var smallFont = Math.max(10, Math.min(14, w / 50));
-  var handleR = Math.max(5, Math.min(9, w / 80));
-  var labelTrunc = Math.max(8, Math.min(18, Math.floor(w / 40)));
+  /* Content rect: the region of this canvas occupied by the image. The
+     remainder is pad zone where labels live so they don't sit on top
+     of bands. See gelPadFor + G._padF. When _padF isn't set yet (first
+     paint) gelContent returns the full canvas as content — labels will
+     look wrong for one frame, then correct after paintBg runs. */
+  var cr = gelContent(w, h);
+  var scaleRef = cr.w;  // font/handle sizing keys off content width, not canvas width
+  var baseFont = Math.max(11, Math.min(16, scaleRef / 45));
+  var smallFont = Math.max(10, Math.min(14, scaleRef / 50));
+  var handleR = Math.max(5, Math.min(9, scaleRef / 80));
+  var labelTrunc = Math.max(8, Math.min(18, Math.floor(scaleRef / 40)));
 
-  /* Precompute display-x for each lane (null = outside crop, skip
-     drawing AND skip stagger accounting so remaining labels aren't
-     pushed into rows they don't need). */
-  var laneDispNX = G.lanes.map(function(lane) {
-    return gelViewNXtoDispN(lane.x_position);
+  /* Precompute display-x (canvas px) for each lane. null = outside
+     crop, skip drawing AND skip stagger accounting. */
+  var laneCanvasX = G.lanes.map(function(lane) {
+    var dn = gelViewNXtoDispN(lane.x_position);
+    return dn === null ? null : cr.left + dn * cr.w;
   });
 
   /* ── overlap-avoidance: pre-assign each label to a row ──────────────
-     Labels used to draw all on row 0 with textAlign=center, so wide
-     sample names on adjacent lanes clipped into each other. We now do
-     a greedy interval-scheduling pass: for each lane in order, compute
-     the label's [x-w/2, x+w/2] interval and place it in the LOWEST row
-     where it doesn't overlap anything already there. Row 0 is the top,
-     each subsequent row is baseFont + 2 pixels lower. Preserves full
-     names — only vertical footprint grows.
-
-     The 4px pad below is a fudge so labels don't visually kiss even
-     when their bounding boxes are technically 1px apart. */
+     Labels stagger UPWARD from the top of the content area into the
+     top pad zone. Row 0 sits just above content, row 1 baseFont+2 px
+     higher, etc. Greedy interval scheduling picks the lowest row
+     (=nearest to content) where the label's x-interval doesn't overlap
+     anything already in that row.                                    */
   var LABEL_PAD_PX = 4;
   ctx.font = baseFont + 'px "SF Mono", Monaco, Consolas, monospace';
   var rowsInUse = [];  // rowsInUse[r] = rightmost x already occupied in row r
@@ -10302,12 +10365,11 @@ function gelDrawOnCtx(ctx, w, h, opts) {
     var label = lane.is_ladder ? 'L' : String(i + 1);
     if (lane.sample_name) label += ': ' + lane.sample_name.substring(0, labelTrunc);
     labelText[i] = label;
-    if (laneDispNX[i] === null) return;  // culled by crop
+    if (laneCanvasX[i] === null) return;  // culled by crop
     var textW = ctx.measureText(label).width;
-    var x = laneDispNX[i] * w;
+    var x = laneCanvasX[i];
     var left = x - textW / 2 - LABEL_PAD_PX;
     var right = x + textW / 2 + LABEL_PAD_PX;
-    // Find lowest row where left > rightmost-in-row
     var row = 0;
     while (row < rowsInUse.length && left < rowsInUse[row]) row++;
     if (row === rowsInUse.length) rowsInUse.push(right);
@@ -10317,105 +10379,109 @@ function gelDrawOnCtx(ctx, w, h, opts) {
 
   /* draw lanes */
   G.lanes.forEach(function(lane, i) {
-    if (laneDispNX[i] === null) return;  // outside crop
-    var x = laneDispNX[i] * w;
+    if (laneCanvasX[i] === null) return;  // outside crop
+    var x = laneCanvasX[i];
     ctx.save();
     // Lane line + drag handle are "guide" chrome — hide when the user
     // turns off guides so the exported image has only labels + solid
     // ladder marks. Selected lane always shows its guide though so you
-    // can still see what's active while editing.
+    // can still see what's active while editing. Line spans the CONTENT
+    // area only, not the whole canvas.
     if (G.showGuides !== false || i === G.selIdx) {
       ctx.setLineDash(i === G.selIdx ? [6, 3] : [4, 4]);
       ctx.strokeStyle = lane.is_ladder ? '#e8a735' : (i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.6)');
       ctx.lineWidth = i === G.selIdx ? 2.5 : 1.5;
       ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
+      ctx.moveTo(x, cr.top);
+      ctx.lineTo(x, cr.top + cr.h);
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    /* lane label — orientation-aware.
-       - horizontal: current behaviour, stagger by row to avoid clipping
-       - diagonal:   rotated -45° at anchor near well top, no stagger
-                     needed (labels extend up-and-right so horizontal
-                     overlap is naturally minimised)
-       - vertical:   rotated -90°, reads bottom-to-top from just above
-                     the well
-       In all cases the label anchors at the LANE X so the reader can
-       trace a diagonal/vertical label straight down to its well. */
+    /* lane label — orientation-aware. All variants anchor just ABOVE
+       the top edge of the content area (so labels sit in the top pad
+       zone, not over bands):
+       - horizontal: baseline at (cr.top - 4 - row*(baseFont+2)); text
+                     grows upward into pad as staggered rows increase
+       - diagonal:   anchor at (x, cr.top - 4), rotate -45°, text
+                     extends up-and-right into pad
+       - vertical:   anchor at (x, cr.top - 4), rotate -90°, text
+                     extends straight up into pad                       */
     ctx.font = baseFont + 'px "SF Mono", Monaco, Consolas, monospace';
     ctx.fillStyle = lane.is_ladder ? '#e8a735' : '#5b7a5e';
     var orient = G.labelOrientation || 'horizontal';
     if (orient === 'diagonal') {
       ctx.save();
-      // Anchor a few pixels above the well top edge; rotate -45° so the
-      // text goes up and to the right (reads bottom-left → top-right,
-      // the classic gel-photo convention).
-      ctx.translate(x, baseFont + 4);
+      ctx.translate(x, cr.top - 4);
       ctx.rotate(-Math.PI / 4);
       ctx.textAlign = 'left';
-      // Small +ve x offset so the leftmost character isn't touching
-      // the pivot point (which sits over the lane).
       ctx.fillText(labelText[i], 4, 0);
       ctx.restore();
     } else if (orient === 'vertical') {
       ctx.save();
-      ctx.translate(x, baseFont + 4);
+      ctx.translate(x, cr.top - 4);
       ctx.rotate(-Math.PI / 2);
       ctx.textAlign = 'left';
-      ctx.fillText(labelText[i], 4, baseFont / 3);  // baseline nudge
+      ctx.fillText(labelText[i], 4, baseFont / 3);
       ctx.restore();
     } else {
-      // horizontal — the current staggered behaviour
+      // horizontal — staggered, growing UPWARD from just above content
       ctx.textAlign = 'center';
-      var labelY = baseFont + 4 + labelRow[i] * (baseFont + 2);
+      var labelY = cr.top - 4 - labelRow[i] * (baseFont + 2);
       ctx.fillText(labelText[i], x, labelY);
     }
-    /* drag handle — only when guides on */
+    /* drag handle — only when guides on. Sits just INSIDE the bottom
+       edge of content so you can grab it without leaving the image. */
     if (G.showGuides !== false || i === G.selIdx) {
       ctx.fillStyle = i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.5)';
       ctx.beginPath();
-      ctx.arc(x, h - handleR - 4, handleR, 0, Math.PI * 2);
+      ctx.arc(x, cr.top + cr.h - handleR - 4, handleR, 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.restore();
   });
   /* draw ladder marks — when guides off, draw solid horizontal rules
-     with size labels (no dashes). Selected mark still gets highlighted. */
+     with size labels (no dashes). Selected mark still gets highlighted.
+     Ticks span the content width; size labels sit in the left pad zone. */
   if (G.annotations.ladderMarks) {
     var ladder = gelActiveLadder();
     var unit = gelSizeUnit(ladder);
     G.annotations.ladderMarks.forEach(function(m, i) {
       var dispNY = gelViewNYtoDispN(m.y);
       if (dispNY === null) return;   // outside crop
-      var y = dispNY * h;
+      var y = cr.top + dispNY * cr.h;
       var isSelected = G.markReplaceIdx === i;
       ctx.save();
       if (G.showGuides !== false || isSelected) {
         ctx.strokeStyle = isSelected ? '#5b7a5e' : 'rgba(232,167,53,0.7)';
         ctx.lineWidth = isSelected ? 2 : 1;
-        // Guides-off: draw solid short tick from left edge instead of a
-        // full dashed rule across the gel — cleaner and points at the
-        // labelled size without cluttering the band area.
+        // Guides-off: solid short tick from content's left edge instead
+        // of a full dashed rule across the gel.
         if (G.showGuides === false) {
           ctx.setLineDash([]);
           ctx.beginPath();
-          ctx.moveTo(0, y);
-          ctx.lineTo(Math.min(24, w * 0.05), y);
+          ctx.moveTo(cr.left, y);
+          ctx.lineTo(cr.left + Math.min(24, cr.w * 0.05), y);
         } else {
           ctx.setLineDash(isSelected ? [] : [3, 3]);
           ctx.beginPath();
-          ctx.moveTo(0, y);
-          ctx.lineTo(w, y);
+          ctx.moveTo(cr.left, y);
+          ctx.lineTo(cr.left + cr.w, y);
         }
         ctx.stroke();
         ctx.setLineDash([]);
       }
-      // Size label always drawn — that's the point of the mark.
+      // Size label sits in the LEFT PAD ZONE, right-aligned so its
+      // right edge lands just before the tick line at cr.left. Falls
+      // back to the old left-flush position if the pad is missing.
       ctx.font = smallFont + 'px "SF Mono", Monaco, Consolas, monospace';
       ctx.fillStyle = isSelected ? '#5b7a5e' : '#e8a735';
-      ctx.textAlign = 'left';
-      ctx.fillText(gelSizeLabel(String(m.size), unit), 4, y - 3);
+      if (cr.left > 8) {
+        ctx.textAlign = 'right';
+        ctx.fillText(gelSizeLabel(String(m.size), unit), cr.left - 4, y - 3);
+      } else {
+        ctx.textAlign = 'left';
+        ctx.fillText(gelSizeLabel(String(m.size), unit), 4, y - 3);
+      }
       ctx.restore();
     });
   }
@@ -10505,21 +10571,23 @@ function gelInitCanvas() {
   var canvas = document.getElementById('gelCanvas');
   if (!img || !bgCanvas || !canvas) return;
 
-  // Paint the rotated+cropped view into the background canvas. This
-  // canvas's intrinsic (attribute) size sets the aspect ratio for the
-  // CSS max-width/max-height sizing rule, so the wrap div lays out
-  // correctly. Returns false if img isn't loaded yet.
+  // Paint the rotated+cropped view into the background canvas. Bg
+  // canvas is padded so labels have somewhere to sit outside the image
+  // content — see gelPadFor. Returns false if img isn't loaded yet.
   function paintBg() {
     var rc = gelGetRotatedCanvas();
     if (!rc) return false;
     var view = gelViewRect();
     if (!view || view.w < 1 || view.h < 1) return false;
-    bgCanvas.width = Math.round(view.w);
-    bgCanvas.height = Math.round(view.h);
+    var pad = gelPadFor(view.w, view.h);
+    G._padF = pad;
+    bgCanvas.width = pad.canvasW;
+    bgCanvas.height = pad.canvasH;
     var bctx = bgCanvas.getContext('2d');
-    bctx.clearRect(0, 0, bgCanvas.width, bgCanvas.height);
+    bctx.fillStyle = '#faf8f4';   // off-white pad, matches app bg
+    bctx.fillRect(0, 0, bgCanvas.width, bgCanvas.height);
     bctx.drawImage(rc, view.x, view.y, view.w, view.h,
-                       0, 0, bgCanvas.width, bgCanvas.height);
+                       pad.padL, pad.padT, view.w, view.h);
     return true;
   }
 
@@ -10557,14 +10625,23 @@ function gelInitCanvas() {
     // ── crop mode: mousedown begins a drag; mousemove/up finish it.
     if (G.cropMode) {
       var pc = gelCanvasPx(e.clientX, e.clientY, canvas);
+      // Clamp to content area — the crop rect can only ever be inside
+      // the image, not in the label pad zone.
+      var cr = gelContent(canvas.width, canvas.height);
+      pc.x = gelClamp(pc.x, cr.left, cr.left + cr.w);
+      pc.y = gelClamp(pc.y, cr.top,  cr.top  + cr.h);
       G.cropDragging = true;
       G.cropDrag = { x0: pc.x, y0: pc.y, x1: pc.x, y1: pc.y };
       gelDrawOverlay();
       return;
     }
 
-    var nx = gelNormX(e.clientX, canvas);
-    var ny = gelNormY(e.clientY, canvas);
+    var pt = gelClientToNorm(e.clientX, e.clientY, canvas);
+    var nx = gelClamp(pt.nx, 0, 1);
+    var ny = gelClamp(pt.ny, 0, 1);
+    // Ignore lane/ladder clicks in the pad zone entirely — otherwise
+    // every click on the left margin would spawn a lane at x=0.
+    if (pt.nx < 0 || pt.nx > 1 || pt.ny < 0 || pt.ny > 1) return;
     /* check if clicking near existing lane handle. Compare in the same
        (display) frame — remap stored x through crop, cull if hidden. */
     for (var i = 0; i < G.lanes.length; i++) {
@@ -10649,18 +10726,21 @@ function gelInitCanvas() {
       gelDrawOverlay();
       return;
     }
-    // Active crop drag: extend the rect to the current cursor.
+    // Active crop drag: extend the rect to the current cursor, clamped
+    // to the content area so the preview can't leak into pad.
     if (G.cropMode && G.cropDragging && G.cropDrag) {
       var pc = gelCanvasPx(e.clientX, e.clientY, canvas);
-      G.cropDrag.x1 = pc.x;
-      G.cropDrag.y1 = pc.y;
+      var cr = gelContent(canvas.width, canvas.height);
+      G.cropDrag.x1 = gelClamp(pc.x, cr.left, cr.left + cr.w);
+      G.cropDrag.y1 = gelClamp(pc.y, cr.top,  cr.top  + cr.h);
       gelDrawOverlay();
       return;
     }
     if (G.dragging < 0) return;
-    var nx = gelNormX(e.clientX, canvas);
+    var mv = gelClientToNorm(e.clientX, e.clientY, canvas);
+    var mvnx = gelClamp(mv.nx, 0, 1);
     // Store in rotated-frame coords so drag while cropped composes correctly.
-    G.lanes[G.dragging].x_position = gelDispNtoViewNX(nx);
+    G.lanes[G.dragging].x_position = gelDispNtoViewNX(mvnx);
     G.dirty = true;
     gelDrawOverlay();
   };
@@ -11604,10 +11684,9 @@ function gelInjectStyles() {
     '.gel-img { display:block; max-width:100%; max-height:50vh; height:auto; user-select:none; -webkit-user-drag:none; }',
     /* bg canvas replaces the visible <img> as the sizing element for the
        wrap div. Same max sizing rules so layout matches what the old img
-       produced. display:block + width/height auto lets the intrinsic
-       canvas attributes (set by paintBg from the rotated-view dims)
-       drive aspect ratio; max-width/max-height scale it to fit. */
-    '.gel-bg-canvas { display:block; max-width:100%; max-height:50vh; width:auto; height:auto; user-select:none; background:#000; }',
+       produced. paintBg fills the canvas with the off-white pad colour
+       and draws the image inset by the pad amounts (see gelPadFor). */
+    '.gel-bg-canvas { display:block; max-width:100%; max-height:50vh; width:auto; height:auto; user-select:none; }',
     '.gel-canvas { position:absolute; top:0; left:0; width:100%; height:100%; cursor:crosshair; }',
     '.gel-controls { display:flex; gap:16px; padding:12px 14px; border-top:1px solid #d5cec0; background:#faf8f4; max-height:280px; overflow-y:auto; flex-wrap:wrap; }',
     '.gel-controls-left { flex:1; min-width:260px; }',
