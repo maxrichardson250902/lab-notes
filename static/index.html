@@ -9315,6 +9315,38 @@ function gelDrawOnCtx(ctx, w, h) {
   var handleR = Math.max(5, Math.min(9, w / 80));
   var labelTrunc = Math.max(8, Math.min(18, Math.floor(w / 40)));
 
+  /* ── overlap-avoidance: pre-assign each label to a row ──────────────
+     Labels used to draw all on row 0 with textAlign=center, so wide
+     sample names on adjacent lanes clipped into each other. We now do
+     a greedy interval-scheduling pass: for each lane in order, compute
+     the label's [x-w/2, x+w/2] interval and place it in the LOWEST row
+     where it doesn't overlap anything already there. Row 0 is the top,
+     each subsequent row is baseFont + 2 pixels lower. Preserves full
+     names — only vertical footprint grows.
+
+     The 4px pad below is a fudge so labels don't visually kiss even
+     when their bounding boxes are technically 1px apart. */
+  var LABEL_PAD_PX = 4;
+  ctx.font = baseFont + 'px "SF Mono", Monaco, Consolas, monospace';
+  var rowsInUse = [];  // rowsInUse[r] = rightmost x already occupied in row r
+  var labelRow = new Array(G.lanes.length);
+  var labelText = new Array(G.lanes.length);
+  G.lanes.forEach(function(lane, i) {
+    var label = lane.is_ladder ? 'L' : String(i + 1);
+    if (lane.sample_name) label += ': ' + lane.sample_name.substring(0, labelTrunc);
+    labelText[i] = label;
+    var textW = ctx.measureText(label).width;
+    var x = lane.x_position * w;
+    var left = x - textW / 2 - LABEL_PAD_PX;
+    var right = x + textW / 2 + LABEL_PAD_PX;
+    // Find lowest row where left > rightmost-in-row
+    var row = 0;
+    while (row < rowsInUse.length && left < rowsInUse[row]) row++;
+    if (row === rowsInUse.length) rowsInUse.push(right);
+    else rowsInUse[row] = right;
+    labelRow[i] = row;
+  });
+
   /* draw lanes */
   G.lanes.forEach(function(lane, i) {
     var x = lane.x_position * w;
@@ -9327,13 +9359,13 @@ function gelDrawOnCtx(ctx, w, h) {
     ctx.lineTo(x, h);
     ctx.stroke();
     ctx.setLineDash([]);
-    /* lane label */
-    var label = lane.is_ladder ? 'L' : String(i + 1);
-    if (lane.sample_name) label += ': ' + lane.sample_name.substring(0, labelTrunc);
+    /* lane label — y is offset by the assigned row so overlapping labels
+       stack downward instead of clipping into each other */
     ctx.font = baseFont + 'px "SF Mono", Monaco, Consolas, monospace';
     ctx.fillStyle = lane.is_ladder ? '#e8a735' : '#5b7a5e';
     ctx.textAlign = 'center';
-    ctx.fillText(label, x, baseFont + 4);
+    var labelY = baseFont + 4 + labelRow[i] * (baseFont + 2);
+    ctx.fillText(labelText[i], x, labelY);
     /* drag handle */
     ctx.fillStyle = i === G.selIdx ? '#5b7a5e' : 'rgba(91,122,94,0.5)';
     ctx.beginPath();
