@@ -547,6 +547,11 @@ function _wfInjectDocStyles() {
     '.wf-run-finish:hover { background:#e8f0e8; }',
     '.wf-doc-toolbar { display:flex; gap:4px; align-items:center; flex-wrap:wrap; padding:6px 0 4px 0; margin-top:4px; border-top:1px solid #ece7dd; }',
     '.wf-tool-btn-primary { background:#5b7a5e !important; color:#fff !important; border-color:#5b7a5e !important; }',
+    // Stretch the editor down the viewport so there's plenty of room to
+    // write without the box feeling cramped on empty days. Viewport-
+    // relative so it scales with window size; 260px reserves space for
+    // header, tabs, and toolbar. Content beyond this scrolls naturally.
+    '#wf-doc { min-height: calc(100vh - 260px); }',
     '#wf-doc .wf-block, #wf-doc p[data-groups], #wf-doc table[data-groups], #wf-doc ul[data-groups], #wf-doc ol[data-groups] { padding-left:8px; border-left:3px solid transparent; transition:border-color .15s; }',
     '#wf-doc [data-groups] { border-left-color: var(--wf-tag-primary, #7a9e7e); background: var(--wf-tag-tint, rgba(122,158,126,0.04)); position:relative; margin-top:14px; }',
     '#wf-doc .wf-task-done { border-left-color:#b89a3a; background:rgba(184,154,58,0.06); }',
@@ -703,6 +708,7 @@ async function _wfSaveDoc(html) {
   }
 }
 
+/* Time chip — inserts current HH:MM as a non-editable chip */
 /* Time chip — inserts current HH:MM as a non-editable chip. Called both
    from the toolbar button (no args) and from the Ctrl+T keydown handler
    ({manual: true}). Manual insert bypasses the idle-threshold check
@@ -920,7 +926,9 @@ function _wfDocKeydownExtras(e) {
          content-producing keystroke (_wfLastActivityAt), NOT the max
          chip time in the doc. This means continuous typing never
          inserts more chips, and returning after a real break always
-         gets one. */
+         gets one.
+         typeof S guard because top-level `let S` in core.js doesn't
+         attach to window — same bug class as the DNA archive icon. */
       var thresholdMin = (typeof S !== 'undefined' && S.settings && S.settings.wf_chip_idle_minutes) || 5;
       var now = new Date();
       var idleMs = now.getTime() - _wfLastActivityAt;
