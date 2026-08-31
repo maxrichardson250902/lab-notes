@@ -6000,3 +6000,111 @@ def run_golden_gate_assembly_endpoint(body: RunGoldenGateAssemblyRequest):
         vector=vec,
         enzyme=body.enzyme or "BsaI",
     )
+
+
+# ── PROTEIN ANALYSIS (ProtParam) ────────────────────────────────────────────
+# Benchling-style analysis of a protein sequence, or a DNA region that gets
+# translated first. Wraps Biopython's ProtParam module with a stable
+# response shape for the frontend.
+
+class ProteinAnalysisIn(BaseModel):
+    sequence: str
+    # If true, treat `sequence` as DNA and translate before analysis.
+    # Otherwise treat as protein (single-letter AA codes).
+    is_dna: bool = True
+    # Reading frame 1 / 2 / 3. Ignored when is_dna is False.
+    frame: int = 1
+    # If true and is_dna, stop translation at the first stop codon (*).
+    stop_at_stop: bool = True
+
+
+@router.post("/cloning/protein-analysis")
+def protein_analysis(body: ProteinAnalysisIn):
+    """Return kDa / pI / instability / GRAVY / extinction / aa composition
+    for a protein sequence (or a DNA region translated in the given frame)."""
+    raw = (body.sequence or "").strip()
+    if not raw:
+        raise HTTPException(400, "sequence is empty")
+
+    # ── prepare protein sequence ────────────────────────────────────────
+    if body.is_dna:
+        # Clean to ATGCN, translate. Frame 1/2/3 shifts the start.
+        dna = "".join(c for c in raw.upper() if c in "ATGCN")
+        if body.frame not in (1, 2, 3):
+            raise HTTPException(400, "frame must be 1, 2 or 3")
+        offset = body.frame - 1
+        protein_raw = _translate_seq(dna[offset:])
+    else:
+        # Assume already-protein (uppercase, single-letter). Strip anything
+        # non-alphabetic. Standard AA + X for unknown are the safe set for
+        # ProtParam.
+        protein_raw = "".join(c for c in raw.upper() if c.isalpha())
+
+    if not protein_raw:
+        raise HTTPException(400, "resulting protein sequence is empty")
+
+    # Optional trim at first stop codon
+    protein = protein_raw
+    if body.stop_at_stop and "*" in protein_raw:
+        protein = protein_raw.split("*", 1)[0]
+
+    if not protein:
+        raise HTTPException(400, "protein empty after stop-codon trim (frame issue?)")
+
+    # ── ProtParam ───────────────────────────────────────────────────────
+    # Strip any residual X / non-standard for the metrics that require
+    # standard AAs (ProtParam raises KeyError on unknowns). We report the
+    # untrimmed protein length + how many non-standard residues we dropped
+    # so the frontend can flag ambiguity.
+    from Bio.SeqUtils.ProtParam import ProteinAnalysis
+    STANDARD = set("ACDEFGHIKLMNPQRSTVWY")
+    clean = "".join(c for c in protein if c in STANDARD)
+    nonstd_dropped = len(protein) - len(clean)
+    if not clean:
+        raise HTTPException(400, "no standard amino acids after cleanup")
+
+    p = ProteinAnalysis(clean)
+
+    # Instability classification: Guruprasad's cutoff of 40. Above = the
+    # protein is predicted to be unstable in a test tube.
+    ii = p.instability_index()
+
+    # Molar extinction coefficient at 280 nm — two values, assuming
+    # (a) all Cys form cystines, (b) all Cys reduced.
+    ext_ox, ext_red = p.molar_extinction_coefficient()
+
+    # Aliphatic index (Ikai 1980): relative volume from A + 2.9*V + 3.9*(I+L).
+    # ProtParam doesn't include it directly; compute here.
+    # `amino_acids_percent` is a property returning fractions (0..1);
+    # older Biopython versions expose the same as get_amino_acids_percent().
+    # Use getattr to survive either API.
+    aa_pct = getattr(p, "amino_acids_percent", None)
+    if aa_pct is None:
+        aa_pct = p.get_amino_acids_percent()
+    aliphatic_index = (
+        aa_pct.get("A", 0) * 100
+        + 2.9 * aa_pct.get("V", 0) * 100
+        + 3.9 * (aa_pct.get("I", 0) + aa_pct.get("L", 0)) * 100
+    )
+
+    return {
+        "protein_sequence":    protein,
+        "protein_length":      len(protein),
+        "cleaned_length":      len(clean),
+        "nonstandard_dropped": nonstd_dropped,
+        "mw_da":               round(p.molecular_weight(), 2),
+        "mw_kda":              round(p.molecular_weight() / 1000.0, 3),
+        "pi":                  round(p.isoelectric_point(), 2),
+        "instability_index":   round(ii, 2),
+        "instability_class":   "unstable" if ii > 40 else "stable",
+        "gravy":               round(p.gravy(), 3),
+        "aromaticity":         round(p.aromaticity(), 3),
+        "aliphatic_index":     round(aliphatic_index, 2),
+        "extinction_280_oxidised": ext_ox,
+        "extinction_280_reduced":  ext_red,
+        "aa_percent":          {aa: round(pct * 100, 2) for aa, pct in aa_pct.items()},
+        "aa_count":            p.count_amino_acids(),
+        # Note about the source
+        "translated_from_dna": body.is_dna,
+        "frame":               body.frame if body.is_dna else None,
+    }

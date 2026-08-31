@@ -3000,6 +3000,7 @@ function _clRenderToolsTab() {
   h += '<button onclick="_saToolsRun(\x27complement\x27)" style="padding:.4rem .7rem;font-size:.78rem;background:#8E44AD;color:#fff;border:none;border-radius:4px;cursor:pointer;">Complement</button>';
   h += '<button onclick="_saToolsRun(\x27reverse\x27)" style="padding:.4rem .7rem;font-size:.78rem;background:#e67e22;color:#fff;border:none;border-radius:4px;cursor:pointer;">Reverse</button>';
   h += '<button onclick="_saToolsRun(\x27translate\x27)" style="padding:.4rem .7rem;font-size:.78rem;background:#2ecc71;color:#fff;border:none;border-radius:4px;cursor:pointer;">Translate</button>';
+  h += '<button onclick="_saToolsProteinAnalysis()" style="padding:.4rem .7rem;font-size:.78rem;background:#16a085;color:#fff;border:none;border-radius:4px;cursor:pointer;" title="Molecular weight, pI, instability index and more">Protein analysis</button>';
   h += '<button onclick="_saToolsTm()" style="padding:.4rem .7rem;font-size:.78rem;color:#5b7a5e;border:1px solid #5b7a5e;border-radius:4px;background:#fff;cursor:pointer;">\ud83c\udf21 Tm</button>';
   h += '</div>';
 
@@ -3516,6 +3517,138 @@ function _saToolsTm() {
       _clRender();
     }).catch(function(err) { toast('Error: ' + (err.message || err), true); });
 }
+
+// Protein analysis (ProtParam via backend). Uses whatever's in the Tools
+// textarea. If it looks like protein (has non-DNA letters), sends is_dna
+// = false; otherwise treats as DNA and translates in frame 1 (user can
+// change frame in the modal and re-run). Modal shows MW / pI /
+// instability / GRAVY / extinction / aa composition.
+function _saToolsProteinAnalysis() {
+  var raw = (_cl.sa.tools.input || '').trim();
+  if (!raw) { toast('Paste a DNA or protein sequence first', true); return; }
+  var isDna = _clLooksLikeDna(raw);
+  _clShowProteinAnalysisModal(raw, isDna, 1);
+}
+
+// Heuristic — treat as DNA if 90%+ of alphabetic characters are ATGCUN.
+// Otherwise it's a protein sequence.
+function _clLooksLikeDna(s) {
+  var letters = s.toUpperCase().replace(/[^A-Z]/g, '');
+  if (!letters) return true;
+  var dnaChars = letters.replace(/[^ATGCUN]/g, '').length;
+  return (dnaChars / letters.length) >= 0.9;
+}
+
+function _clShowProteinAnalysisModal(sequence, isDna, frame) {
+  // Kick off the fetch first, THEN render the modal so we can show a
+  // loading state and then update in place.
+  var existing = document.getElementById('cl-protein-modal');
+  if (existing) existing.remove();
+  var modal = document.createElement('div');
+  modal.id = 'cl-protein-modal';
+  modal.className = 'rem-notify-backdrop';  // reuse the same overlay CSS
+  modal.innerHTML =
+    '<div class="rem-notify-card" style="width:min(640px,92vw)">' +
+      '<div class="rem-notify-header">' +
+        '<h3>Protein analysis</h3>' +
+        '<button onclick="document.getElementById(\'cl-protein-modal\').remove()" title="Close">&times;</button>' +
+      '</div>' +
+      '<div class="rem-notify-body" id="cl-protein-body">' +
+        '<div style="text-align:center;padding:24px;color:#8a7f72">Computing\u2026</div>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+
+  api('POST', '/api/cloning/protein-analysis', {
+    sequence: sequence, is_dna: !!isDna, frame: frame || 1
+  }).then(function(data) {
+    var body = document.getElementById('cl-protein-body');
+    if (body) body.innerHTML = _clRenderProteinAnalysis(data, sequence, isDna, frame);
+  }).catch(function(err) {
+    var body = document.getElementById('cl-protein-body');
+    if (body) body.innerHTML = '<div style="color:#c0392b;padding:12px">Error: ' + esc(err.message || String(err)) + '</div>';
+  });
+}
+
+function _clRenderProteinAnalysis(d, srcSeq, isDna, currentFrame) {
+  // Row helper. Grouped by category.
+  function row(label, value, unit, hint) {
+    return '<tr>' +
+      '<td style="padding:4px 8px;color:#6a5f52;font-size:12px" title="' + (hint || '') + '">' + label + '</td>' +
+      '<td style="padding:4px 8px;font-family:monospace;font-size:13px;text-align:right">' + value + (unit ? ' <span style="color:#8a7f72;font-size:11px">' + unit + '</span>' : '') + '</td>' +
+    '</tr>';
+  }
+  var stableCol = d.instability_class === 'stable' ? '#5b7a5e' : '#c98a4a';
+
+  // Frame picker only if the input was DNA
+  var framePicker = '';
+  if (isDna) {
+    framePicker = '<div style="margin-bottom:10px;font-size:12px;color:#6a5f52">' +
+      'Reading frame: ' +
+      [1, 2, 3].map(function(f) {
+        var active = f === currentFrame;
+        return '<button onclick="_clShowProteinAnalysisModal(' +
+          JSON.stringify(srcSeq).replace(/"/g, '&quot;') + ',true,' + f + ')"' +
+          ' style="margin-left:4px;padding:2px 8px;border:1px solid ' + (active ? '#5b7a5e' : '#d5cec0') +
+          ';background:' + (active ? '#5b7a5e' : '#fff') + ';color:' + (active ? '#fff' : '#4a4139') +
+          ';border-radius:3px;cursor:pointer;font-size:11px">Frame ' + f + '</button>';
+      }).join('') +
+    '</div>';
+  }
+
+  // Warning if we dropped non-standard residues
+  var warn = '';
+  if (d.nonstandard_dropped > 0) {
+    warn = '<div style="background:#fef5e7;border:1px solid #e8d5a7;padding:6px 10px;border-radius:4px;font-size:12px;color:#8a6f4a;margin-bottom:10px">' +
+      '&#9888; Dropped ' + d.nonstandard_dropped + ' non-standard residue' +
+      (d.nonstandard_dropped === 1 ? '' : 's') + ' (X or ambiguous) before analysis.' +
+    '</div>';
+  }
+
+  // Amino acid composition — top 5 by frequency
+  var aaPairs = Object.keys(d.aa_percent).map(function(k) { return [k, d.aa_percent[k]]; });
+  aaPairs.sort(function(a, b) { return b[1] - a[1]; });
+  var aaTop = aaPairs.slice(0, 8).map(function(p) {
+    return '<span style="display:inline-block;margin:2px 4px;padding:2px 6px;background:#faf8f4;border:1px solid #e8e2d8;border-radius:3px;font-family:monospace;font-size:11px">' +
+      p[0] + ' ' + p[1].toFixed(1) + '%</span>';
+  }).join('');
+
+  return framePicker + warn +
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">' +
+      '<div>' +
+        '<h4 style="margin:0 0 6px;font-size:12px;color:#8a7f72;text-transform:uppercase;letter-spacing:.05em">Basic</h4>' +
+        '<table style="width:100%;border-collapse:collapse">' +
+          row('Length',              d.protein_length, 'aa') +
+          row('Molecular weight',    d.mw_kda,         'kDa', 'Monoisotopic MW of the protein chain') +
+          row('&nbsp;',              d.mw_da,          'Da') +
+          row('Isoelectric point',   d.pi,             '', 'pH at which the protein has no net charge') +
+        '</table>' +
+      '</div>' +
+      '<div>' +
+        '<h4 style="margin:0 0 6px;font-size:12px;color:#8a7f72;text-transform:uppercase;letter-spacing:.05em">Stability</h4>' +
+        '<table style="width:100%;border-collapse:collapse">' +
+          row('Instability index',   '<span style="color:' + stableCol + ';font-weight:600">' + d.instability_index + '</span>',
+              '', 'Guruprasad 1990. >40 predicts unstable in test tube.') +
+          row('&nbsp;',              '<span style="color:' + stableCol + ';font-size:11px">' + d.instability_class + '</span>', '') +
+          row('Aliphatic index',     d.aliphatic_index, '', 'Higher = more thermostable') +
+          row('GRAVY',               d.gravy,          '', 'Grand average hydropathy. + = hydrophobic') +
+          row('Aromaticity',         d.aromaticity,    '', 'Fraction F+Y+W') +
+        '</table>' +
+      '</div>' +
+    '</div>' +
+    '<h4 style="margin:12px 0 6px;font-size:12px;color:#8a7f72;text-transform:uppercase;letter-spacing:.05em">Extinction coefficient (280 nm)</h4>' +
+    '<table style="width:100%;border-collapse:collapse">' +
+      row('Oxidised (Cys form S-S)',   d.extinction_280_oxidised, 'M\u207B\u00B9 cm\u207B\u00B9') +
+      row('Reduced (Cys free)',        d.extinction_280_reduced,  'M\u207B\u00B9 cm\u207B\u00B9') +
+    '</table>' +
+    '<h4 style="margin:12px 0 6px;font-size:12px;color:#8a7f72;text-transform:uppercase;letter-spacing:.05em">Amino acid composition (top 8)</h4>' +
+    '<div>' + aaTop + '</div>' +
+    '<h4 style="margin:12px 0 6px;font-size:12px;color:#8a7f72;text-transform:uppercase;letter-spacing:.05em">Protein sequence</h4>' +
+    '<div style="font-family:monospace;font-size:11px;word-break:break-all;line-height:1.5;padding:8px;background:#faf8f4;border:1px solid #e8e2d8;border-radius:4px;max-height:120px;overflow:auto">' +
+      esc(d.protein_sequence) +
+    '</div>';
+}
+
 function _saToolsCopy() {
   if (_cl.sa.tools.result) { navigator.clipboard.writeText(_cl.sa.tools.result).then(function() { toast('Copied'); }); }
 }

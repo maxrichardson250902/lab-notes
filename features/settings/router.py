@@ -41,8 +41,23 @@ DEFAULTS = {
     # while still stamping natural break points. Manual Ctrl+T always
     # inserts regardless of this setting.
     "wf_chip_idle_minutes": 5,
+    # ── Archived DNA entries ──────────────────────────────────────────────
+    # Show archived DNA entries (plasmids, primers, gblocks, kit parts, parts).
+    # When off (default), rows with private=1 are filtered out at both the
+    # frontend list render AND the backend query WHERE clause. When on, they
+    # come through and each entry gets a per-row archive toggle in the UI.
+    # Deliberately named blandly — this is the visible label in the Settings
+    # view. Also serves as the visibility gate for personal work-in-progress
+    # / IP-sensitive entries the user doesn't want a shared viewer to see.
+    "show_archived_items": False,
+    # ── Reminders boot delay ──────────────────────────────────────────────
+    # Milliseconds to wait after page load before checking for due
+    # reminders and firing the pop-up notification. Higher = less chance
+    # of interrupting whatever you were about to do. Lower = pop-up
+    # appears sooner. The 60s poll after boot is unaffected.
+    "reminder_boot_delay_ms": 1500,
     # ── LLM backend selection ──────────────────────────────────────────────
-    # Which LLM backend the app uses for enrichment, predictions, protocol
+    # Which LLM backend the app uses for enrichment, protocol
     # extraction, Process Day, etc. "3090" = local GPU (free); "claude" =
     # Anthropic API (costs money, capped below); "local" = alias for 3090.
     "llm_backend": "3090",

@@ -577,13 +577,21 @@ function _remDoBrowserNotify(items) {
 
 // ── boot hook + poller ──────────────────────────────────────────────────
 // Runs at module load (bundled scripts execute at page load). Kicks off
-// an initial check + a 60s poller. The poller is cheap: a localStorage
-// read and a fetch only when a slot boundary is crossed.
+// an initial check + a 60s poller. The initial check delay reads from
+// S.settings.reminder_boot_delay_ms (default 1500ms) so users can tune
+// how quickly the pop-up appears on page load. The poller is cheap: a
+// localStorage read and a fetch only when a slot boundary is crossed.
 (function _remindersBootstrap() {
-  // Initial check on next tick — gives core.js a moment to finish loading
-  // settings and setting up S, so api() calls have any needed context.
-  setTimeout(_remindersCheckAndNotify, 1500);
-  // Poll every minute
+  // Settings may not be loaded at this exact moment (bundled script order
+  // has core.js first, but async settings-load may not have finished).
+  // Read the delay lazily inside a small wrapper.
+  function bootCheck() {
+    var delay = (typeof S !== 'undefined' && S.settings && S.settings.reminder_boot_delay_ms);
+    // Default to 1500 if the setting isn't loaded yet or is invalid.
+    if (typeof delay !== 'number' || delay < 0) delay = 1500;
+    setTimeout(_remindersCheckAndNotify, delay);
+  }
+  bootCheck();
   setInterval(_remindersCheckAndNotify, 60 * 1000);
 })();
 

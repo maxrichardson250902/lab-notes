@@ -62,6 +62,22 @@ var SETTINGS_SPEC = [
     step: 1,
     suffix: 'min',
   },
+  {
+    key: 'show_archived_items',
+    label: 'Show archived items',
+    hint: 'Include archived entries in DNA lists (plasmids, primers, gblocks, kit parts).',
+    type: 'toggle',
+  },
+  {
+    key: 'reminder_boot_delay_ms',
+    label: 'Reminder pop-up boot delay',
+    hint: 'Milliseconds to wait after page load before checking for due reminders. Higher = less likely to interrupt you as the page finishes loading.',
+    type: 'number',
+    min: 0,
+    max: 60000,
+    step: 500,
+    suffix: 'ms',
+  },
 ];
 
 async function renderSettings(el) {
@@ -82,7 +98,6 @@ async function renderSettings(el) {
     { value: 'summaries', label: 'Project Summaries' },
     { value: 'pipeline', label: 'Pipeline' },
     { value: 'timeline', label: 'Project Timelines' },
-    { value: 'predictions', label: 'Predicted Tasks' },
     { value: 'reminders', label: 'Reminders' },
     { value: 'cloning', label: 'Cloning Workbench' },
     { value: 'circuits', label: 'Circuits' },
