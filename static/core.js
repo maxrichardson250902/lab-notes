@@ -589,6 +589,23 @@ function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('collapsed', !S.sidebarOpen);
 }
 
+// Local-timezone date helpers. Use these ANYWHERE the app needs
+// "today's date" or "this Date's calendar day" for storage keys /
+// route params / UI display. Do NOT use `new Date().toISOString().
+// slice(0,10)` because that returns the UTC date — which is a day
+// behind local time for any user east of UTC when they're in the
+// first hour or two past midnight. The workflow view keys documents
+// by ISO date and hit exactly that bug for BST users.
+function toIsoLocal(d) {
+  var y = d.getFullYear();
+  var m = String(d.getMonth() + 1).padStart(2, '0');
+  var dd = String(d.getDate()).padStart(2, '0');
+  return y + '-' + m + '-' + dd;
+}
+function todayLocal() {
+  return toIsoLocal(new Date());
+}
+
 function formatDate(d) {
   const dt = new Date(d + 'T00:00:00');
   return dt.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });

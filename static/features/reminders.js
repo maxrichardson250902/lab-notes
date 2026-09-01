@@ -111,7 +111,7 @@ async function renderReminders(el) {
   if (reminderFilterGroup === '__none__') {
     reminders = reminders.filter(function(r) { return !r.group_name; });
   }
-  var today = new Date().toISOString().slice(0, 10);
+  var today = todayLocal();
 
   // Group datalist
   var groupOpts = '';

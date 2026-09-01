@@ -53,7 +53,7 @@ function renderImport(el){
               (section?esc(section)+' &middot; ':'')+
               (p.char_count||0)+' chars'+
               (p.image_count?' &middot; '+p.image_count+' img'+(p.image_count>1?'s':''):'')+
-              (p.date&&p.date!==new Date().toISOString().slice(0,10)?' &middot; '+esc(p.date):'')+
+              (p.date&&p.date!==todayLocal()?' &middot; '+esc(p.date):'')+
             '</div>'+
           '</div>'+
           '<select class="import-type-sel" data-idx="'+i+'" id="imp-type-'+i+'" style="width:90px" onclick="event.stopPropagation()">'+

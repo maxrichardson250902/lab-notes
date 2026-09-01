@@ -31,7 +31,7 @@ async function renderNotebook(el){
   S.entries=data.entries||[];
 
   var html='';
-  var todayStr=new Date().toISOString().slice(0,10);
+  var todayStr=todayLocal();
 
   // Dashboard cards
   if(todayData){

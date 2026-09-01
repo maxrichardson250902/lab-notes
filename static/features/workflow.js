@@ -1,5 +1,5 @@
 // ── DAILY WORKFLOW ───────────────────────────────────────────────────────────
-var _workflowDate = new Date().toISOString().slice(0, 10);
+var _workflowDate = todayLocal();
 var _wfNotebookGroups = [];    // cached from /api/entries
 var _wfSubgroupMap = {};       // {group: {subgroup: true}}
 var _wfProcessJobId = null;    // active process-day job ID
@@ -11,7 +11,7 @@ var _wfPollTimer = null;       // polling interval handle
    Switching modes calls loadView() which re-runs renderWorkflow, which
    branches on _workflowMode at the top. */
 var _workflowMode = 'write';   // 'write' | 'read'
-var _readWindowEnd = new Date().toISOString().slice(0, 10);  // ISO date; newest day in the window
+var _readWindowEnd = todayLocal();  // ISO date; newest day in the window
 var _readWindowDays = 30;      // window size
 
 /* ── Active project selector ────────────────────────────────────────────────
@@ -317,7 +317,7 @@ function _wfShiftReadWindow(delta) {
      Capped at today for the newer end. */
   var dt = new Date(_readWindowEnd + 'T12:00:00');
   dt.setDate(dt.getDate() + delta);
-  var today = new Date().toISOString().slice(0, 10);
+  var today = todayLocal();
   var iso = dt.toISOString().slice(0, 10);
   if (iso > today) iso = today;
   _readWindowEnd = iso;
@@ -348,7 +348,7 @@ async function renderWorkflow(el) {
   }
   var data    = await api('GET', '/api/workflow/' + _workflowDate);
   var entries = data.entries || [];
-  var today   = new Date().toISOString().slice(0, 10);
+  var today   = todayLocal();
   await _loadWfNotebookGroups();
   await _wfLoadKnownProjects();
 
@@ -377,7 +377,7 @@ async function renderWorkflow(el) {
        to keep the button compact: today shows "today", any other day shows
        "6 May" style. */
     (function() {
-      var todayStr = new Date().toISOString().slice(0, 10);
+      var todayStr = todayLocal();
       var label;
       if (_workflowDate === todayStr) {
         label = '&#9881; Process today';
@@ -865,7 +865,7 @@ function wfInsertTimeChip(opts) {
 var _wfRedactMode = false;
 
 function _wfIsPastDay() {
-  var today = new Date().toISOString().slice(0, 10);
+  var today = todayLocal();
   return _workflowDate < today;
 }
 
@@ -1871,7 +1871,7 @@ window.wfResetProcessDay  = wfResetProcessDay;
    ══════════════════════════════════════════════════════════════════════════ */
 
 async function _wfRenderReadMode(el) {
-  var today = new Date().toISOString().slice(0, 10);
+  var today = todayLocal();
   var end = _readWindowEnd;
   var days = _readWindowDays;
   // Compute window start for the label
@@ -2035,7 +2035,7 @@ async function _wfCalRender() {
   } catch(ex) { /* silent — dots just won't show */ }
   _wfCalState.populated = populated;
 
-  var today = new Date().toISOString().slice(0, 10);
+  var today = todayLocal();
   var selectedDate = _wfCalState.mode === 'read' ? _readWindowEnd : _workflowDate;
 
   var monthNames = ['January','February','March','April','May','June',
