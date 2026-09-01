@@ -117,17 +117,109 @@ _migrate()
 
 def _split_claude_sections(formatted: str) -> dict:
     """Split a Claude-formatted import block on === DELIMITER === markers.
-    Returns dict with keys 'STEPS', 'RECIPES', 'NOTES' (missing sections → '')."""
+    Returns dict with keys 'STEPS', 'RECIPES', 'METADATA', 'NOTES'
+    (missing sections → ''). METADATA is optional — older Claude output
+    (from before the prompt template was extended) won't have it,
+    which is fine: metadata_schema just stays unset."""
     # Match "=== NAME ===" at the start of a line
     parts = re.split(r'(?m)^===\s*([A-Z]+)\s*===\s*$', formatted)
     # re.split with a capturing group produces: [pre, name1, body1, name2, body2, ...]
-    out = {"STEPS": "", "RECIPES": "", "NOTES": ""}
+    out = {"STEPS": "", "RECIPES": "", "METADATA": "", "NOTES": ""}
     for i in range(1, len(parts) - 1, 2):
         name = parts[i].strip().upper()
         body = parts[i + 1].strip()
         if name in out:
             out[name] = body
     return out
+
+
+def _parse_metadata_block(block: str) -> Optional[str]:
+    """Turn the METADATA section into a JSON string suitable for storing in
+    protocols.metadata_schema, or None if the section is empty / unparseable.
+
+    Recognises two shapes the prompt asks Claude to produce:
+
+    1. Preset match — a single "Preset: <slug>" line where slug is a known
+       key in METADATA_PRESETS. Backend uses that preset's schema verbatim,
+       ignoring anything else in the block. Safest path — no risk of Claude
+       introducing typos in field names that the app later depends on.
+
+    2. Custom — "Preset: custom" line followed by a JSON object with a
+       `fields` array. May be wrapped in ```json ... ``` fences (which we
+       strip). Field shapes are validated loosely — anything malformed is
+       dropped rather than raising, so a partial parse still lands.
+
+    Returns a JSON string (already dumped) or None.
+    """
+    block = (block or "").strip()
+    if not block:
+        return None
+
+    # First line often carries "Preset: X". Peel it off and inspect.
+    lines = block.splitlines()
+    preset_slug = None
+    body_start = 0
+    for i, ln in enumerate(lines):
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        m = re.match(r'^preset\s*:\s*([a-z_][a-z0-9_]*)\s*$', stripped, re.I)
+        if m:
+            preset_slug = m.group(1).lower()
+            body_start = i + 1
+        break   # first non-blank line decides
+
+    # Preset match wins immediately — use the exact preset schema, ignore
+    # any following JSON. This is the "safe" path.
+    if preset_slug and preset_slug != "custom" and preset_slug in METADATA_PRESETS:
+        return json.dumps(METADATA_PRESETS[preset_slug]["schema"])
+
+    # Custom path — everything after the Preset: line is JSON. Strip code
+    # fences if present.
+    remainder = "\n".join(lines[body_start:]).strip()
+    if not remainder:
+        return None
+    # ```json ... ``` or ``` ... ``` fences
+    fence = re.match(r'^```(?:json)?\s*\n(.*?)\n```\s*$', remainder, re.S)
+    if fence:
+        remainder = fence.group(1).strip()
+
+    try:
+        parsed = json.loads(remainder)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("fields"), list):
+        return None
+
+    # Sanitise the fields list — drop anything malformed rather than raising,
+    # so a mostly-good schema still gets through.
+    clean_fields = []
+    for f in parsed["fields"]:
+        if not isinstance(f, dict): continue
+        fid = f.get("id"); label = f.get("label"); ftype = f.get("type", "text")
+        if not isinstance(fid, str) or not fid.strip(): continue
+        if not isinstance(label, str) or not label.strip(): continue
+        if ftype not in ("text", "number", "table"): continue
+        clean = {"id": fid.strip(), "label": label.strip(), "type": ftype}
+        if "default" in f and f["default"] not in (None, ""):
+            clean["default"] = f["default"]
+        if ftype == "table":
+            cols = f.get("columns")
+            if not isinstance(cols, list) or not cols: continue
+            clean_cols = []
+            for c in cols:
+                if not isinstance(c, dict): continue
+                cid = c.get("id"); clabel = c.get("label"); ctype = c.get("type", "text")
+                if not isinstance(cid, str) or not cid.strip(): continue
+                if not isinstance(clabel, str) or not clabel.strip(): continue
+                if ctype not in ("text", "number"): ctype = "text"
+                clean_cols.append({"id": cid.strip(), "label": clabel.strip(), "type": ctype})
+            if not clean_cols: continue
+            clean["columns"] = clean_cols
+        clean_fields.append(clean)
+    if not clean_fields:
+        return None
+    return json.dumps({"fields": clean_fields})
 
 
 def _parse_steps_block(block: str) -> str:
@@ -649,6 +741,11 @@ async def create_from_claude(body: ClaudeProtocol):
 
     steps_json  = _parse_steps_block(sections["STEPS"])   if sections["STEPS"]   else json.dumps([])
     recipe_json = _parse_recipes_block(sections["RECIPES"]) if sections["RECIPES"] else json.dumps(DEFAULT_RECIPE)
+    # Metadata schema is optional — older Claude output may not have this
+    # section, and _parse_metadata_block returns None if it's absent or
+    # unparseable. In both cases we leave metadata_schema NULL and the
+    # user can set it later via the schema editor.
+    metadata_schema = _parse_metadata_block(sections["METADATA"])
 
     # Notes from the pasted block get merged with any notes the user typed in
     # the form field (form notes come first, Claude notes appended).
@@ -659,10 +756,12 @@ async def create_from_claude(body: ClaudeProtocol):
 
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO protocols (title,source_type,url,source_text,steps,recipe,notes,tags,auto_complete,created,updated) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO protocols (title,source_type,url,source_text,steps,recipe,notes,tags,"
+            "auto_complete,metadata_schema,created,updated) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (body.title, "claude", None, None, steps_json, recipe_json,
-             combined_notes, json.dumps(body.tags), body.auto_complete, now, now))
+             combined_notes, json.dumps(body.tags), body.auto_complete,
+             metadata_schema, now, now))
         conn.commit()
         proto = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -676,9 +775,16 @@ async def create_from_claude(body: ClaudeProtocol):
         table_count = len(r) if isinstance(r, list) else (1 if isinstance(r, dict) and r.get("columns") and r.get("rows") else 0)
     except Exception:
         table_count = 0
+    metadata_field_count = 0
+    if metadata_schema:
+        try:
+            metadata_field_count = len(json.loads(metadata_schema).get("fields", []))
+        except Exception:
+            pass
 
     return {**proto, "steps_parsed": step_count, "tables_parsed": table_count,
-            "notes_appended": bool(sections["NOTES"].strip())}
+            "notes_appended": bool(sections["NOTES"].strip()),
+            "metadata_fields_parsed": metadata_field_count}
 
 
 @router.post("/protocols/from-manual")
@@ -753,6 +859,11 @@ def import_from_claude(protocol_id: int, body: ImportFromClaude):
 
     steps_json = _parse_steps_block(sections["STEPS"]) if sections["STEPS"] else None
     recipe_json = _parse_recipes_block(sections["RECIPES"]) if sections["RECIPES"] else None
+    # metadata_schema: parse the METADATA section. If the section is
+    # absent or unparseable, keep whatever's already stored on the
+    # protocol — this endpoint is used to REFRESH a Claude import, so
+    # skipping a bad metadata block shouldn't nuke a good manual one.
+    new_metadata = _parse_metadata_block(sections["METADATA"]) if sections["METADATA"] else None
 
     # Notes: append with a separator so any manual context already there survives.
     new_notes = p.get("notes") or ""
@@ -764,13 +875,14 @@ def import_from_claude(protocol_id: int, body: ImportFromClaude):
             new_notes = addition
 
     now = datetime.utcnow().isoformat()
-    final_steps  = steps_json  if steps_json  is not None else p.get("steps")
-    final_recipe = recipe_json if recipe_json is not None else p.get("recipe")
+    final_steps    = steps_json    if steps_json    is not None else p.get("steps")
+    final_recipe   = recipe_json   if recipe_json   is not None else p.get("recipe")
+    final_metadata = new_metadata  if new_metadata  is not None else p.get("metadata_schema")
 
     with get_db() as conn:
         conn.execute(
-            "UPDATE protocols SET steps=?, recipe=?, notes=?, updated=? WHERE id=?",
-            (final_steps, final_recipe, new_notes, now, protocol_id))
+            "UPDATE protocols SET steps=?, recipe=?, notes=?, metadata_schema=?, updated=? WHERE id=?",
+            (final_steps, final_recipe, new_notes, final_metadata, now, protocol_id))
         conn.commit()
         updated = dict(conn.execute("SELECT * FROM protocols WHERE id=?", (protocol_id,)).fetchone())
 
@@ -784,10 +896,17 @@ def import_from_claude(protocol_id: int, body: ImportFromClaude):
         table_count = len(r) if isinstance(r, list) else (1 if isinstance(r, dict) and r.get("columns") else 0)
     except Exception:
         table_count = 0
+    metadata_field_count = 0
+    if new_metadata:
+        try:
+            metadata_field_count = len(json.loads(new_metadata).get("fields", []))
+        except Exception:
+            pass
 
     return {"protocol": updated, "steps_parsed": step_count,
             "tables_parsed": table_count,
-            "notes_appended": bool(sections["NOTES"].strip())}
+            "notes_appended": bool(sections["NOTES"].strip()),
+            "metadata_fields_parsed": metadata_field_count}
 
 
 @router.post("/protocols/{protocol_id}/clone")

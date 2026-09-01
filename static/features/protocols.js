@@ -790,6 +790,55 @@ var PROTO_CLAUDE_PROMPT_TEMPLATE = [
   "|-----------|-------|-------------|-------|",
   "| Buffer    | 5x    | 5           | 1x    |",
   "",
+  "=== METADATA ===",
+  "Metadata is the per-run data the user will fill in each time they run",
+  "this protocol — primer names, sample IDs, observed values. Different",
+  "from recipes (fixed reagents) and steps (procedure).",
+  "",
+  "The app has these preset schemas. If the protocol closely matches one,",
+  "output the preset slug alone. If not, output \"Preset: custom\" then a",
+  "JSON schema. Preset match is preferred — it's more robust than custom",
+  "JSON and links the protocol to app features (e.g. gel loaders read",
+  "the wells table from dna_gel / sds_page presets).",
+  "",
+  "  colony_pcr         Colony screening PCR — primers, anneal temp, cycles,",
+  "                     polymerase, table of colonies with result column.",
+  "  standard_pcr       Regular PCR — primers, template, template ng, anneal",
+  "                     temp, cycles, polymerase, expected product size.",
+  "  dna_gel            Agarose gel — agarose %, buffer, voltage, run time,",
+  "                     ladder, wells table (lane/sample/volume/expected size).",
+  "  sds_page           Protein gel — gel %, running buffer, voltage, time,",
+  "                     ladder, stain, wells table (lane/sample/volume/notes).",
+  "  transformation     Bacterial transformation — competent strain, plasmid,",
+  "                     DNA ng, selection antibiotic, recovery, plated volume,",
+  "                     colonies observed.",
+  "  miniprep           Plasmid miniprep — kit, culture volume, samples table",
+  "                     (ID, yield ng/uL, A260/A280, A260/A230).",
+  "  restriction_digest Restriction digest — enzymes, buffer, template, template",
+  "                     ng, incubation temp, time, final volume.",
+  "",
+  "Format 1 (matches a preset — preferred):",
+  "  Preset: colony_pcr",
+  "",
+  "Format 2 (custom — only when no preset fits):",
+  "  Preset: custom",
+  "  {",
+  "    \"fields\": [",
+  "      {\"id\": \"primer_fwd\", \"label\": \"Forward primer\", \"type\": \"text\"},",
+  "      {\"id\": \"anneal_c\",   \"label\": \"Annealing (°C)\", \"type\": \"number\", \"default\": 55},",
+  "      {\"id\": \"samples\",    \"label\": \"Samples\",       \"type\": \"table\",",
+  "        \"columns\": [",
+  "          {\"id\": \"lane\",   \"label\": \"Lane\",   \"type\": \"number\"},",
+  "          {\"id\": \"sample\", \"label\": \"Sample\", \"type\": \"text\"}",
+  "        ]}",
+  "    ]",
+  "  }",
+  "",
+  "Field types: text, number, table (with columns of type text or number).",
+  "IDs are lowercase snake_case keys the app uses internally; labels are",
+  "what the user sees. Only include fields the user needs to fill in per",
+  "run — fixed reagents go in RECIPES, procedure in STEPS.",
+  "",
   "=== NOTES ===",
   "Warnings, tips, or context worth preserving. Free text.",
   "",
@@ -802,7 +851,7 @@ var PROTO_CLAUDE_PROMPT_TEMPLATE = [
   "  25 uL\". The totals row treats this as the final volume rather than",
   "  adding it to the running sum, and scaling multiplies through it.",
   "- If a section has no content, still include the delimiter with nothing",
-  "  under it.",
+  "  under it. METADATA can be empty if the protocol has no per-run inputs.",
   "- Output ONLY the delimited block — no other text.",
   "",
   "--- PROTOCOL TO FORMAT ---",
@@ -923,6 +972,7 @@ async function protoAddFromClaude() {
     _tagState['import-claude']=[];
     await loadView();
     var msg='Saved: '+(data.steps_parsed||0)+' step(s), '+(data.tables_parsed||0)+' table(s)';
+    if (data.metadata_fields_parsed) msg += ', '+data.metadata_fields_parsed+' metadata field(s)';
     toast(msg);
   }catch(e){toast('Failed: '+(e.message||e),true);}
   finally{if(btn){btn.textContent='Save Protocol';btn.disabled=false;}}
@@ -1003,6 +1053,7 @@ async function protoSubmitClaudeImport(pid) {
     var li = document.getElementById('pli-'+pid);
     if (li) { var w = document.createElement('div'); w.innerHTML = _compactCard(p); li.replaceWith(w.firstChild); }
     var msg = 'Imported: ' + data.steps_parsed + ' step(s), ' + data.tables_parsed + ' table(s)';
+    if (data.metadata_fields_parsed) msg += ', ' + data.metadata_fields_parsed + ' metadata field(s)';
     if (data.notes_appended) msg += ', notes appended';
     toast(msg);
   } catch(e) {

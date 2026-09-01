@@ -887,7 +887,10 @@ function gelDrawOnCtx(ctx, w, h, opts) {
      labels sit in the RIGHT PAD ZONE, left-aligned so their left
      edge lands just after the tick line at cr.left + cr.w. */
   if (G.annotations.expectedMarks && G.annotations.expectedMarks.length) {
-    var padRightPx = (typeof G._padF !== 'undefined' && G._padF) ? (canvasW * G._padF.fRight) : 0;
+    // Right pad space = canvas width - (content left + content width).
+    // Compute from the content rect directly so we don't have to trust
+    // G._padF (which may be stale/missing on the very first paint).
+    var padRightPx = Math.max(0, w - (cr.left + cr.w));
     G.annotations.expectedMarks.forEach(function(m, i) {
       var dispNYe = gelViewNYtoDispN(m.y);
       if (dispNYe === null) return;

@@ -412,24 +412,49 @@ async function ppSave(pid) {
    Usage:
      window.papersOpenPicker(function(paper) { ... });
 
-   Renders a modal overlay with a search box; user picks a result or clicks
-   "add new" to create a paper inline. Callback receives the paper record
-   (or null if the user closed without picking).
+   Renders a centered modal overlay with a search input and results list.
+   Prominent "+ New paper" action in the header for adding an unlisted
+   reference inline. Callback receives the paper record (or null if the
+   user dismissed without picking).
+
+   Dismissal is handled by three paths, all of which converge on
+   ppPickerClose so the callback runs exactly once and DOM/keyboard
+   listeners are cleaned up:
+     - backdrop click
+     - Escape key (only when THIS picker is the top-most overlay — see
+       _ppEscHandler for the delegation logic that fixes the "opens
+       inside a refs modal, Escape closes the wrong one" bug)
+     - close (✕) button
 */
 window.papersOpenPicker = function(onSelect) {
+  // Guard against a stale picker if a previous call didn't clean up
+  var stale = document.querySelector('.pp-picker-overlay');
+  if (stale) stale.remove();
+
   var overlay = document.createElement('div');
   overlay.className = 'pp-picker-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', 'Add reference');
   overlay.innerHTML =
-    '<div class="pp-picker">' +
+    '<div class="pp-picker" onclick="event.stopPropagation()">' +
       '<div class="pp-picker-hdr">' +
-        '<div style="font-weight:600">Add reference</div>' +
-        '<button class="pp-picker-close" onclick="ppPickerClose()">✕</button>' +
+        '<div class="pp-picker-title">Add reference</div>' +
+        '<div class="pp-picker-hdr-actions">' +
+          '<button class="pp-btn-ghost pp-btn-sm" onclick="ppPickerNew()">+ New paper</button>' +
+          '<button class="pp-picker-close" onclick="ppPickerClose()" aria-label="Close" title="Close (Esc)">&times;</button>' +
+        '</div>' +
       '</div>' +
-      '<input type="text" id="pp-picker-q" class="pp-input" placeholder="Search title, author, DOI…">' +
-      '<div id="pp-picker-results" class="pp-picker-results"></div>' +
-      '<div class="pp-picker-add">' +
-        '<span style="color:#8a7f72;font-size:.82rem">Not in library?</span> ' +
-        '<button class="pp-btn-ghost pp-btn-sm" onclick="ppPickerNew()">+ Add new paper</button>' +
+      '<div class="pp-picker-search">' +
+        '<span class="pp-picker-search-icon" aria-hidden="true">🔍</span>' +
+        '<input type="text" id="pp-picker-q" class="pp-picker-input" ' +
+               'placeholder="Search by title, author, or DOI\u2026" autocomplete="off">' +
+      '</div>' +
+      '<div id="pp-picker-results" class="pp-picker-results" tabindex="-1"></div>' +
+      '<div class="pp-picker-footer">' +
+        '<span class="pp-picker-hint">Not in your library? ' +
+          '<button class="pp-picker-link" onclick="ppPickerNew()">Add it now &rarr;</button>' +
+        '</span>' +
       '</div>' +
     '</div>';
   document.body.appendChild(overlay);
@@ -441,29 +466,56 @@ window.papersOpenPicker = function(onSelect) {
     if (e.target === overlay) ppPickerClose();
   });
 
+  // Escape handling — registered on document so it works whatever has
+  // focus. _ppEscRegister only closes the top-most overlay so nested
+  // pickers (e.g. picker opened from inside a refs modal) don't
+  // accidentally close both.
+  _ppEscRegister(overlay, ppPickerClose);
+
   var input = document.getElementById('pp-picker-q');
   var results = document.getElementById('pp-picker-results');
   var t;
+  var lastQuery = null;   // dedupe identical searches from arrow keys etc.
   function search() {
     clearTimeout(t);
+    var q = input.value.trim();
+    if (q === lastQuery) return;
+    lastQuery = q;
     t = setTimeout(async function() {
-      var q = input.value.trim();
+      // Loading state — small skeleton so the results area doesn't
+      // just go blank while the request is in flight.
+      results.innerHTML = '<div class="pp-picker-loading">Searching\u2026</div>';
       try {
         var data = await api('GET', '/api/papers' + (q ? ('?q=' + encodeURIComponent(q)) : ''));
-        _renderPickerResults(results, data.items || []);
+        _renderPickerResults(results, data.items || [], q);
       } catch (e) {
-        results.innerHTML = '<div class="pp-empty">Search failed</div>';
+        results.innerHTML = '<div class="pp-picker-empty">Search failed. Try again.</div>';
       }
     }, 180);
   }
   input.addEventListener('input', search);
+  // Enter picks the first result if there is one, else opens Add-new.
+  input.addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    var first = results.querySelector('.pp-picker-item');
+    if (first) first.click();
+    else ppPickerNew();
+  });
   input.focus();
   search();
 };
 
-function _renderPickerResults(el, items) {
+function _renderPickerResults(el, items, query) {
   if (!items.length) {
-    el.innerHTML = '<div class="pp-picker-empty">No papers match. Try broadening the search, or add a new paper.</div>';
+    var msg = query
+      ? 'No papers match \u201C' + esc(query) + '\u201D.'
+      : 'Your library is empty — add your first paper.';
+    el.innerHTML =
+      '<div class="pp-picker-empty">' +
+        '<div class="pp-picker-empty-msg">' + msg + '</div>' +
+        '<button class="pp-btn-pri pp-btn-sm" onclick="ppPickerNew()">+ Add a new paper</button>' +
+      '</div>';
     return;
   }
   var h = '';
@@ -473,19 +525,21 @@ function _renderPickerResults(el, items) {
              authors.length === 1 ? authors[0] :
              authors.length <= 3  ? authors.join(', ') :
                                     authors[0] + ' et al.';
-    h += '<div class="pp-picker-item" onclick="ppPickerSelect(' + p.id + ')">';
+    var meta = [au, p.year || '', p.journal || ''].filter(Boolean).map(esc).join(' \u00b7 ');
+    h += '<div class="pp-picker-item" onclick="ppPickerSelect(' + p.id + ')" tabindex="0" ' +
+         'onkeydown="if(event.key===\'Enter\'){event.preventDefault();ppPickerSelect(' + p.id + ')}">';
     h += '<div class="pp-picker-item-title">' + esc(p.title) + '</div>';
-    h += '<div class="pp-picker-item-meta">' + esc(au) +
-         (p.year ? ' · ' + p.year : '') +
-         (p.journal ? ' · ' + esc(p.journal) : '') + '</div>';
+    if (meta) h += '<div class="pp-picker-item-meta">' + meta + '</div>';
     h += '</div>';
   });
+  if (items.length > 20) {
+    h += '<div class="pp-picker-truncated">Showing first 20 \u2014 refine the search to see more</div>';
+  }
   el.innerHTML = h;
 }
 
 function ppPickerSelect(pid) {
   var picked = (PP.items || []).find(function(x){return x.id===pid;});
-  // Fall back to fetching if not in the local list (e.g. results loaded from search)
   if (picked) {
     var cb = PP._pickerCallback;
     ppPickerClose();
@@ -501,45 +555,96 @@ function ppPickerSelect(pid) {
 
 function ppPickerClose() {
   if (PP._pickerOverlay) {
+    _ppEscUnregister(PP._pickerOverlay);
     PP._pickerOverlay.remove();
     PP._pickerOverlay = null;
   }
   PP._pickerCallback = null;
 }
 
-/* When the user wants to add a new paper mid-pick — leave the picker up but
-   show a compact inline form. On save, the created paper is returned via the
-   picker callback. */
+/* Escape-key delegation for all overlays that call _ppEscRegister.
+   Only the LAST-registered (i.e. top-most in stacking order) overlay
+   handles a keypress. That fixes the case where a picker is opened
+   from inside a refs modal — Escape closes only the picker on top,
+   leaving the modal beneath intact for the next keypress.
+
+   Overlays are tracked in _ppEscStack, oldest first. Register on open,
+   unregister on close. The single document-level keydown listener is
+   installed lazily on first registration and never removed (harmless
+   when the stack is empty). */
+var _ppEscStack = [];
+function _ppEscRegister(overlay, closer) {
+  _ppEscStack.push({ overlay: overlay, closer: closer });
+  if (!_ppEscHandlerInstalled) {
+    document.addEventListener('keydown', _ppEscHandler);
+    _ppEscHandlerInstalled = true;
+  }
+}
+function _ppEscUnregister(overlay) {
+  _ppEscStack = _ppEscStack.filter(function(e) { return e.overlay !== overlay; });
+}
+var _ppEscHandlerInstalled = false;
+function _ppEscHandler(e) {
+  if (e.key !== 'Escape' || !_ppEscStack.length) return;
+  // Ignore if the active element is a text input where Esc might have
+  // its own semantics (browser default: cancel IME composition). We
+  // still close, but preventDefault to stop bubbling to other handlers.
+  e.preventDefault();
+  var top = _ppEscStack[_ppEscStack.length - 1];
+  if (top && typeof top.closer === 'function') top.closer();
+}
+
+/* When the user wants to add a new paper mid-pick — replace the picker
+   contents with a compact form. On save, the created paper is returned
+   via the picker callback. Keeps the same overlay so Escape delegation
+   stays consistent. */
 function ppPickerNew() {
   var overlay = PP._pickerOverlay;
   if (!overlay) return;
   var picker = overlay.querySelector('.pp-picker');
   picker.innerHTML =
     '<div class="pp-picker-hdr">' +
-      '<div style="font-weight:600">Add new paper</div>' +
-      '<button class="pp-picker-close" onclick="ppPickerClose()">✕</button>' +
+      '<div class="pp-picker-title">Add new paper</div>' +
+      '<div class="pp-picker-hdr-actions">' +
+        '<button class="pp-btn-ghost pp-btn-sm" onclick="ppPickerBackToSearch()">&larr; Search library</button>' +
+        '<button class="pp-picker-close" onclick="ppPickerClose()" aria-label="Close" title="Close (Esc)">&times;</button>' +
+      '</div>' +
     '</div>' +
-    '<label class="pp-label">DOI</label>' +
-    '<div style="display:flex;gap:8px">' +
-      '<input type="text" id="pp-pk-doi" class="pp-input" placeholder="10.xxxx/…" style="flex:1">' +
-      '<button class="pp-btn-ghost" onclick="ppPickerLookup()" id="pp-pk-lookup">Look up</button>' +
+    '<div class="pp-picker-form">' +
+      '<div class="pp-picker-field">' +
+        '<label class="pp-label" for="pp-pk-doi">DOI <span class="pp-hint">optional — look up to auto-fill</span></label>' +
+        '<div class="pp-picker-doi-row">' +
+          '<input type="text" id="pp-pk-doi" class="pp-input" placeholder="10.xxxx/\u2026">' +
+          '<button class="pp-btn-ghost" onclick="ppPickerLookup()" id="pp-pk-lookup">Look up</button>' +
+        '</div>' +
+        '<div id="pp-pk-msg" class="pp-lookup-msg"></div>' +
+      '</div>' +
+      '<div class="pp-picker-field">' +
+        '<label class="pp-label" for="pp-pk-title">Title <span class="pp-hint">required</span></label>' +
+        '<input type="text" id="pp-pk-title" class="pp-input" required>' +
+      '</div>' +
+      '<div class="pp-picker-field">' +
+        '<label class="pp-label" for="pp-pk-authors">Authors <span class="pp-hint">one per line</span></label>' +
+        '<textarea id="pp-pk-authors" class="pp-input" rows="2"></textarea>' +
+      '</div>' +
+      '<div class="pp-picker-row">' +
+        '<div class="pp-picker-field" style="flex:2">' +
+          '<label class="pp-label" for="pp-pk-journal">Journal</label>' +
+          '<input type="text" id="pp-pk-journal" class="pp-input">' +
+        '</div>' +
+        '<div class="pp-picker-field" style="flex:1">' +
+          '<label class="pp-label" for="pp-pk-year">Year</label>' +
+          '<input type="number" id="pp-pk-year" class="pp-input">' +
+        '</div>' +
+      '</div>' +
+      '<div class="pp-picker-field">' +
+        '<label class="pp-label" for="pp-pk-url">URL</label>' +
+        '<input type="text" id="pp-pk-url" class="pp-input" placeholder="https://\u2026">' +
+      '</div>' +
     '</div>' +
-    '<div id="pp-pk-msg" class="pp-lookup-msg"></div>' +
-    '<label class="pp-label" style="margin-top:10px">Title *</label>' +
-    '<input type="text" id="pp-pk-title" class="pp-input">' +
-    '<label class="pp-label" style="margin-top:10px">Authors <span class="pp-hint">(one per line)</span></label>' +
-    '<textarea id="pp-pk-authors" class="pp-input" rows="2"></textarea>' +
-    '<div style="display:flex;gap:10px;margin-top:10px">' +
-      '<div style="flex:2"><label class="pp-label">Journal</label>' +
-      '<input type="text" id="pp-pk-journal" class="pp-input"></div>' +
-      '<div style="flex:1"><label class="pp-label">Year</label>' +
-      '<input type="number" id="pp-pk-year" class="pp-input"></div>' +
-    '</div>' +
-    '<label class="pp-label" style="margin-top:10px">URL</label>' +
-    '<input type="text" id="pp-pk-url" class="pp-input">' +
-    '<div class="pp-actions">' +
-      '<button class="pp-btn-ghost" onclick="ppPickerBackToSearch()">← Search instead</button>' +
-      '<button class="pp-btn-pri" onclick="ppPickerSaveNew()">Add & attach</button>' +
+    '<div class="pp-picker-footer pp-picker-footer-actions">' +
+      '<button class="pp-btn-ghost" onclick="ppPickerBackToSearch()">Cancel</button>' +
+      '<button class="pp-btn-pri" onclick="ppPickerSaveNew()">Add &amp; attach</button>' +
     '</div>';
 
   var doi = document.getElementById('pp-pk-doi');
@@ -727,32 +832,36 @@ window.papersOpenRefsModal = function(entity_type, entity_id, title) {
 
   var overlay = document.createElement('div');
   overlay.className = 'pp-refs-modal-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
   overlay.innerHTML =
-    '<div class="pp-refs-modal">' +
+    '<div class="pp-refs-modal" onclick="event.stopPropagation()">' +
       '<div class="pp-refs-modal-hdr">' +
-        '<div class="pp-refs-modal-title">References' + (title ? ' — ' + esc(title) : '') + '</div>' +
-        '<button class="pp-picker-close" onclick="this.closest(\'.pp-refs-modal-overlay\').remove()">✕</button>' +
+        '<div class="pp-refs-modal-title">References' + (title ? ' \u2014 ' + esc(title) : '') + '</div>' +
+        '<button class="pp-picker-close" onclick="_ppRefsModalClose()" aria-label="Close" title="Close (Esc)">&times;</button>' +
       '</div>' +
       '<div class="pp-refs-modal-body" id="pp-refs-modal-body"></div>' +
     '</div>';
   document.body.appendChild(overlay);
   overlay.addEventListener('click', function(e) {
-    if (e.target === overlay) overlay.remove();
+    if (e.target === overlay) _ppRefsModalClose();
   });
 
-  // Escape key closes
-  var onEsc = function(e) {
-    if (e.key === 'Escape') {
-      overlay.remove();
-      document.removeEventListener('keydown', onEsc);
-    }
-  };
-  document.addEventListener('keydown', onEsc);
+  // Delegated Escape — closes only the top-most overlay, so a picker
+  // opened from the "+ Add" button inside this modal will close on the
+  // first Escape and this modal on the second, rather than both at once.
+  _ppEscRegister(overlay, _ppRefsModalClose);
 
   var body = document.getElementById('pp-refs-modal-body');
-  // Reuse the standard inline renderer inside the modal shell.
   window.papersRenderReferencesInto(body, entity_type, entity_id);
 };
+
+function _ppRefsModalClose() {
+  var overlay = document.querySelector('.pp-refs-modal-overlay');
+  if (!overlay) return;
+  _ppEscUnregister(overlay);
+  overlay.remove();
+}
 
 /* ── STYLES ───────────────────────────────────────────────────────── */
 function ppStyles() {
@@ -805,19 +914,46 @@ textarea.pp-input{font-family:inherit;resize:vertical}\
 .pp-lookup-msg.ok{color:#5b7a5e}\
 .pp-lookup-msg.warn{color:#c9a84c}\
 .pp-lookup-msg.err{color:#c25a4a}\
-.pp-picker-overlay{position:fixed;inset:0;background:rgba(74,65,57,.4);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding-top:80px}\
-.pp-picker{width:min(560px,92vw);background:#faf8f4;border:1px solid #d5cec0;border-radius:10px;padding:18px;box-shadow:0 12px 40px rgba(0,0,0,.2);max-height:calc(100vh - 120px);display:flex;flex-direction:column}\
-.pp-picker-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}\
-.pp-picker-close{background:none;border:none;color:#8a7f72;font-size:1.1rem;cursor:pointer;padding:2px 6px}\
-.pp-picker-close:hover{color:#4a4139}\
-.pp-picker-results{margin-top:10px;overflow-y:auto;max-height:340px;border:1px solid #ece7dd;border-radius:6px;background:#fff;flex:1;min-height:120px}\
-.pp-picker-empty{padding:24px;text-align:center;color:#8a7f72;font-size:.85rem}\
-.pp-picker-item{padding:10px 12px;border-bottom:1px solid #ece7dd;cursor:pointer}\
-.pp-picker-item:last-child{border-bottom:none}\
-.pp-picker-item:hover{background:#faf8f4}\
-.pp-picker-item-title{font-weight:600;color:#4a4139;font-size:.88rem;line-height:1.35}\
-.pp-picker-item-meta{color:#8a7f72;font-size:.78rem;margin-top:2px}\
-.pp-picker-add{margin-top:12px;text-align:right}\
+/* Picker overlay — centred, not top-anchored; warm backdrop with subtle fade+rise animation. */\
+.pp-picker-overlay{position:fixed;inset:0;background:rgba(74,65,57,.42);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;animation:pp-fade-in 120ms ease-out}\
+@keyframes pp-fade-in{from{opacity:0}to{opacity:1}}\
+@keyframes pp-rise-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}\
+.pp-picker{width:min(600px,100%);background:#faf8f4;border:1px solid #d5cec0;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.22),0 2px 6px rgba(0,0,0,.08);max-height:min(720px,calc(100vh - 32px));display:flex;flex-direction:column;overflow:hidden;animation:pp-rise-in 140ms ease-out}\
+.pp-picker-hdr{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #ece7dd;background:#f5f1ea;flex-shrink:0}\
+.pp-picker-title{font-weight:600;color:#4a4139;font-size:1.02rem;letter-spacing:.005em}\
+.pp-picker-hdr-actions{display:flex;gap:6px;align-items:center}\
+.pp-picker-close{background:none;border:none;color:#8a7f72;font-size:1.5rem;line-height:1;cursor:pointer;padding:4px 10px;border-radius:6px;font-weight:400;transition:background 120ms,color 120ms}\
+.pp-picker-close:hover{background:#ece7dd;color:#4a4139}\
+/* Search row — icon prefix on the input, no double border */\
+.pp-picker-search{position:relative;padding:14px 20px 10px;flex-shrink:0}\
+.pp-picker-search-icon{position:absolute;left:32px;top:50%;transform:translateY(-20%);font-size:.9rem;color:#a89e91;pointer-events:none;line-height:1}\
+.pp-picker-input{width:100%;box-sizing:border-box;padding:10px 12px 10px 36px;border:1px solid #d5cec0;border-radius:8px;background:#fff;font-size:.92rem;color:#4a4139;font-family:inherit;transition:border-color 120ms,box-shadow 120ms}\
+.pp-picker-input:focus{outline:none;border-color:#5b7a5e;box-shadow:0 0 0 3px rgba(91,122,94,.15)}\
+/* Results — flex-1 so it stretches to fill remaining modal height */\
+.pp-picker-results{flex:1;overflow-y:auto;min-height:200px;padding:0 8px 8px}\
+.pp-picker-loading{padding:32px;text-align:center;color:#a89e91;font-size:.85rem}\
+.pp-picker-empty{padding:40px 24px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:14px}\
+.pp-picker-empty-msg{color:#8a7f72;font-size:.9rem;line-height:1.5;max-width:340px}\
+.pp-picker-item{padding:11px 14px;border-radius:8px;cursor:pointer;margin:2px 4px;transition:background 100ms;outline:none}\
+.pp-picker-item:hover,.pp-picker-item:focus{background:#f0ebe0}\
+.pp-picker-item:focus{box-shadow:0 0 0 2px rgba(91,122,94,.35)}\
+.pp-picker-item-title{font-weight:600;color:#4a4139;font-size:.9rem;line-height:1.4}\
+.pp-picker-item-meta{color:#8a7f72;font-size:.78rem;margin-top:3px;line-height:1.3}\
+.pp-picker-truncated{padding:10px 14px;color:#a89e91;font-size:.75rem;font-style:italic;text-align:center}\
+/* Footer — subtle hint pattern by default, action row when adding new */\
+.pp-picker-footer{padding:12px 20px;border-top:1px solid #ece7dd;background:#f5f1ea;flex-shrink:0}\
+.pp-picker-footer-actions{display:flex;justify-content:flex-end;gap:8px}\
+.pp-picker-hint{color:#8a7f72;font-size:.82rem}\
+.pp-picker-link{background:none;border:none;color:#5b7a5e;font-size:.82rem;cursor:pointer;padding:0;font-family:inherit;text-decoration:underline;text-decoration-color:rgba(91,122,94,.4);text-underline-offset:2px}\
+.pp-picker-link:hover{text-decoration-color:#5b7a5e}\
+/* Add-new form */\
+.pp-picker-form{padding:16px 20px;overflow-y:auto;flex:1}\
+.pp-picker-field{margin-bottom:12px}\
+.pp-picker-field:last-child{margin-bottom:0}\
+.pp-picker-row{display:flex;gap:12px}\
+.pp-picker-doi-row{display:flex;gap:8px}\
+.pp-picker-doi-row .pp-input{flex:1}\
+/* Refs modal — same design language as the picker */\
 .pp-refs-box{margin-top:14px;padding:12px 14px;background:#faf8f4;border:1px solid #ece7dd;border-radius:6px}\
 .pp-refs-compact{padding:10px 12px;font-size:.85rem}\
 .pp-refs-hdr{display:flex;justify-content:space-between;align-items:center;font-variant:small-caps;font-size:.72rem;letter-spacing:.12em;color:#8a7f72;margin-bottom:8px}\
@@ -832,11 +968,11 @@ textarea.pp-input{font-family:inherit;resize:vertical}\
 .pp-refs-item-doi:hover{color:#4a6a4d}\
 .pp-refs-item-x{background:none;border:none;color:#a89e91;cursor:pointer;font-size:.85rem;padding:2px 6px;border-radius:3px}\
 .pp-refs-item-x:hover{color:#c25a4a;background:#faf0ee}\
-.pp-refs-modal-overlay{position:fixed;inset:0;background:rgba(74,65,57,.4);z-index:9999;display:flex;align-items:flex-start;justify-content:center;padding-top:80px}\
-.pp-refs-modal{width:min(620px,92vw);background:#faf8f4;border:1px solid #d5cec0;border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,.2);max-height:calc(100vh - 120px);display:flex;flex-direction:column;overflow:hidden}\
-.pp-refs-modal-hdr{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #ece7dd;background:#f5f1ea}\
-.pp-refs-modal-title{font-weight:600;color:#4a4139;font-size:.95rem}\
-.pp-refs-modal-body{padding:14px 18px;overflow-y:auto;flex:1}\
+.pp-refs-modal-overlay{position:fixed;inset:0;background:rgba(74,65,57,.42);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;animation:pp-fade-in 120ms ease-out}\
+.pp-refs-modal{width:min(680px,100%);background:#faf8f4;border:1px solid #d5cec0;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.22),0 2px 6px rgba(0,0,0,.08);max-height:min(720px,calc(100vh - 32px));display:flex;flex-direction:column;overflow:hidden;animation:pp-rise-in 140ms ease-out}\
+.pp-refs-modal-hdr{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #ece7dd;background:#f5f1ea;flex-shrink:0}\
+.pp-refs-modal-title{font-weight:600;color:#4a4139;font-size:1rem}\
+.pp-refs-modal-body{padding:16px 20px;overflow-y:auto;flex:1}\
 .pp-refs-modal-body .pp-refs-box{margin-top:0;background:transparent;border:none;padding:0}\
 </style>';
 }
