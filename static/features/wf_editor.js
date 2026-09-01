@@ -62,14 +62,19 @@ function _wfInjectStyles() {
     '.wf-rich-render th { background:#f0ebe3; }',
     '.wf-rich-render img { max-width:100%; max-height:240px; border-radius:3px; vertical-align:middle; }',
     '.wf-rich-render ul, .wf-rich-render ol { margin:2px 0 2px 18px; padding:0; }',
-    /* Gel link — plain click opens a lightbox preview, Cmd/Ctrl+click
-       jumps to the Gel Annotation view. The scoped .wf-editor-area
-       .wf-gel-thumb + .wf-rich-render .wf-gel-thumb overrides below
-       beat the broad `img { max-width; max-height }` rules above so
-       the thumb stays 32×32 instead of scaling to the container. */
-    'a.wf-gel-link { display:inline-flex; align-items:center; gap:6px; padding:2px 8px; background:#f0ebe3; border:1px solid #d5cec0; border-radius:4px; color:#5b7a5e; text-decoration:none; cursor:pointer; font-size:.85em; vertical-align:middle; }',
+    /* Gel embed — block-level card containing the full annotated gel
+       image with a caption below. Plain click on the image or its
+       surrounding card opens a lightbox preview; Cmd/Ctrl+click opens
+       the Gel Annotation view. The scoped selectors under
+       .wf-editor-area / .wf-rich-render override the broad
+       `img { max-width; max-height }` rules those contexts set so the
+       gel image renders at its own natural aspect (capped by
+       max-height:520px for very tall gels), not scaled to whatever the
+       generic rule would allow. */
+    'a.wf-gel-link { display:block; padding:8px; margin:10px 0; background:#f0ebe3; border:1px solid #d5cec0; border-radius:6px; color:#5b7a5e; text-decoration:none; cursor:pointer; max-width:100%; box-sizing:border-box; }',
     'a.wf-gel-link:hover { background:#e8e2d6; }',
-    'a.wf-gel-link .wf-gel-thumb, .wf-editor-area a.wf-gel-link img, .wf-rich-render a.wf-gel-link img { width:32px; height:32px; object-fit:cover; border-radius:3px; max-width:32px; max-height:32px; margin:0; }',
+    'a.wf-gel-link .wf-gel-thumb, .wf-editor-area a.wf-gel-link img, .wf-rich-render a.wf-gel-link img { display:block; width:auto; height:auto; max-width:100%; max-height:520px; margin:0 auto; border-radius:4px; background:#faf8f4; }',
+    'a.wf-gel-link span { display:block; font-size:12px; color:#8a7f72; margin-top:6px; text-align:center; font-family:inherit; }',
     /* Toolbar */
     '.wf-tool-row { display:flex; gap:4px; flex-wrap:wrap; padding:4px 0 6px 0; }',
     '.wf-tool-btn { padding:3px 8px; background:transparent; border:1px solid transparent; border-radius:3px; cursor:pointer; font-size:12px; color:#8a7f72; font-family:inherit; }',
@@ -203,22 +208,24 @@ function _wfPickGel(gelId, imageFile, title, annotatedFile) {
   /* Restore the editor's caret BEFORE insertion — opening the modal moved focus. */
   _wfGelPickerOpenFor.focus();
   var safeTitle = _wfEsc(title || ('Gel ' + gelId));
-  // Thumb shows the annotated version if saved, else raw. Same for the
-  // full-size click target.
-  var displayFile = annotatedFile || imageFile;
-  var thumb = '/api/gel_images/' + encodeURIComponent(displayFile);
-  // Emit only what the sanitizer preserves:
-  //   class, data-gel-id, href, title, and the inner <img> + <span>.
-  // Everything else (data-full, onclick) gets stripped on save, so
-  // relying on it here just misleads readers of the DOM before save.
-  // Click behaviour is driven entirely by the global delegated handler
-  // in _wfInstallGelClickHandler — plain click opens a lightbox,
-  // Cmd/Ctrl+click navigates to the Gel Annotation view.
+  // Use the /latest/ endpoint so the embed tracks the current annotated
+  // snapshot dynamically — if the user re-saves annotations later, the
+  // embed picks up the new version on next page load without needing
+  // to re-insert. Server prefers annotated_file, falls back to raw
+  // image_file when no snapshot has been saved. imageFile and
+  // annotatedFile args are kept for signature compatibility (called
+  // from inline onclick handlers on picker rows) but no longer used
+  // to build the URL.
+  var imgUrl = '/api/gel_images/latest/' + gelId;
+  // Full-size embed: single block-level <a> around the image, caption
+  // span below for context. Only class, href, data-gel-id, title, and
+  // <img> src/alt / <span> content survive the sanitizer, so the click
+  // handler works off href + data-gel-id (see _wfInstallGelClickHandler).
   var html = '<a class="wf-gel-link" data-gel-id="' + gelId +
-             '" href="' + thumb +
+             '" href="' + imgUrl +
              '" title="Click to preview · Cmd/Ctrl-click to open in Gel view">' +
-             '<img class="wf-gel-thumb" src="' + thumb + '" alt="">' +
-             '<span>' + safeTitle + '</span></a>&nbsp;';
+             '<img class="wf-gel-thumb" src="' + imgUrl + '" alt="' + safeTitle + '">' +
+             '<span>' + safeTitle + '</span></a>';
   _wfInsertHtmlAtCaret(html);
   _wfCloseGelPicker();
 }

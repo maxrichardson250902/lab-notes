@@ -239,21 +239,29 @@ keep the format: one line per feature, short scope description.*
 - **Workflow (Daily Workflow)** — contenteditable day doc; time-chip
   auto-insert (idle-based, `wf_chip_idle_minutes` setting, default 5);
   project tagging via `data-groups` on blocks; Read mode; Redact mode;
-  Process Day AI summarisation; **gel picker inserts an
-  `<a class="wf-gel-link" data-gel-id="…" href="/api/gel_images/…">`
-  wrapping a 32×32 thumb `<img>`**. Only `class`, `href`, `data-gel-id`,
-  `title` survive the sanitizer — click behaviour is driven entirely
-  by a **globally-installed** delegated handler (IIFE at bottom of
-  `wf_editor.js`, runs on module load so read-only pages work without
-  an editor ever attaching): plain click → in-page lightbox, Cmd/Ctrl
-  click → `navigateWith('gel_annotation', {gelId})`. In `.wf-editor-area`
-  a plain click is a no-op (edit-friendly) but modifier click still
-  navigates. Thumb sizing uses scoped selectors
-  (`a.wf-gel-link img`, `.wf-read-day-body a.wf-gel-link img`,
-  `.wf-editor-area a.wf-gel-link img`, `.wf-rich-render a.wf-gel-link img`)
-  with `max-width/max-height:32px` to beat the broad
-  `.wf-read-day-body img { max-width:100% }` rule by specificity.
-  `#wf-doc` has `min-height: calc(100vh - 260px)`
+  Process Day AI summarisation; **gel picker inserts a block-level
+  full-image embed**: `<a class="wf-gel-link" data-gel-id="…" href="/api/gel_images/latest/{id}">`
+  wrapping `<img class="wf-gel-thumb" src="/api/gel_images/latest/{id}">`
+  and a `<span>` caption. The `/latest/{gel_id}` endpoint (registered
+  BEFORE the generic `/gel_images/{filename}` route in
+  `gel_annotation/router.py` so "latest" isn't matched as a filename)
+  serves `annotated_file` if present, else falls back to `image_file` —
+  embeds automatically pick up newly-saved annotated snapshots on next
+  page load, no re-insert needed. Cache-Control: no-cache on the
+  response prevents stale browser cache. Only `class`, `href`,
+  `data-gel-id`, `title` survive the sanitizer; click behaviour is
+  driven by a **globally-installed** delegated handler (IIFE at bottom
+  of `wf_editor.js`, runs on module load so read-only pages work
+  without an editor ever attaching): plain click → in-page lightbox,
+  Cmd/Ctrl click → `navigateWith('gel_annotation', {gelId})`. In
+  `.wf-editor-area` a plain click is a no-op (edit-friendly) but
+  modifier click still navigates. Image sizing uses scoped
+  `a.wf-gel-link img` selectors (max-height:520px) with per-context
+  overrides in `.wf-read-day-body`, `.wf-editor-area`, `.wf-rich-render`
+  to beat those areas' broad `img { max-width; max-height }` rules by
+  specificity. Old embeds (pre-`/latest/` endpoint) have a baked-in
+  filename `src` and won't auto-update — user must re-insert to get
+  dynamic behaviour. `#wf-doc` has `min-height: calc(100vh - 260px)`
 - **Scratch pad** — active protocol runs with multi-run tabs, step
   ticks (logged to `/api/time-events`), proto-timer widget, run
   metadata side panel (right column, 340px wide) rendering schema as

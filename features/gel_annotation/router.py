@@ -284,6 +284,35 @@ def delete_gel(gel_id: int):
     return {"ok": True}
 
 
+@router.get("/gel_images/latest/{gel_id}")
+def serve_gel_latest(gel_id: int):
+    """Serve the current best image for a gel: the annotated snapshot if
+    one has been saved, else the raw upload. Used by workflow gel embeds
+    so the image displayed there tracks whatever the user has saved
+    most recently — insert the embed once, resave annotations later,
+    the embed picks up the new version without re-inserting.
+
+    Registered BEFORE the generic /gel_images/{filename} route because
+    otherwise FastAPI would match "latest" as a filename parameter."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT annotated_file, image_file FROM gels WHERE id=?",
+            (gel_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Gel not found")
+    filename = row["annotated_file"] or row["image_file"]
+    if not filename:
+        raise HTTPException(404, "No image for this gel")
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(filepath):
+        # File referenced in DB but missing on disk — treat as gone.
+        raise HTTPException(404, "Image file missing")
+    # Explicit no-cache so re-saving an annotated snapshot shows up on
+    # next page load without hitting a stale browser cache.
+    return FileResponse(filepath, headers={"Cache-Control": "no-cache"})
+
+
 @router.get("/gel_images/{filename}")
 def serve_gel_image(filename: str):
     filepath = os.path.join(UPLOAD_DIR, filename)
