@@ -5456,10 +5456,15 @@ function protoEdit(pid) {
   // Seed schema too. Falls back to {fields:[]} for a blank protocol.
   var mschema = {fields: []};
   try { if (p.metadata_schema) { var parsed_s = JSON.parse(p.metadata_schema); if (parsed_s && Array.isArray(parsed_s.fields)) mschema = parsed_s; } } catch(e) {}
+  // Warnings — JSON array of strings shown as banner on every run.
+  // Seed as a plain array so the editor doesn't have to re-parse.
+  var warnings = [];
+  try { if (p.warnings) { var w = JSON.parse(p.warnings); if (Array.isArray(w)) warnings = w.filter(function(s){return typeof s==='string';}); } } catch(e) {}
   _editState[pid]={
     title:p.title,
     steps:steps.map(function(s){return{text:s.text,note:s.note||''};}),
-    metadata_schema: mschema
+    metadata_schema: mschema,
+    warnings: warnings
   };
   if(!_editState[pid].steps.length) _editState[pid].steps=[{text:'',note:''}];
   var h='<div class="proto-edit-mode-banner">&#9998; <strong>Editing mode</strong> — drag steps to reorder, edit inline</div>';
@@ -5481,6 +5486,18 @@ function protoEdit(pid) {
        '<button class="btn" onclick="_msAddField('+pid+',\'table\')">+ Table</button>' +
      '</div></div>' +
      '<div id="ms-body-'+pid+'">'+_msRenderBody(pid)+'</div>' +
+     '</div>';
+  // ── Pre-flight warnings ──────────────────────────────────────────────
+  // Short reminder strings shown as a persistent banner at the top of
+  // a run in the scratch view. One-liner things you catch yourself
+  // forgetting every time ("check primers don't add overhang", etc).
+  h+='<div class="recipe-section" style="margin-top:16px" id="pw-section-'+pid+'">' +
+     '<div class="recipe-section-head"><span>Pre-flight warnings</span>' +
+     '<div style="display:flex;gap:6px;align-items:center">' +
+       '<span style="font-size:11px;color:#8a7f72">banner on every run</span>' +
+       '<button class="btn" onclick="_pwAddWarning('+pid+')">+ Warning</button>' +
+     '</div></div>' +
+     '<div id="pw-body-'+pid+'">'+_pwRenderBody(pid)+'</div>' +
      '</div>';
   // auto-complete setting
   h+='<div style="margin-top:16px;display:flex;align-items:center;gap:10px"><span style="font-size:12px;font-weight:600;color:#8a7f72">Auto-complete runs:</span>'+_acDropdownHTML('pe-ac-'+pid, p.auto_complete||'manual')+'</div>';
@@ -5688,6 +5705,59 @@ function protoEditLinkStep(pid,afterIdx){_showLinkPicker(function(linkPid,title)
 function _attachEditStepListeners(pid){var c=document.getElementById('pe-steps-'+pid);if(!c)return;c.querySelectorAll('input[data-editpid]').forEach(function(inp){inp.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();protoEditAddStep(parseInt(inp.dataset.editpid),parseInt(inp.dataset.editidx));}});});}
 function _refreshEditSteps(pid){var c=document.getElementById('pe-steps-'+pid);if(!c)return;c.innerHTML=_buildEditStepsHTML(pid);_attachEditStepListeners(pid);}
 
+// ── Pre-flight warnings editor helpers ────────────────────────────────
+// State lives on _editState[pid].warnings as a plain string[]. The
+// section body renders one input per warning + a remove button. Adding
+// / removing rebuilds only the body div. On save, protoSaveEdit sends
+// the array in the PUT body.
+function _pwRenderBody(pid) {
+  var es = _editState[pid];
+  if (!es) return '';
+  var warnings = es.warnings || [];
+  if (!warnings.length) {
+    return '<div style="font-size:12px;color:#8a7f72;padding:8px 0">No warnings. Add one for things you want to double-check every time you run this protocol.</div>';
+  }
+  var h = '';
+  warnings.forEach(function(w, i) {
+    h += '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+         '<span style="color:#e8a735;font-size:14px;line-height:1">&#9888;</span>' +
+         '<input type="text" value="' + esc(w) +
+         '" oninput="_pwSetWarning(' + pid + ',' + i + ',this.value)"' +
+         ' style="flex:1;padding:6px 8px;font-size:13px;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#4a4139"/>' +
+         '<button class="btn" onclick="_pwRemoveWarning(' + pid + ',' + i + ')" title="Remove">&times;</button>' +
+         '</div>';
+  });
+  return h;
+}
+function _pwAddWarning(pid) {
+  var es = _editState[pid]; if (!es) return;
+  if (!es.warnings) es.warnings = [];
+  es.warnings.push('');
+  _pwRefresh(pid);
+  // Focus the new input so the user can just type.
+  setTimeout(function() {
+    var body = document.getElementById('pw-body-' + pid);
+    if (!body) return;
+    var inputs = body.querySelectorAll('input[type="text"]');
+    if (inputs.length) inputs[inputs.length - 1].focus();
+  }, 20);
+}
+function _pwSetWarning(pid, i, val) {
+  var es = _editState[pid]; if (!es || !es.warnings) return;
+  es.warnings[i] = val;
+  // No re-render — the input already shows the value. Blank rows are
+  // stripped server-side in the PUT handler.
+}
+function _pwRemoveWarning(pid, i) {
+  var es = _editState[pid]; if (!es || !es.warnings) return;
+  es.warnings.splice(i, 1);
+  _pwRefresh(pid);
+}
+function _pwRefresh(pid) {
+  var body = document.getElementById('pw-body-' + pid);
+  if (body) body.innerHTML = _pwRenderBody(pid);
+}
+
 async function protoSaveEdit(pid) {
   var es=_editState[pid]; if(!es)return;
   var steps=es.steps.filter(function(s){return s.text.trim();});
@@ -5703,9 +5773,12 @@ async function protoSaveEdit(pid) {
               ? es.metadata_schema
               : null;
   var msj = msObj ? JSON.stringify(msObj) : null;
-  await api('PUT','/api/protocols/'+pid,{title:title,steps:sj,recipe:rj,auto_complete:ac,metadata_schema:msj});
+  // Strip blank warnings client-side (server also strips, but this keeps
+  // the local cache honest so the banner doesn't briefly render empties).
+  var warnings = (es.warnings || []).map(function(s){ return (s || '').trim(); }).filter(Boolean);
+  await api('PUT','/api/protocols/'+pid,{title:title,steps:sj,recipe:rj,auto_complete:ac,metadata_schema:msj,warnings:warnings});
   var p=(S.protocols||[]).find(function(x){return x.id===pid;});
-  if(p){p.title=title;p.steps=sj;p.recipe=rj;p.auto_complete=ac;p.metadata_schema=msj;}
+  if(p){p.title=title;p.steps=sj;p.recipe=rj;p.auto_complete=ac;p.metadata_schema=msj;p.warnings=JSON.stringify(warnings);}
   delete _editState[pid];
   if(p){var panel=document.getElementById('pp-'+pid);if(panel){panel.innerHTML=_panelBody(p);protoLoadRunHistory(pid);}}
   _reloadProtocol(pid); _refreshPanelTab(pid); toast('Protocol updated');
@@ -6736,6 +6809,14 @@ async function _getAllRuns() {
     '.sp-run-group-badge{display:inline-block;font-size:11px;background:#e8f0e8;color:#5b7a5e;border:1px solid #c8d8c8;border-radius:3px;padding:1px 7px;margin-top:4px;font-weight:600}',
     '.sp-progress{height:4px;background:#e8e2d8;border-radius:2px;margin-bottom:18px}',
     '.sp-progress-fill{height:100%;background:#5b7a5e;border-radius:2px;transition:width .25s ease}',
+    /* Pre-flight warnings banner — always visible above the progress
+       bar when the protocol has warnings set. Warm amber tone so it
+       reads as "check" not "error". */
+    '.sp-run-warnings{background:#fdf6e6;border:1px solid #e8a735;border-left:4px solid #e8a735;border-radius:4px;padding:10px 14px;margin-bottom:14px}',
+    '.sp-run-warnings-head{display:flex;align-items:center;gap:8px;font-weight:600;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#8a5b0d;margin-bottom:6px}',
+    '.sp-run-warnings-icon{font-size:15px;color:#e8a735;line-height:1}',
+    '.sp-run-warnings-list{margin:0;padding-left:22px;color:#4a4139;font-size:13px;line-height:1.5}',
+    '.sp-run-warnings-list li{margin:2px 0}',
     '.sp-recipe-section{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:14px;margin-bottom:18px}',
     '.sp-recipe-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}',
     '.sp-recipe-label{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72}',
@@ -7418,6 +7499,33 @@ async function spDiscardRunById(runId) {
 }
 
 // ── run view ──────────────────────────────────────────────────────────────────
+// Pre-flight warnings banner — reads rs.protocol.warnings (JSON string
+// from the protocols row, snapshotted into protocol_json when the run
+// was started). Always visible while the run is open; not dismissable
+// on purpose (the point is to prompt every time).
+function _renderRunWarnings(rs) {
+  if (!rs || !rs.protocol) return '';
+  var raw = rs.protocol.warnings;
+  var warnings = [];
+  if (Array.isArray(raw)) {
+    warnings = raw;
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try { var p = JSON.parse(raw); if (Array.isArray(p)) warnings = p; } catch(e) {}
+  }
+  warnings = warnings.filter(function(w){ return typeof w === 'string' && w.trim(); });
+  if (!warnings.length) return '';
+  var items = warnings.map(function(w) {
+    return '<li>' + esc(w) + '</li>';
+  }).join('');
+  return '<div class="sp-run-warnings" role="note">' +
+    '<div class="sp-run-warnings-head">' +
+      '<span class="sp-run-warnings-icon">&#9888;</span>' +
+      '<span>Before you start</span>' +
+    '</div>' +
+    '<ul class="sp-run-warnings-list">' + items + '</ul>' +
+    '</div>';
+}
+
 function _renderProtoRunInScratch(el) {
   var rs = _scratchProtoRun; if (!rs) return;
   var done = rs.steps.filter(function(s) { return s.done; }).length;
@@ -7457,6 +7565,7 @@ function _renderProtoRunInScratch(el) {
             '<button class="btn" style="color:#c0392b" onclick="spAbandonRun()">&#215; Abandon</button>' +
           '</div>' +
         '</div>' +
+        _renderRunWarnings(rs) +
         '<div class="sp-progress"><div class="sp-progress-fill" id="sp-pfill" style="width:' + pct + '%"></div></div>' +
         '<div id="sp-recipe-wrap">' + _renderRunRecipe() + '</div>' +
         '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Steps</div>' +
@@ -9831,6 +9940,12 @@ var G = {
      source image dims change. Keyed by "<rotation>|<srcW>|<srcH>". */
   _rotCanvas: null,
   _rotCanvasKey: '',
+
+  /* Layout panel: whether the pad-settings popover is open. Panel edits
+     global S.settings values directly via /api/settings PUT — no per-gel
+     state. Live-repaint on input; save (debounced) on release. */
+  layoutPanelOpen: false,
+  _layoutSaveTimer: null,
 };
 
 /* ── helpers ── */
@@ -9969,9 +10084,20 @@ function gelDispNtoViewNY(dn) {
    fractions so gelDrawOnCtx can compute the content rect regardless
    of what canvas it's rendering to (screen or export).                 */
 function gelPadFor(viewW, viewH) {
-  var padL = Math.round(gelClamp(viewW * 0.06, 30, 60));
+  // Pad percentages come from user settings (see settings/router.py
+  // defaults gel_pad_left_pct=6, gel_pad_top_pct=10). Fallback to
+  // defaults if settings haven't loaded yet (first boot / offline).
+  var settings = (typeof S !== 'undefined' && S.settings) ? S.settings : {};
+  var leftPct = (typeof settings.gel_pad_left_pct === 'number') ? settings.gel_pad_left_pct : 6;
+  var topPct  = (typeof settings.gel_pad_top_pct  === 'number') ? settings.gel_pad_top_pct  : 10;
+  // Min-clamp only, so at very small images the pad is still legible
+  // (avoids 5px zones for tiny thumbnails). No max-clamp — user asked
+  // for canvas space control, and clamping down would fight that.
+  var padL = Math.max(0, Math.round(viewW * leftPct / 100));
+  if (leftPct > 0) padL = Math.max(padL, 20);
+  var padT = Math.max(0, Math.round(viewH * topPct / 100));
+  if (topPct > 0) padT = Math.max(padT, 24);
   var padR = 8;
-  var padT = Math.round(gelClamp(viewH * 0.10, 34, 90));
   var padB = 8;
   var totalW = viewW + padL + padR;
   var totalH = viewH + padT + padB;
@@ -9979,7 +10105,6 @@ function gelPadFor(viewW, viewH) {
     padL: padL, padR: padR, padT: padT, padB: padB,
     viewW: viewW, viewH: viewH,
     canvasW: totalW, canvasH: totalH,
-    // fractions (used by gelDrawOnCtx which only sees final canvas dims)
     fLeft: padL / totalW,
     fRight: padR / totalW,
     fTop: padT / totalH,
@@ -10183,6 +10308,74 @@ function gelExport() {
 // get their highlight so editing works even in "clean" mode.
 function gelToggleGuides(on) {
   G.showGuides = !!on;
+  gelDrawOverlay();
+}
+
+/* ── layout panel (canvas pad settings) ──
+   Slider inputs edit S.settings.gel_pad_{top,left}_pct in-memory for
+   instant repaint; a debounced PUT persists to the backend so a rapid
+   slider drag doesn't fire 60 requests. Values apply GLOBALLY (all
+   gels use the same pad) — per-gel override deliberately deferred. */
+function gelToggleLayoutPanel() {
+  G.layoutPanelOpen = !G.layoutPanelOpen;
+  gelRenderFull();
+}
+function gelSetPad(which, value) {
+  var v = parseFloat(value);
+  if (isNaN(v)) return;
+  if (!S.settings) S.settings = {};
+  var key = which === 'top' ? 'gel_pad_top_pct' : 'gel_pad_left_pct';
+  S.settings[key] = v;
+  // Live update: recompute pads → repaint bg + overlay. Invalidating
+  // the rotated cache is NOT needed (pad doesn't touch the rotated
+  // pre-render), but paintBg has to re-run to resize the bg canvas.
+  gelReflowCanvases();
+  // Update the number readout beside the slider without re-rendering
+  // the whole toolbar (which would blow away the input's focus).
+  var out = document.getElementById('gel-pad-' + which + '-out');
+  if (out) out.textContent = v + '%';
+  // Debounced save so a slider drag doesn't hammer the API.
+  clearTimeout(G._layoutSaveTimer);
+  G._layoutSaveTimer = setTimeout(function() {
+    api('PUT', '/api/settings', { key: key, value: v }).catch(function() {
+      toast('Could not save pad setting', true);
+    });
+  }, 400);
+}
+function gelResetPad() {
+  if (!S.settings) S.settings = {};
+  S.settings.gel_pad_top_pct = 10;
+  S.settings.gel_pad_left_pct = 6;
+  gelReflowCanvases();
+  // Fire-and-forget save of both defaults in one bulk update.
+  api('PUT', '/api/settings', { settings: { gel_pad_top_pct: 10, gel_pad_left_pct: 6 } })
+    .catch(function() { toast('Could not save pad reset', true); });
+  gelRenderFull();  // rebuild toolbar to reflect the reset values in slider positions
+}
+// Rebuild bg canvas + overlay canvas after any change that alters the
+// content/pad geometry (pad settings, crop, rotation apply). Cheap; no
+// full DOM rebuild, no init re-run.
+function gelReflowCanvases() {
+  var img = document.getElementById('gelImg');
+  var bg = document.getElementById('gelBgCanvas');
+  var overlay = document.getElementById('gelCanvas');
+  if (!img || !bg || !overlay || !img.naturalWidth) return;
+  var rc = gelGetRotatedCanvas();
+  var view = gelViewRect();
+  if (!rc || !view) return;
+  var pad = gelPadFor(view.w, view.h);
+  G._padF = pad;
+  bg.width = pad.canvasW;
+  bg.height = pad.canvasH;
+  var bctx = bg.getContext('2d');
+  bctx.fillStyle = '#faf8f4';
+  bctx.fillRect(0, 0, bg.width, bg.height);
+  bctx.drawImage(rc, view.x, view.y, view.w, view.h,
+                     pad.padL, pad.padT, view.w, view.h);
+  overlay.width = bg.clientWidth;
+  overlay.height = bg.clientHeight;
+  G.imgW = bg.clientWidth;
+  G.imgH = bg.clientHeight;
   gelDrawOverlay();
 }
 
@@ -11592,6 +11785,10 @@ function gelRenderFull() {
     html += '<label class="gel-btn-sm" style="display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none">' +
       '<input type="checkbox" ' + (G.showGuides !== false ? 'checked' : '') + ' onchange="gelToggleGuides(this.checked)" style="margin:0"/>' +
       'Guides</label>';
+    // Layout toggle — opens the pad-settings popover below the toolbar
+    // so the user can dial canvas margins in when labels overflow.
+    html += '<button class="gel-btn-sm' + (G.layoutPanelOpen ? ' gel-btn-active' : '') +
+            '" onclick="gelToggleLayoutPanel()" title="Adjust canvas padding (space around image for labels)">Layout</button>';
     // Label orientation dropdown — how well labels tilt above the lanes.
     // Diagonal fits classic gel-photo look; vertical helps when lanes
     // are very narrow and names would still clip in diagonal.
@@ -11658,7 +11855,34 @@ function gelRenderFull() {
     html += '<button class="gel-btn-sm gel-btn-danger" onclick="gelDelete(' + G.gel.id + ')" title="Delete gel">&times;</button>';
     html += '</div></div>';
 
-    /* canvas area
+    /* Layout / canvas pad settings panel — only rendered when open.
+       Sliders live-update S.settings, repaint immediately, and PUT to
+       /api/settings debounced. Values are global (apply to every gel). */
+    if (G.layoutPanelOpen) {
+      var topPct  = (S.settings && typeof S.settings.gel_pad_top_pct  === 'number') ? S.settings.gel_pad_top_pct  : 10;
+      var leftPct = (S.settings && typeof S.settings.gel_pad_left_pct === 'number') ? S.settings.gel_pad_left_pct : 6;
+      html += '<div class="gel-layout-panel">';
+      html += '<div style="font-size:.72rem;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Canvas padding <span style="text-transform:none;font-weight:400;color:#8a7f72;letter-spacing:0"> — space around image for labels. Applies to all gels.</span></div>';
+      html += '<div style="display:grid;grid-template-columns:110px 1fr 48px;gap:10px;align-items:center;row-gap:6px">';
+      // Top pad
+      html += '<label for="gel-pad-top" style="font-size:.82rem;color:#4a4139">Top (labels)</label>';
+      html += '<input id="gel-pad-top" type="range" min="0" max="50" step="1" value="' + topPct +
+              '" oninput="gelSetPad(\'top\',this.value)" style="width:100%">';
+      html += '<span id="gel-pad-top-out" style="font-size:.75rem;color:#8a7f72;text-align:right">' + topPct + '%</span>';
+      // Left pad
+      html += '<label for="gel-pad-left" style="font-size:.82rem;color:#4a4139">Left (ladder sizes)</label>';
+      html += '<input id="gel-pad-left" type="range" min="0" max="30" step="1" value="' + leftPct +
+              '" oninput="gelSetPad(\'left\',this.value)" style="width:100%">';
+      html += '<span id="gel-pad-left-out" style="font-size:.75rem;color:#8a7f72;text-align:right">' + leftPct + '%</span>';
+      html += '</div>';
+      html += '<div style="margin-top:10px;display:flex;gap:6px;justify-content:flex-end">';
+      html += '<button class="gel-btn-sm" onclick="gelResetPad()">Reset defaults</button>';
+      html += '<button class="gel-btn-sm" onclick="gelToggleLayoutPanel()">Close</button>';
+      html += '</div>';
+      html += '</div>';
+    }
+
+    /* canvas area.
        The <img> is a hidden loader only — its onload event drives the
        bg-canvas paint (via gelInitCanvas → resize → paintBg). The bg
        canvas holds the rotated+cropped image; the overlay canvas holds
@@ -11727,6 +11951,10 @@ function gelInjectStyles() {
        and draws the image inset by the pad amounts (see gelPadFor). */
     '.gel-bg-canvas { display:block; max-width:100%; max-height:50vh; width:auto; height:auto; user-select:none; }',
     '.gel-canvas { position:absolute; top:0; left:0; width:100%; height:100%; cursor:crosshair; }',
+    /* Layout / canvas-pad settings panel — sits between toolbar and
+       canvas area. Only rendered when G.layoutPanelOpen. */
+    '.gel-layout-panel { padding:12px 14px; background:#faf8f4; border-bottom:1px solid #e8e2d8; }',
+    '.gel-btn-active { background:#e8e2d8; border-color:#a89e8e; }',
     '.gel-controls { display:flex; gap:16px; padding:12px 14px; border-top:1px solid #d5cec0; background:#faf8f4; max-height:280px; overflow-y:auto; flex-wrap:wrap; }',
     '.gel-controls-left { flex:1; min-width:260px; }',
     '.gel-controls-right { flex:2; min-width:320px; }',
