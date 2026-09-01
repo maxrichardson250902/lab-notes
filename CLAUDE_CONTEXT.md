@@ -239,8 +239,21 @@ keep the format: one line per feature, short scope description.*
 - **Workflow (Daily Workflow)** — contenteditable day doc; time-chip
   auto-insert (idle-based, `wf_chip_idle_minutes` setting, default 5);
   project tagging via `data-groups` on blocks; Read mode; Redact mode;
-  Process Day AI summarisation; gel picker inserts wf-gel-link with
-  full-screen lightbox on click; `#wf-doc` has `min-height: calc(100vh - 260px)`
+  Process Day AI summarisation; **gel picker inserts an
+  `<a class="wf-gel-link" data-gel-id="…" href="/api/gel_images/…">`
+  wrapping a 32×32 thumb `<img>`**. Only `class`, `href`, `data-gel-id`,
+  `title` survive the sanitizer — click behaviour is driven entirely
+  by a **globally-installed** delegated handler (IIFE at bottom of
+  `wf_editor.js`, runs on module load so read-only pages work without
+  an editor ever attaching): plain click → in-page lightbox, Cmd/Ctrl
+  click → `navigateWith('gel_annotation', {gelId})`. In `.wf-editor-area`
+  a plain click is a no-op (edit-friendly) but modifier click still
+  navigates. Thumb sizing uses scoped selectors
+  (`a.wf-gel-link img`, `.wf-read-day-body a.wf-gel-link img`,
+  `.wf-editor-area a.wf-gel-link img`, `.wf-rich-render a.wf-gel-link img`)
+  with `max-width/max-height:32px` to beat the broad
+  `.wf-read-day-body img { max-width:100% }` rule by specificity.
+  `#wf-doc` has `min-height: calc(100vh - 260px)`
 - **Scratch pad** — active protocol runs with multi-run tabs, step
   ticks (logged to `/api/time-events`), proto-timer widget, run
   metadata side panel (right column, 340px wide) rendering schema as
@@ -248,7 +261,12 @@ keep the format: one line per feature, short scope description.*
 - **Protocols (Protocol Library)** — CRUD, drag-reorder steps, recipe
   tables with unit-aware totals, auto-complete mode, papers refs
   attached via `pt-refs-` panel, metadata schema editor with preset
-  library
+  library. **Pre-flight warnings** (`warnings` column: JSON array of
+  strings) — edited in the protocol editor's "Pre-flight warnings"
+  section, displayed as an always-visible amber banner at the top of
+  a run in the scratch view (see `_renderRunWarnings`). Snapshotted
+  into `active_runs.protocol_json` at run start so edits to warnings
+  post-run don't retroactively change what an in-progress run shows.
 - **Reminders** — always-visible composer at top; quick date buttons
   (Today, Tomorrow, Next Mon, This week, Next week); bulk-add for
   week creates 7 discrete reminders; in-app modal + browser
@@ -280,7 +298,12 @@ keep the format: one line per feature, short scope description.*
   outside. Image display uses a two-canvas stack: `<canvas id="gelBgCanvas">`
   holds the rotated+cropped pre-render (rebuilt on rotation change via
   `gelGetRotatedCanvas` cache), `<canvas id="gelCanvas">` holds
-  annotations. The `<img id="gelImg">` is a hidden loader only
+  annotations. The `<img id="gelImg">` is a hidden loader only. The
+  canvas has a **pad zone** around the image so labels sit off the
+  bands — pad size is percent-based (`gelPadFor`), configured live via
+  the **Layout** toolbar toggle (sliders bind to global settings
+  `gel_pad_top_pct` / `gel_pad_left_pct`, live repaint via
+  `gelReflowCanvases`, debounced PUT to `/api/settings`)
 - **DNA Manager** — plasmids/primers/gblocks/kit_parts/parts CRUD;
   Show archived items setting toggles `X-Show-Archived` header;
   backend filters via WHERE clause; archive/unarchive per-row folder
@@ -294,7 +317,9 @@ keep the format: one line per feature, short scope description.*
 
 ### Schema highlights
 
-- `protocols(metadata_schema TEXT NULL)` — JSON `{fields: [...]}`
+- `protocols(metadata_schema TEXT NULL, warnings TEXT NOT NULL DEFAULT '[]')`
+  — `metadata_schema` is JSON `{fields: [...]}`; `warnings` is a JSON
+  array of short strings (banner shown at top of run)
 - `active_runs(metadata_values TEXT NULL, snoozed_until TEXT NULL)`
 - `hours_entries(project TEXT NOT NULL DEFAULT '', secondary_json
   TEXT NOT NULL DEFAULT '[]')`
@@ -317,6 +342,10 @@ keep the format: one line per feature, short scope description.*
 - `reminder_boot_delay_ms` (number, 0–60000, default 1500)
 - other UI prefs: `sidebar_peek_delay`, `sidebar_auto_hide`,
   `autosave_delay_ms`, etc
+- `gel_pad_top_pct` (percent of view height for label pad above image,
+  default 10, range 0–50)
+- `gel_pad_left_pct` (percent of view width for ladder-size-label pad
+  left of image, default 6, range 0–30)
 
 ### Removed
 

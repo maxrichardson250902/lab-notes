@@ -638,6 +638,17 @@ function _wfInjectDocStyles() {
     '.wf-read-src-tag { font-size:9.5px; color:#8a7f72; background:#f0ebe3; padding:1px 6px; border-radius:2px; font-variant:small-caps; letter-spacing:.05em; margin-left:auto; }',
     '.wf-read-day-body { font-size:13.5px; line-height:1.55; color:#4a4139; }',
     '.wf-read-day-body img { max-width:100%; height:auto; border-radius:3px; }',
+    /* Gel link — kept in sync with the copy in wf_editor.js's
+       _wfInjectStyles. Duplicated here because that function only runs
+       when an editor attaches; read-mode workflow pages (viewing past
+       days without editing) never hit it, so without this the gel
+       thumb would inherit the broad `.wf-read-day-body img` rule above
+       and render as a full-width monster with no click affordance. The
+       scoped `.wf-read-day-body a.wf-gel-link img` selector below beats
+       that rule by specificity (0,2,1 vs 0,1,1). */
+    'a.wf-gel-link { display:inline-flex; align-items:center; gap:6px; padding:2px 8px; background:#f0ebe3; border:1px solid #d5cec0; border-radius:4px; color:#5b7a5e; text-decoration:none; cursor:pointer; font-size:.85em; vertical-align:middle; }',
+    'a.wf-gel-link:hover { background:#e8e2d6; }',
+    'a.wf-gel-link .wf-gel-thumb, .wf-read-day-body a.wf-gel-link img { width:32px; height:32px; object-fit:cover; border-radius:3px; max-width:32px; max-height:32px; margin:0; }',
     '.wf-read-day-body table { border-collapse:collapse; margin:6px 0; }',
     '.wf-read-day-body td, .wf-read-day-body th { border:1px solid #d5cec0; padding:3px 8px; }',
     /* Reuse the same block coloring rules from the editor for consistency */
