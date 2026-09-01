@@ -1,8 +1,9 @@
 """Sanger Sequencing — AB1 trace alignment and chromatogram viewer."""
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-from core.database import register_table, get_db
+from core.database import register_table, register_seed, ensure_column, get_db
 from Bio import SeqIO
 import io, json, pathlib, uuid
 
@@ -49,6 +50,14 @@ register_table("sanger_batches", """CREATE TABLE IF NOT EXISTS sanger_batches (
     ref_annotations TEXT,
     ref_name        TEXT,
     created         TEXT NOT NULL)""")
+
+# Rotation offset added later. When the batch's stored ref_sequence has
+# been rotated to avoid wrap-splitting reads, this records the amount
+# rotated (bp) so the frontend can translate back to original .gb
+# coords for tooltips. 0 = not rotated / same as source .gb.
+register_seed(lambda conn: ensure_column(conn, "sanger_batches",
+                                         "rotation_offset",
+                                         "INTEGER NOT NULL DEFAULT 0"))
 
 router = APIRouter(prefix="/api", tags=["sanger"])
 
@@ -194,29 +203,46 @@ def get_reference_sequence(ref_source, ref_id=None, ref_text=None):
         "parts": "part", "primers": "primer",
     }
     if ref_source in INVENTORY_TABLES and ref_id:
+        # Tables that also carry a plain 'sequence' column — items in
+        # these can be aligned even when they have no .gb file on disk
+        # (DNA Manager entries with sequences imported as text rather
+        # than as annotated GenBank). Circularity is unknown from a
+        # bare sequence so we treat them as linear.
+        SEQUENCE_ONLY_OK = {"gblocks", "primers", "parts"}
+        has_seq_col = ref_source in SEQUENCE_ONLY_OK
         with get_db() as conn:
+            cols = "name, gb_file" + (", sequence" if has_seq_col else "")
             row = conn.execute(
-                f"SELECT name, gb_file FROM {ref_source} WHERE id=?", (ref_id,)
+                f"SELECT {cols} FROM {ref_source} WHERE id=?", (ref_id,)
             ).fetchone()
-        if not row or not row["gb_file"]:
-            raise HTTPException(404, f"No .gb file for {ref_source} id {ref_id}")
-        # Try {prefix}_{id}.gb first (standard naming), then original gb_file value
+        if not row:
+            raise HTTPException(404, f"{ref_source} id {ref_id} not found")
+        # Prefer the .gb file (has annotations + topology). Fall back
+        # to the bare sequence column if there is one.
         prefix = TABLE_TO_PREFIX.get(ref_source, ref_source.rstrip("s"))
-        candidates = [
-            pathlib.Path(f"/data/gb_files/{prefix}_{ref_id}.gb"),
-            pathlib.Path(f"/data/gb_files/{row['gb_file']}"),
-        ]
         gb_path = None
-        for c in candidates:
-            if c.exists():
-                gb_path = c
-                break
-        if not gb_path:
-            raise HTTPException(404, f".gb file not found for {ref_source} id {ref_id}")
-        record = SeqIO.read(gb_path, "genbank")
-        annotations = parse_gb_annotations(record)
-        is_circular = _is_circular(record)
-        return str(record.seq), row["name"] or record.name or f"{ref_source}_{ref_id}", annotations, is_circular
+        if row["gb_file"]:
+            candidates = [
+                pathlib.Path(f"/data/gb_files/{prefix}_{ref_id}.gb"),
+                pathlib.Path(f"/data/gb_files/{row['gb_file']}"),
+            ]
+            for c in candidates:
+                if c.exists():
+                    gb_path = c
+                    break
+        if gb_path:
+            record = SeqIO.read(gb_path, "genbank")
+            annotations = parse_gb_annotations(record)
+            is_circular = _is_circular(record)
+            return str(record.seq), row["name"] or record.name or f"{ref_source}_{ref_id}", annotations, is_circular
+        if has_seq_col and row["sequence"] and row["sequence"].strip():
+            seq = row["sequence"].strip().upper().replace("\n", "").replace(" ", "")
+            return seq, row["name"] or f"{ref_source}_{ref_id}", [], False
+        raise HTTPException(
+            404,
+            f"No sequence available for {ref_source} id {ref_id} "
+            "(no .gb file and no sequence column value)",
+        )
     elif ref_source == "fasta" and ref_text:
         record = SeqIO.read(io.StringIO(ref_text), "fasta")
         return str(record.seq), record.id, annotations, False
@@ -247,43 +273,51 @@ def list_references():
         ("gblocks",   "gBlock",   "gblock",   ["project"]),
         ("primers",   "Primer",   "primer",   ["project", "use"]),
     ]
+    SEQUENCE_ONLY_OK = {"gblocks", "primers", "parts"}
     gb_dir = pathlib.Path("/data/gb_files")
     with get_db() as conn:
         for table, label, prefix, meta_cols in tables:
-            # SELECT id, name, gb_file, <meta_cols>. Build dynamically but only
-            # include columns we know exist for this table (defensive against
-            # older schemas missing newer columns).
+            # SELECT id, name, gb_file, (sequence if present), <meta_cols>.
+            # Include tables' 'sequence' column when they have one (DNA
+            # Manager items may have plain sequences without a .gb file).
+            # Defensive against older schemas missing newer columns.
             try:
                 existing_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             except Exception:
                 continue
+            has_seq_col = table in SEQUENCE_ONLY_OK and "sequence" in existing_cols
             present_meta = [c for c in meta_cols if c in existing_cols]
-            select_cols = ["id", "name", "gb_file"] + present_meta
+            select_cols = ["id", "name", "gb_file"] + (["sequence"] if has_seq_col else []) + present_meta
             try:
-                rows = conn.execute(
-                    f"SELECT {', '.join(select_cols)} FROM {table} "
-                    f"WHERE gb_file IS NOT NULL AND gb_file != ''"
-                ).fetchall()
+                rows = conn.execute(f"SELECT {', '.join(select_cols)} FROM {table}").fetchall()
             except Exception:
                 continue
             for r in rows:
-                has_file = (
+                # Include the item if it has EITHER an on-disk .gb OR a
+                # non-empty sequence column. Items with neither are
+                # unusable as refs and stay out of the list.
+                has_gb = bool(r["gb_file"]) and (
                     (gb_dir / f"{prefix}_{r['id']}.gb").exists() or
                     (gb_dir / r["gb_file"]).exists()
                 )
-                if not has_file:
+                has_seq = has_seq_col and r["sequence"] and str(r["sequence"]).strip()
+                if not (has_gb or has_seq):
                     continue
                 meta_parts = []
                 for c in present_meta:
                     v = r[c]
                     if v is not None and str(v).strip():
                         meta_parts.append(str(v).strip())
+                # Mark seq-only items so the UI can hint (e.g. "no annotations").
+                if not has_gb and has_seq:
+                    meta_parts.append("seq only")
                 items.append({
                     "id": r["id"],
                     "name": r["name"],
                     "type": table,
                     "label": label,
                     "meta": " / ".join(meta_parts),
+                    "source_kind": "gb" if has_gb else "sequence",
                 })
     return {"items": items}
 
@@ -372,6 +406,125 @@ def _split_wrap_alignment(result, ref_len):
         0, re - ref_len, q_at_split, int(result["query_end"]),
     )
     return [piece1, piece2]
+
+
+def _piece_covers_circular(pieces, ref_len):
+    """Given the list-of-pieces returned by do_alignment for ONE read,
+    return the coverage interval in linear coord space [rs, re) where
+    re may exceed ref_len (meaning: the read wraps origin, covered
+    region is [rs, ref_len) ∪ [0, re-ref_len)). For single-piece
+    alignments returns just (piece.ref_start, piece.ref_end)."""
+    if not pieces:
+        return None
+    if len(pieces) == 1:
+        p = pieces[0]
+        return (int(p["ref_start"]), int(p["ref_end"]))
+    # Wrap-split from _split_wrap_alignment: piece 0 ends at ref_len,
+    # piece 1 starts at 0. Reconstruct as [piece0.ref_start,
+    # piece1.ref_end + ref_len). Piece order = query order.
+    # Sort by query_start just in case, so we don't mis-identify which
+    # side is which.
+    sorted_pieces = sorted(pieces, key=lambda p: int(p["query_start"]))
+    return (int(sorted_pieces[0]["ref_start"]),
+            int(sorted_pieces[1]["ref_end"]) + ref_len)
+
+
+def _pick_rotation_offset(coverage_ranges, ref_len):
+    """Given [(start, end), ...] coverage on a circular ref of length
+    ref_len (end may exceed ref_len for wrap-covering reads), pick a
+    rotation offset that places the new position 0 in the MIDDLE of
+    the largest uncovered gap. Returns 0 (no rotation) if every point
+    is covered, or if the offset would land exactly at 0 already.
+
+    Strategy: convert everything to a set of covered arcs on the
+    circle, merge overlapping arcs, then find the largest gap between
+    consecutive arc ends and arc starts (going forwards around the
+    circle). Rotation offset = midpoint of that gap."""
+    if not coverage_ranges or ref_len <= 0:
+        return 0
+    # Convert each (start, end) range to on-circle arcs [s, e) with
+    # 0 <= s < e <= ref_len. Wrap-covering ranges (end > ref_len) split
+    # into two arcs.
+    arcs = []
+    for rs, re in coverage_ranges:
+        if re <= rs or re <= 0:
+            continue
+        rs = max(0, rs)
+        if re <= ref_len:
+            arcs.append((rs, re))
+        else:
+            arcs.append((rs, ref_len))
+            wrapped_end = re - ref_len
+            if wrapped_end > ref_len:
+                # A single read longer than the whole plasmid — degenerate.
+                # Treat as full coverage: nothing to rotate to.
+                return 0
+            arcs.append((0, wrapped_end))
+    if not arcs:
+        return 0
+    arcs.sort()
+    # Merge overlapping / touching arcs
+    merged = [list(arcs[0])]
+    for s, e in arcs[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    # If the last arc touches ref_len and the first arc starts at 0,
+    # they're actually connected on the circle — merge them.
+    if len(merged) > 1 and merged[0][0] == 0 and merged[-1][1] == ref_len:
+        merged[0][0] = merged[-1][0] - ref_len   # allow negative start
+        merged.pop()
+    # Now find the largest GAP walking around the circle. Gaps sit
+    # between consecutive merged arcs; add one more between the last
+    # arc's end and the first arc's start + ref_len (going around).
+    best_gap_len = 0
+    best_gap_mid = None
+    for i in range(len(merged)):
+        arc_end = merged[i][1]
+        next_start = merged[(i + 1) % len(merged)][0]
+        if i == len(merged) - 1:
+            next_start += ref_len  # wrap for last→first gap
+        gap = next_start - arc_end
+        if gap > best_gap_len:
+            best_gap_len = gap
+            best_gap_mid = (arc_end + gap // 2) % ref_len
+    # If everything is covered (best_gap_len == 0) there's no good
+    # rotation — leave as-is.
+    if best_gap_mid is None or best_gap_len < 1:
+        return 0
+    return int(best_gap_mid)
+
+
+def _rotate_ref_and_annos(ref_seq, annos, offset, ref_len):
+    """Return (rotated_seq, rotated_annos) where rotated_seq starts at
+    the input's `offset` position on the circle. Annotations are
+    shifted by -offset (mod ref_len); features that would span the new
+    origin are split into two annotations sharing the label, so the
+    frontend sees them as two ordinary linear ranges."""
+    offset = offset % ref_len
+    if offset == 0:
+        return ref_seq, annos
+    rotated = ref_seq[offset:] + ref_seq[:offset]
+    new_annos = []
+    for a in annos:
+        s = (int(a["start"]) - offset) % ref_len
+        e_raw = int(a["end"]) - offset
+        # e_raw can now be negative (feature entirely in the pre-offset
+        # window) — normalise.
+        length = int(a["end"]) - int(a["start"])
+        if length <= 0:
+            continue
+        # If the feature entirely fits without spanning the new origin
+        # (i.e. shifted start + length <= ref_len), emit one piece.
+        if s + length <= ref_len:
+            new_annos.append({**a, "start": s, "end": s + length})
+        else:
+            # Splits across the rotated origin. Emit head + tail.
+            head_len = ref_len - s
+            new_annos.append({**a, "start": s, "end": ref_len})
+            new_annos.append({**a, "start": 0, "end": length - head_len})
+    return rotated, new_annos
 
 
 def do_alignment(query_seq, ref_seq, is_circular=False):
@@ -603,57 +756,123 @@ async def align_ab1(
     now = datetime.utcnow().isoformat()
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    # Store batch reference data
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO sanger_batches (batch_id, ref_sequence, ref_annotations, ref_name, created) VALUES (?,?,?,?,?)",
-            (batch_id, ref_seq, json.dumps(ref_annos), ref_label, now),
-        )
-        conn.commit()
-
-    results = []
-    errors = []
-
+    # ── Read all ab1 payloads FIRST so we can do a two-pass alignment if
+    # any read wraps the current linearization. Store bytes + trimmed
+    # sequences up-front; parse each once, align (up to) twice.
+    # (Previous behaviour: single-pass alignment per file, wrap-splitting
+    # each into two DB rows. That's still what happens for linear refs
+    # and for circular refs where no read wraps. See _pick_rotation_offset
+    # + _rotate_ref_and_annos for the rotate-and-re-align path.)
+    file_states = []  # each: {filename, stored_name, ab1_path, query_seq, trim_start, trim_end, error}
     for file in ab1:
         content = await file.read()
         safe_name = file.filename.replace("/", "_").replace("\\", "_")
         stored_name = f"{ts}_{safe_name}"
         ab1_path = AB1_DIR / stored_name
         ab1_path.write_bytes(content)
-
+        st = {"filename": file.filename, "stored_name": stored_name,
+              "ab1_path": ab1_path, "query_seq": None,
+              "trim_start": 0, "trim_end": 0, "error": None}
         try:
             trace_data = parse_ab1(ab1_path)
         except Exception as e:
+            st["error"] = f"Parse failed: {e}"
             ab1_path.unlink(missing_ok=True)
-            errors.append({"file": file.filename, "error": f"Parse failed: {e}"})
+            file_states.append(st)
             continue
-
         query_seq = trace_data["bases"]
         if not query_seq:
+            st["error"] = "No base calls"
             ab1_path.unlink(missing_ok=True)
-            errors.append({"file": file.filename, "error": "No base calls"})
+            file_states.append(st)
             continue
-
-        # Quality trim
         trim_threshold = trim_qual if trim_qual and trim_qual > 0 else 0
-        trim_start_idx = 0
-        trim_end_idx = len(query_seq)
+        trim_start_idx, trim_end_idx = 0, len(query_seq)
         if trim_threshold > 0:
             query_seq, trim_start_idx, trim_end_idx = quality_trim(
                 query_seq, trace_data["quals"], threshold=trim_threshold
             )
             if not query_seq:
+                st["error"] = "No bases left after trimming"
                 ab1_path.unlink(missing_ok=True)
-                errors.append({"file": file.filename, "error": "No bases left after trimming"})
+                file_states.append(st)
                 continue
+        st["query_seq"] = query_seq
+        st["trim_start"] = trim_start_idx
+        st["trim_end"] = trim_end_idx
+        file_states.append(st)
 
-        pieces = do_alignment(query_seq, ref_seq, is_circular=is_circular)
+    # ── Pass 1: align every readable file against the ORIGINAL ref.
+    # If any alignment wraps origin (returned >1 piece), we pick a
+    # rotation offset that puts the new position 0 in a gap none of
+    # the reads cover, then re-align in pass 2 against the rotated ref.
+    # No wrapping reads → skip rotation entirely, use pass-1 pieces.
+    pass1 = []   # list of pieces per file (None if error)
+    any_wraps = False
+    ref_len = len(ref_seq)
+    for st in file_states:
+        if st["error"] or st["query_seq"] is None:
+            pass1.append(None)
+            continue
+        pieces = do_alignment(st["query_seq"], ref_seq, is_circular=is_circular)
+        pass1.append(pieces)
+        if pieces and len(pieces) > 1:
+            any_wraps = True
+
+    rotation_offset = 0
+    aligned_pieces = pass1
+    if any_wraps and is_circular:
+        # Collect coverage from pass 1 to find the best rotation.
+        coverage = []
+        for pieces in pass1:
+            if not pieces:
+                continue
+            rng = _piece_covers_circular(pieces, ref_len)
+            if rng:
+                coverage.append(rng)
+        rotation_offset = _pick_rotation_offset(coverage, ref_len)
+        if rotation_offset != 0:
+            rotated_ref, rotated_annos = _rotate_ref_and_annos(
+                ref_seq, ref_annos, rotation_offset, ref_len)
+            # Pass 2: re-align every file against the rotated ref.
+            pass2 = []
+            for st in file_states:
+                if st["error"] or st["query_seq"] is None:
+                    pass2.append(None)
+                    continue
+                pieces = do_alignment(st["query_seq"], rotated_ref,
+                                      is_circular=is_circular)
+                pass2.append(pieces)
+            aligned_pieces = pass2
+            ref_seq = rotated_ref
+            ref_annos = rotated_annos
+        # If _pick_rotation_offset returned 0 (all points covered),
+        # fall through to pass 1 pieces — split rendering is the best
+        # we can do.
+
+    # Store batch reference (possibly rotated) + rotation offset.
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO sanger_batches (batch_id, ref_sequence, ref_annotations, "
+            "ref_name, rotation_offset, created) VALUES (?,?,?,?,?,?)",
+            (batch_id, ref_seq, json.dumps(ref_annos), ref_label,
+             rotation_offset, now),
+        )
+        conn.commit()
+
+    results = []
+    errors = []
+
+    for st, pieces in zip(file_states, aligned_pieces):
+        if st["error"]:
+            errors.append({"file": st["filename"], "error": st["error"]})
+            continue
         if not pieces:
-            ab1_path.unlink(missing_ok=True)
-            errors.append({"file": file.filename, "error": "No valid alignment"})
+            st["ab1_path"].unlink(missing_ok=True)
+            errors.append({"file": st["filename"], "error": "No valid alignment"})
             continue
 
-        base_name = safe_name.replace(".ab1", "").replace(".abi", "")
+        base_name = st["stored_name"].replace(ts + "_", "", 1).replace(".ab1", "").replace(".abi", "")
         if name and len(ab1) == 1:
             base_name = name
         is_rev = 1 if pieces[0].get("is_reverse") else 0
@@ -674,12 +893,12 @@ async def align_ab1(
                         query_start, query_end, ref_start, ref_end,
                         num_mismatches, num_gaps, is_reverse, trim_start, trim_end, created)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (batch_id, piece_name, stored_name, ref_source, ref_label,
+                    (batch_id, piece_name, st["stored_name"], ref_source, ref_label,
                      piece["identity_pct"], piece["aligned_query"], piece["aligned_ref"],
                      piece["score"], piece["query_start"], piece["query_end"],
                      piece["ref_start"], piece["ref_end"],
                      piece["num_mismatches"], piece["num_gaps"], is_rev,
-                     trim_start_idx, trim_end_idx, now),
+                     st["trim_start"], st["trim_end"], now),
                 )
                 conn.commit()
                 row = dict(conn.execute(
@@ -690,7 +909,197 @@ async def align_ab1(
     if not results and errors:
         raise HTTPException(400, f"All files failed: {errors[0]['error']}")
 
-    return {"items": results, "errors": errors, "batch_id": batch_id}
+    return {"items": results, "errors": errors, "batch_id": batch_id,
+            "rotation_offset": rotation_offset}
+
+
+# ── Bulk screen: N .ab1 files × M refs, ephemeral matrix ────────────────────
+# Purpose: "did my sequencing lab mix up my tubes?" Try each read against
+# a set of candidate refs, see where the identity spikes. Nothing is written
+# to sanger_alignments — clicking through a matrix cell calls the normal
+# /sanger/align endpoint for that one (file, ref) pair to persist it.
+
+@router.post("/sanger/screen")
+async def screen_ab1_multi_ref(
+    ab1: List[UploadFile] = File(...),
+    refs: str = Form(...),
+    trim_qual: Optional[int] = Form(20),
+):
+    """POST multi-file × multi-ref → matrix of scores. `refs` is a JSON
+    array of {source, id?, text?} objects, same schema as
+    get_reference_sequence's params (inventory table names, or
+    genbank/fasta/raw + text). Returns per-file rows with per-ref
+    scored results; the best hit per file is flagged. Alignments are
+    NOT written to the DB."""
+    try:
+        ref_specs = json.loads(refs)
+        assert isinstance(ref_specs, list) and ref_specs
+    except (json.JSONDecodeError, AssertionError, TypeError):
+        raise HTTPException(400, "refs must be a non-empty JSON array")
+
+    # Resolve every ref up-front so a bad ref-spec fails cleanly before
+    # we start reading potentially many AB1 files.
+    resolved_refs = []
+    for i, spec in enumerate(ref_specs):
+        try:
+            seq, name, _annos, is_circ = get_reference_sequence(
+                spec.get("source"), spec.get("id"), spec.get("text"))
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"ref[{i}] failed to parse: {e}")
+        resolved_refs.append({
+            "source": spec.get("source"),
+            "id": spec.get("id"),
+            "name": name,
+            "seq": seq,
+            "is_circular": is_circ,
+            "length": len(seq),
+        })
+
+    file_rows = []
+    trim_threshold = trim_qual if trim_qual and trim_qual > 0 else 0
+
+    for file in ab1:
+        # Parse the .ab1 in-memory (no disk write — this is ephemeral).
+        content = await file.read()
+        try:
+            trace_record = SeqIO.read(io.BytesIO(content), "abi")
+            query_seq_raw = str(trace_record.seq)
+            quals_raw = list(trace_record.letter_annotations["phred_quality"])
+        except Exception as e:
+            file_rows.append({"file": file.filename, "error": f"Parse failed: {e}",
+                              "results": []})
+            continue
+        if not query_seq_raw:
+            file_rows.append({"file": file.filename, "error": "No base calls",
+                              "results": []})
+            continue
+        if trim_threshold > 0:
+            query_seq, trim_start, trim_end = quality_trim(
+                query_seq_raw, quals_raw, threshold=trim_threshold)
+            if not query_seq:
+                file_rows.append({"file": file.filename,
+                                  "error": "No bases left after trimming",
+                                  "results": []})
+                continue
+        else:
+            query_seq, trim_start, trim_end = query_seq_raw, 0, len(query_seq_raw)
+
+        results = []
+        for r in resolved_refs:
+            pieces = do_alignment(query_seq, r["seq"], is_circular=r["is_circular"])
+            if not pieces:
+                results.append({
+                    "ref_source": r["source"], "ref_id": r["id"], "ref_name": r["name"],
+                    "score": 0.0, "identity_pct": 0.0,
+                    "ref_start": None, "ref_end": None, "is_reverse": None,
+                    "num_pieces": 0, "coverage_bp": 0, "ref_length": r["length"],
+                })
+                continue
+            # Sum coverage across pieces (wrap-split); use max identity.
+            total_cov = sum(int(p["ref_end"]) - int(p["ref_start"]) for p in pieces)
+            best_id = max(float(p["identity_pct"]) for p in pieces)
+            results.append({
+                "ref_source": r["source"], "ref_id": r["id"], "ref_name": r["name"],
+                "score": float(pieces[0]["score"]),
+                "identity_pct": round(best_id, 2),
+                "ref_start": int(pieces[0]["ref_start"]),
+                "ref_end": int(pieces[-1]["ref_end"]),
+                "is_reverse": bool(pieces[0].get("is_reverse")),
+                "num_pieces": len(pieces),
+                "coverage_bp": total_cov,
+                "ref_length": r["length"],
+            })
+        # Flag the best hit by score (identity is a fine tiebreak but score
+        # accounts for length — a 100% id on 200bp isn't a better hit than
+        # 98% on 5kb).
+        if results:
+            best_idx = max(range(len(results)), key=lambda i: results[i]["score"])
+            results[best_idx]["is_best"] = True
+        file_rows.append({
+            "file": file.filename,
+            "query_length": len(query_seq),
+            "trim_start": trim_start,
+            "trim_end": trim_end,
+            "results": results,
+        })
+
+    return {"files": file_rows, "refs": [
+        {"source": r["source"], "id": r["id"], "name": r["name"], "length": r["length"]}
+        for r in resolved_refs
+    ]}
+
+
+# ── Compare two sequences (both stored or pasted), no chromatogram ─────────
+class CompareRequest(BaseModel):
+    query_source: str
+    query_id: Optional[str] = None
+    query_text: Optional[str] = None
+    ref_source: str
+    ref_id: Optional[str] = None
+    ref_text: Optional[str] = None
+
+
+@router.post("/sanger/compare")
+def compare_sequences(body: CompareRequest):
+    """Align two sequences and return the result. Both sides come from
+    inventory (source=plasmids|gblocks|primers|kit_parts|parts + id) or
+    from pasted text (source=genbank|fasta|raw + text). Ephemeral —
+    nothing is stored. No trace, no batch record."""
+    try:
+        q_seq, q_name, _q_annos, q_circ = get_reference_sequence(
+            body.query_source, body.query_id, body.query_text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Query failed to parse: {e}")
+    try:
+        r_seq, r_name, _r_annos, r_circ = get_reference_sequence(
+            body.ref_source, body.ref_id, body.ref_text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Reference failed to parse: {e}")
+
+    if not q_seq or not r_seq:
+        raise HTTPException(400, "Both query and reference must have sequence")
+
+    # If either side is circular, treat the alignment as circular so a query
+    # spanning the ref's origin doesn't fragment. Query circularity doesn't
+    # affect the aligner (we align query bytes as a linear string) — only
+    # ref circularity matters for wrap handling.
+    pieces = do_alignment(q_seq, r_seq, is_circular=r_circ)
+    if not pieces:
+        raise HTTPException(400, "No alignment could be found")
+
+    is_rev = bool(pieces[0].get("is_reverse"))
+    total_cov = sum(int(p["ref_end"]) - int(p["ref_start"]) for p in pieces)
+    return {
+        "query_name": q_name,
+        "query_length": len(q_seq),
+        "ref_name": r_name,
+        "ref_length": len(r_seq),
+        "ref_is_circular": r_circ,
+        "is_reverse": is_rev,
+        "num_pieces": len(pieces),
+        "coverage_bp": total_cov,
+        "pieces": [
+            {
+                "aligned_ref": p["aligned_ref"],
+                "aligned_query": p["aligned_query"],
+                "identity_pct": p["identity_pct"],
+                "score": p["score"],
+                "num_mismatches": p["num_mismatches"],
+                "num_gaps": p["num_gaps"],
+                "ref_start": int(p["ref_start"]),
+                "ref_end": int(p["ref_end"]),
+                "query_start": int(p["query_start"]),
+                "query_end": int(p["query_end"]),
+            }
+            for p in pieces
+        ],
+    }
 
 
 @router.get("/sanger/batch/{batch_id}")

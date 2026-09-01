@@ -44,8 +44,20 @@ async function _saveRunToDb(run) {
       // Metadata values (side-panel form). Send even when empty ({}) so
       // clearing a field actually persists rather than reverting to
       // whatever was on disk. run.metadata is a plain object.
-      metadata_values: JSON.stringify(run.metadata || {})
+      metadata_values: JSON.stringify(run.metadata || {}),
+      // Linked-run group id. Empty string = unlink. null / undefined =
+      // leave as-is (Pydantic Optional[str] treats missing key as None).
+      // Only send it when it's actually set on the run object.
+      ...(run.linkedGroupId !== undefined ? {linked_group_id: run.linkedGroupId || ''} : {})
     });
+    // ── Local sibling propagation ────────────────────────────────
+    // Backend already fanned out to sibling rows in DB, but the local
+    // cache (_getAllRunsLocal) for other tabs is stale until reload.
+    // Mirror the shared fields onto every locally-known sibling so tab
+    // switches show current state without a reload.
+    if (run.linkedGroupId) {
+      _spPropagateToLocalSiblings(run);
+    }
   } catch(e) {
     // record may not exist yet - create it
     try {
@@ -89,7 +101,11 @@ async function _getAllRuns() {
         startedAt:   r.started_at,
         // Filled-in metadata values (side-panel form). Empty object when
         // the run is new or the schema was blank.
-        metadata:    meta
+        metadata:    meta,
+        // Linked-run group id — string when this run is linked to others,
+        // null when standalone. Used for tab-icon rendering + local
+        // propagation of ticks/deviations/scaling to sibling runs.
+        linkedGroupId: r.linked_group_id || null
       };
     });
     try { localStorage.setItem(_RUNS_KEY, JSON.stringify(dbRuns)); } catch(e) {}
@@ -114,6 +130,14 @@ async function _getAllRuns() {
     '.sp-run-group-badge{display:inline-block;font-size:11px;background:#e8f0e8;color:#5b7a5e;border:1px solid #c8d8c8;border-radius:3px;padding:1px 7px;margin-top:4px;font-weight:600}',
     '.sp-progress{height:4px;background:#e8e2d8;border-radius:2px;margin-bottom:18px}',
     '.sp-progress-fill{height:100%;background:#5b7a5e;border-radius:2px;transition:width .25s ease}',
+    /* Pre-flight warnings banner — always visible above the progress
+       bar when the protocol has warnings set. Warm amber tone so it
+       reads as "check" not "error". */
+    '.sp-run-warnings{background:#fdf6e6;border:1px solid #e8a735;border-left:4px solid #e8a735;border-radius:4px;padding:10px 14px;margin-bottom:14px}',
+    '.sp-run-warnings-head{display:flex;align-items:center;gap:8px;font-weight:600;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#8a5b0d;margin-bottom:6px}',
+    '.sp-run-warnings-icon{font-size:15px;color:#e8a735;line-height:1}',
+    '.sp-run-warnings-list{margin:0;padding-left:22px;color:#4a4139;font-size:13px;line-height:1.5}',
+    '.sp-run-warnings-list li{margin:2px 0}',
     '.sp-recipe-section{background:#f0ebe3;border:1px solid #d5cec0;border-radius:8px;padding:14px;margin-bottom:18px}',
     '.sp-recipe-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}',
     '.sp-recipe-label{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72}',
@@ -755,7 +779,8 @@ async function spResumeRunById(runId) {
         group_name:  dbRun.group_name || 'Protocols',
         subgroup:    dbRun.subgroup || '',
         startedAt:   dbRun.started_at,
-        metadata:    meta
+        metadata:    meta,
+        linkedGroupId: dbRun.linked_group_id || null
       };
       _saveLocalOnly(_scratchProtoRun);
       if (typeof setView === 'function') setView('scratch');
@@ -795,6 +820,33 @@ async function spDiscardRunById(runId) {
 }
 
 // ── run view ──────────────────────────────────────────────────────────────────
+// Pre-flight warnings banner — reads rs.protocol.warnings (JSON string
+// from the protocols row, snapshotted into protocol_json when the run
+// was started). Always visible while the run is open; not dismissable
+// on purpose (the point is to prompt every time).
+function _renderRunWarnings(rs) {
+  if (!rs || !rs.protocol) return '';
+  var raw = rs.protocol.warnings;
+  var warnings = [];
+  if (Array.isArray(raw)) {
+    warnings = raw;
+  } else if (typeof raw === 'string' && raw.trim()) {
+    try { var p = JSON.parse(raw); if (Array.isArray(p)) warnings = p; } catch(e) {}
+  }
+  warnings = warnings.filter(function(w){ return typeof w === 'string' && w.trim(); });
+  if (!warnings.length) return '';
+  var items = warnings.map(function(w) {
+    return '<li>' + esc(w) + '</li>';
+  }).join('');
+  return '<div class="sp-run-warnings" role="note">' +
+    '<div class="sp-run-warnings-head">' +
+      '<span class="sp-run-warnings-icon">&#9888;</span>' +
+      '<span>Before you start</span>' +
+    '</div>' +
+    '<ul class="sp-run-warnings-list">' + items + '</ul>' +
+    '</div>';
+}
+
 function _renderProtoRunInScratch(el) {
   var rs = _scratchProtoRun; if (!rs) return;
   var done = rs.steps.filter(function(s) { return s.done; }).length;
@@ -818,15 +870,23 @@ function _renderProtoRunInScratch(el) {
       '<div class="sp-run-main">' +
         '<div class="sp-run-header">' +
           '<div>' +
-            '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) + '</div>' +
-            '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;&#183;&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + '</div>' +
+            '<div class="sp-run-title">&#9654; ' + esc(rs.protocol.title) +
+              (rs.linkedGroupId ? ' <span style="color:hsl(' + _spLinkedGroupHue(rs.linkedGroupId) + ',55%,42%);font-size:14px" title="Linked to other runs — steps/deviations/scaling propagate">&#128279;</span>' : '') +
+            '</div>' +
+            '<div class="sp-run-meta" id="sp-run-meta">' + done + ' / ' + rs.steps.length + ' steps &nbsp;&#183;&nbsp; started ' + new Date(rs.startedAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) +
+              (rs.linkedGroupId ? ' &nbsp;&#183;&nbsp; <span style="color:hsl(' + _spLinkedGroupHue(rs.linkedGroupId) + ',55%,35%)">linked group</span>' : '') +
+            '</div>' +
             '<span class="sp-run-group-badge">&#128193; ' + esc(groupLabel) + '</span>' +
           '</div>' +
-          '<div style="display:flex;gap:6px">' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+            (rs.linkedGroupId
+              ? '<button class="btn" onclick="spUnlinkRun()" title="Break the link — this run becomes independent">&#128279;&#10060; Unlink</button>'
+              : '<button class="btn" onclick="spDuplicateAsLinked()" title="Create a linked copy — step ticks propagate, metadata stays separate">&#128279;+ Duplicate as linked</button>') +
             '<button class="btn" onclick="spSaveAndExit()">&#9632; Save &amp; exit</button>' +
             '<button class="btn" style="color:#c0392b" onclick="spAbandonRun()">&#215; Abandon</button>' +
           '</div>' +
         '</div>' +
+        _renderRunWarnings(rs) +
         '<div class="sp-progress"><div class="sp-progress-fill" id="sp-pfill" style="width:' + pct + '%"></div></div>' +
         '<div id="sp-recipe-wrap">' + _renderRunRecipe() + '</div>' +
         '<div style="font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:#8a7f72;margin-bottom:10px">Steps</div>' +
@@ -842,6 +902,86 @@ function _renderProtoRunInScratch(el) {
         _spRenderMetaPanel(rs) +
       '</aside>' +
     '</div>';
+}
+
+// ── Linked-runs handlers ──────────────────────────────────────────────────
+// Steps + deviations + recipe + scaling propagate; metadata_values stays
+// per-run. Backend enforces the propagation authoritatively (see the
+// PUT /active-runs/{id} handler); this client-side mirror keeps the
+// local run cache in sync so tab-switches don't show stale data
+// between saves.
+
+// After a save on a linked run, update the locally-cached copies of
+// every sibling run to match the shared fields. Doesn't touch metadata.
+function _spPropagateToLocalSiblings(sourceRun) {
+  if (!sourceRun.linkedGroupId) return;
+  var runs = _getAllRunsLocal();
+  var changed = false;
+  runs.forEach(function(r) {
+    if (r.runId === sourceRun.runId) return;
+    if (r.linkedGroupId !== sourceRun.linkedGroupId) return;
+    r.steps       = JSON.parse(JSON.stringify(sourceRun.steps));
+    r.recipe      = JSON.parse(JSON.stringify(sourceRun.recipe));
+    r.scaling     = sourceRun.scaling;
+    r.scaleFactor = sourceRun.scaleFactor;
+    changed = true;
+  });
+  if (changed) {
+    try { localStorage.setItem(_RUNS_KEY, JSON.stringify(runs)); } catch (e) {}
+    // If one of the affected siblings happens to also be _scratchProtoRun
+    // (rare — same tab, but possible if the user duplicated then switched)
+    // its in-memory copy stays stale until next _saveRun. Not worth
+    // syncing here; the switch path already re-hydrates.
+  }
+}
+
+async function spDuplicateAsLinked() {
+  var rs = _scratchProtoRun; if (!rs) { toast('No active run', true); return; }
+  // Save current state first so the duplicate copies the latest ticks.
+  await _saveRunToDb(rs);
+  try {
+    var resp = await api('POST', '/api/active-runs/' + encodeURIComponent(rs.runId) + '/duplicate-linked');
+    // Refresh runs from server so both source (now with linkedGroupId)
+    // and the new run appear correctly in the tab bar.
+    var all = await _getAllRuns();
+    var newRun = all.find(function(r) { return r.runId === resp.new_run_id; });
+    var srcRun = all.find(function(r) { return r.runId === rs.runId; });
+    // Update the in-memory active run so the header re-renders with the
+    // new linkedGroupId (source got it too when backend created group).
+    if (srcRun) _scratchProtoRun = srcRun;
+    toast('Linked run created');
+    // Switch to the new run so user starts filling its metadata.
+    if (newRun) {
+      await spSwitchRun(newRun.runId);
+    } else {
+      // Fallback: just re-render.
+      var el = document.getElementById('scratch-view');
+      if (el && typeof _renderScratchProtoRun === 'function') _renderScratchProtoRun(el);
+      else if (typeof setView === 'function') setView('scratch');
+    }
+  } catch (e) {
+    toast('Duplicate failed: ' + (e.message || e), true);
+  }
+}
+
+async function spUnlinkRun() {
+  var rs = _scratchProtoRun; if (!rs || !rs.linkedGroupId) return;
+  if (!confirm('Unlink this run? Future changes will no longer propagate to its linked siblings.')) return;
+  var prevGid = rs.linkedGroupId;
+  rs.linkedGroupId = null;
+  try {
+    await api('PUT', '/api/active-runs/' + encodeURIComponent(rs.runId), {
+      linked_group_id: ''  // empty string = unlink
+    });
+    // Also strip the local cache copy so tabs render with the link
+    // indicator removed on next redraw.
+    _saveLocalOnly(rs);
+    toast('Unlinked');
+    if (typeof setView === 'function') setView('scratch');
+  } catch (e) {
+    rs.linkedGroupId = prevGid;  // rollback
+    toast('Unlink failed: ' + (e.message || e), true);
+  }
 }
 
 // ── Metadata side panel (protocol-run details) ───────────────────────────
@@ -1089,10 +1229,17 @@ function _renderRunTabs() {
     var doneCount = (r.steps || []).filter(function(s){return s.done;}).length;
     var total = (r.steps || []).length;
     var title = (r.protocol && r.protocol.title) || 'Untitled';
+    // Linked-run indicator: chain-link glyph tinted by the group id
+    // (deterministic colour hash — same colour for all runs in one group).
+    var linkChip = '';
+    if (r.linkedGroupId) {
+      var hue = _spLinkedGroupHue(r.linkedGroupId);
+      linkChip = ' <span class="sp-runtab-link" style="color:hsl(' + hue + ',55%,42%)" title="Linked to other runs — step ticks propagate">&#128279;</span>';
+    }
     return '<div class="sp-runtab' + (isActive ? ' active' : '') + '" ' +
                 'onclick="spSwitchRun(\'' + esc(r.runId) + '\')" ' +
-                'title="' + esc(title) + ' — ' + doneCount + '/' + total + ' steps">' +
-      '<span class="sp-runtab-title">' + esc(title) + '</span>' +
+                'title="' + esc(title) + ' — ' + doneCount + '/' + total + ' steps' + (r.linkedGroupId ? ' (linked)' : '') + '">' +
+      '<span class="sp-runtab-title">' + esc(title) + '</span>' + linkChip +
       '<span class="sp-runtab-count">' + doneCount + '/' + total + '</span>' +
       '<button class="sp-runtab-x" onclick="event.stopPropagation();spDiscardRunTab(\'' + esc(r.runId) + '\')" title="Discard this run">&#215;</button>' +
     '</div>';
@@ -1101,6 +1248,15 @@ function _renderRunTabs() {
     '<button class="sp-runtab sp-runtab-add" onclick="spShowRunPickerInline()" title="Start another run alongside this one">+ Run another</button>' +
     '<div id="sp-runpicker-inline" style="flex-basis:100%"></div>' +
     '</div>';
+}
+
+// Deterministic hue (0–360) for a linked_group_id, so all runs in the
+// same group get the same chain-link colour. Just sums char codes;
+// collisions are visually fine (different groups may share a hue).
+function _spLinkedGroupHue(gid) {
+  var h = 0;
+  for (var i = 0; i < gid.length; i++) h = (h + gid.charCodeAt(i) * 13) % 360;
+  return h;
 }
 
 async function spSwitchRun(runId) {

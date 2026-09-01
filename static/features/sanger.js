@@ -56,9 +56,29 @@ async function renderSanger(el) {
     SG._preselectRef = pendingSg;  // { type: 'plasmid'|'kitpart'|..., id: N }
   }
 
-  if (SG.view === 'new')    return renderNew(el);
-  if (SG.view === 'viewer') return renderViewer(el);
+  if (SG.view === 'new')     return renderNew(el);
+  if (SG.view === 'screen')  return renderScreen(el);
+  if (SG.view === 'compare') return renderCompare(el);
+  if (SG.view === 'viewer')  return renderViewer(el);
   return renderList(el);
+}
+
+/* ── Shared mode-tabs helper (used by renderNew / renderScreen / renderCompare)
+   Lets the user swap between the three "new alignment" workflows in one click.
+   All three share this bar so navigating between them is natural.        */
+function sgModeTabs(currentMode) {
+  var modes = [
+    ['single',  'Single alignment',  'new'],
+    ['screen',  'Screen refs',       'screen'],
+    ['compare', 'Compare sequences', 'compare'],
+  ];
+  var h = '<div class="sg-tabs" style="margin-bottom:18px">';
+  modes.forEach(function(m) {
+    var active = (currentMode === m[0]) ? ' active' : '';
+    h += '<button class="sg-tab' + active + '" onclick="sgNav(\'' + m[2] + '\')">' + m[1] + '</button>';
+  });
+  h += '</div>';
+  return h;
 }
 
 /* ── LIST VIEW ───────────────────────────────────────────── */
@@ -119,9 +139,10 @@ async function renderNew(el) {
   } catch(e) { SG.refs = []; }
 
   var h = '<div style="max-width:720px;margin:0 auto">';
-  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:24px">';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">';
   h += '<button class="sg-btn-ghost" onclick="sgNav(\'list\')">← Back</button>';
   h += '<div class="sg-section-hdr">new alignment</div></div>';
+  h += sgModeTabs('single');
 
   h += '<label class="sg-label">Name <span style="font-variant:normal;text-transform:none;letter-spacing:0;color:#b0a89a">(optional)</span></label>';
   h += '<input type="text" id="sg-name" class="sg-input" placeholder="e.g. Colony 1 fwd">';
@@ -280,6 +301,414 @@ async function sgRunAlign() {
     sgOpenBatch(res.batch_id);
   } catch(e) { toast(e.message,true); btn.disabled=false; btn.textContent='Align'; status.textContent=''; }
 }
+
+/* ── SCREEN VIEW: multi-file × multi-ref ephemeral matrix ────────────
+   Purpose: "did the sequencing lab mix up my tubes?" — try each read
+   against a set of candidate references and see where the identity
+   spikes. Results are NOT persisted. Clicking a matrix cell fires a
+   normal /sanger/align for that (file, ref) pair, which becomes a
+   real alignment record.                                              */
+async function renderScreen(el) {
+  try {
+    var refData = await api('GET', '/api/sanger/references');
+    SG.refs = refData.items || [];
+  } catch (e) { SG.refs = []; }
+  if (!SG._screenSelectedRefs) SG._screenSelectedRefs = {};   // {"plasmids:5": true, ...}
+  if (!SG._screenFilter) SG._screenFilter = '';
+
+  var h = '<div style="max-width:960px;margin:0 auto">';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">';
+  h += '<button class="sg-btn-ghost" onclick="sgNav(\'list\')">← Back</button>';
+  h += '<div class="sg-section-hdr">screen against multiple refs</div></div>';
+  h += sgModeTabs('screen');
+
+  h += '<div style="color:#8a7f72;font-size:.85rem;margin-bottom:14px">' +
+       'Upload the AB1 file(s) you\u2019re not sure about, tick the refs to test them against. ' +
+       'Each pair gets scored; nothing is stored unless you click a result to persist it.' +
+       '</div>';
+
+  h += '<label class="sg-label">AB1 files</label>';
+  h += '<div id="sg-scr-drop" class="sg-drop" onclick="document.getElementById(\'sg-scr-input\').click()">';
+  h += '<div id="sg-scr-label">Drop .ab1 file(s) here or click to browse</div>';
+  h += '<input type="file" id="sg-scr-input" accept=".ab1,.abi" multiple style="display:none"></div>';
+  h += '<div id="sg-scr-file-list" style="margin-top:6px"></div>';
+
+  h += '<label class="sg-label" style="margin-top:16px">References to try</label>';
+  h += '<div style="display:flex;gap:8px;margin-bottom:6px">';
+  h += '<input type="text" class="sg-input" id="sg-scr-filter" placeholder="Filter by name\u2026" oninput="_sgScreenFilter(this.value)" style="flex:1">';
+  h += '<button class="sg-btn-ghost" onclick="_sgScreenSelectAll(true)">Select all</button>';
+  h += '<button class="sg-btn-ghost" onclick="_sgScreenSelectAll(false)">Clear</button>';
+  h += '</div>';
+  h += '<div id="sg-scr-refs" style="border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;max-height:280px;overflow-y:auto;padding:6px 10px">';
+  h += _sgScreenRefListHtml();
+  h += '</div>';
+  h += '<div id="sg-scr-count" style="font-size:.75rem;color:#8a7f72;margin-top:4px">' + _sgScreenCountText() + '</div>';
+
+  h += '<label class="sg-label" style="margin-top:16px">Quality trim</label>';
+  h += '<div style="display:flex;align-items:center;gap:12px">';
+  h += '<input type="range" id="sg-scr-trim" min="0" max="40" value="20" style="flex:1;accent-color:#5b7a5e" oninput="document.getElementById(\'sg-scr-trim-val\').textContent=this.value===\'0\'?\'Off\':\'Q\'+this.value">';
+  h += '<span id="sg-scr-trim-val" style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.82rem;color:#4a4139;min-width:36px">Q20</span>';
+  h += '</div>';
+
+  h += '<button class="sg-btn-pri" style="margin-top:24px;width:100%" onclick="sgRunScreen()" id="sg-scr-btn">Screen</button>';
+  h += '<div id="sg-scr-status" style="margin-top:12px;color:#8a7f72;font-size:.85rem"></div>';
+  h += '<div id="sg-scr-results" style="margin-top:20px"></div>';
+  h += '</div>';
+  el.innerHTML = sgStyles() + h;
+
+  setTimeout(function() {
+    var inp = document.getElementById('sg-scr-input');
+    var drop = document.getElementById('sg-scr-drop');
+    if (inp) inp.onchange = function() { _sgScrUpdateFiles(); };
+    if (drop) {
+      drop.ondragover = function(e) { e.preventDefault(); drop.style.borderColor = '#5b7a5e'; };
+      drop.ondragleave = function() { drop.style.borderColor = '#d5cec0'; };
+      drop.ondrop = function(e) { e.preventDefault(); inp.files = e.dataTransfer.files; _sgScrUpdateFiles(); };
+    }
+  }, 50);
+}
+function _sgScrUpdateFiles() {
+  var inp = document.getElementById('sg-scr-input');
+  var list = document.getElementById('sg-scr-file-list');
+  var label = document.getElementById('sg-scr-label');
+  var drop = document.getElementById('sg-scr-drop');
+  if (!inp || !list) return;
+  var f = inp.files;
+  if (!f.length) { list.innerHTML = ''; label.textContent = 'Drop .ab1 file(s) here or click to browse'; drop.style.borderColor = '#d5cec0'; return; }
+  drop.style.borderColor = '#5b7a5e';
+  if (f.length === 1) { label.textContent = f[0].name; list.innerHTML = ''; return; }
+  label.textContent = f.length + ' files selected';
+  var names = [];
+  for (var i = 0; i < f.length; i++) names.push(esc(f[i].name));
+  list.innerHTML = '<div style="font-size:.75rem;color:#8a7f72">' + names.join(', ') + '</div>';
+}
+// Ref list — one checkbox row per inventory item, filtered by search.
+// Keys like "plasmids:5" match the SG.refs.type prefix used in
+// renderNew's dropdown. We reuse SG.refs (already fetched) so the same
+// items appear in both flows.
+function _sgScreenRefListHtml() {
+  var filt = (SG._screenFilter || '').toLowerCase();
+  var items = SG.refs.filter(function(r) {
+    if (!filt) return true;
+    return (r.name || '').toLowerCase().indexOf(filt) >= 0 ||
+           (r.meta || '').toLowerCase().indexOf(filt) >= 0;
+  });
+  if (!items.length) return '<div style="color:#8a7f72;padding:6px 0">No references match.</div>';
+  var h = '';
+  items.forEach(function(r) {
+    var key = r.type + ':' + r.id;
+    var checked = SG._screenSelectedRefs[key] ? 'checked' : '';
+    var meta = r.meta ? ' <span style="color:#8a7f72;font-size:.75rem">\u00b7 ' + esc(r.meta) + '</span>' : '';
+    h += '<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;font-size:.82rem">';
+    h += '<input type="checkbox" ' + checked + ' onchange="_sgScreenToggleRef(\'' + key + '\', this.checked)">';
+    h += '<span style="color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;min-width:60px">' + esc(r.label) + '</span>';
+    h += '<span>' + esc(r.name) + meta + '</span>';
+    h += '</label>';
+  });
+  return h;
+}
+function _sgScreenCountText() {
+  var n = Object.keys(SG._screenSelectedRefs).filter(function(k) { return SG._screenSelectedRefs[k]; }).length;
+  return n ? (n + ' reference' + (n === 1 ? '' : 's') + ' selected') : 'No references selected';
+}
+window._sgScreenFilter = function(v) {
+  SG._screenFilter = v;
+  var list = document.getElementById('sg-scr-refs');
+  if (list) list.innerHTML = _sgScreenRefListHtml();
+};
+window._sgScreenToggleRef = function(key, on) {
+  SG._screenSelectedRefs[key] = !!on;
+  var c = document.getElementById('sg-scr-count');
+  if (c) c.textContent = _sgScreenCountText();
+};
+window._sgScreenSelectAll = function(on) {
+  var filt = (SG._screenFilter || '').toLowerCase();
+  SG.refs.forEach(function(r) {
+    if (!filt || (r.name || '').toLowerCase().indexOf(filt) >= 0 ||
+                 (r.meta || '').toLowerCase().indexOf(filt) >= 0) {
+      SG._screenSelectedRefs[r.type + ':' + r.id] = !!on;
+    }
+  });
+  var list = document.getElementById('sg-scr-refs');
+  if (list) list.innerHTML = _sgScreenRefListHtml();
+  var c = document.getElementById('sg-scr-count');
+  if (c) c.textContent = _sgScreenCountText();
+};
+async function sgRunScreen() {
+  var btn = document.getElementById('sg-scr-btn');
+  var status = document.getElementById('sg-scr-status');
+  var inp = document.getElementById('sg-scr-input');
+  if (!inp || !inp.files.length) { toast('Upload at least one AB1 file', true); return; }
+  var refKeys = Object.keys(SG._screenSelectedRefs).filter(function(k) { return SG._screenSelectedRefs[k]; });
+  if (!refKeys.length) { toast('Select at least one reference', true); return; }
+
+  var refs = refKeys.map(function(k) {
+    var p = k.split(':');
+    return { source: p[0], id: p[1] };
+  });
+  var fd = new FormData();
+  for (var i = 0; i < inp.files.length; i++) fd.append('ab1', inp.files[i]);
+  fd.append('refs', JSON.stringify(refs));
+  var trimVal = document.getElementById('sg-scr-trim');
+  fd.append('trim_qual', trimVal ? trimVal.value : '20');
+
+  btn.disabled = true; btn.textContent = 'Screening\u2026';
+  status.textContent = 'Aligning ' + inp.files.length + ' file(s) \u00d7 ' + refs.length + ' ref(s) \u2014 this may take a moment\u2026';
+  try {
+    var resp = await fetch('/api/sanger/screen', { method: 'POST', body: fd });
+    if (!resp.ok) { var e = await resp.json().catch(function(){return{detail:resp.statusText};}); throw new Error(e.detail || 'Failed'); }
+    var data = await resp.json();
+    SG._lastScreenFiles = inp.files;   // stash so click-to-persist can re-send
+    sgRenderScreenResults(data);
+    status.textContent = 'Done \u00b7 click a cell to keep that pair as a full alignment';
+  } catch (err) {
+    toast(err.message, true);
+    status.textContent = '';
+  }
+  btn.disabled = false; btn.textContent = 'Screen';
+}
+function sgRenderScreenResults(data) {
+  var out = document.getElementById('sg-scr-results');
+  if (!out) return;
+  if (!data.files || !data.files.length) { out.innerHTML = '<div style="color:#c25a4a">No results.</div>'; return; }
+  var refs = data.refs || [];
+  var h = '<div class="sg-table-wrap"><table class="sg-table sg-screen-table"><thead><tr>';
+  h += '<th>File</th>';
+  refs.forEach(function(r) {
+    h += '<th title="' + esc(r.name) + ' (' + r.length + ' bp)" style="min-width:120px;max-width:200px">' + esc(r.name) + '</th>';
+  });
+  h += '</tr></thead><tbody>';
+  data.files.forEach(function(f, fileIdx) {
+    h += '<tr>';
+    var label = esc(f.file) + '<div style="font-size:.7rem;color:#8a7f72">' + (f.query_length || 0) + ' bp</div>';
+    if (f.error) label += '<div style="color:#c25a4a;font-size:.7rem">' + esc(f.error) + '</div>';
+    h += '<td style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.82rem">' + label + '</td>';
+    if (f.error) {
+      refs.forEach(function() { h += '<td style="color:#c0b8b0">\u2014</td>'; });
+    } else {
+      (f.results || []).forEach(function(res, refIdx) {
+        var pct = res.identity_pct || 0;
+        var bg = pct >= 95 ? '#d5e7d5' : pct >= 70 ? '#f2e6c8' : '#f0dcd8';
+        var textColor = pct >= 95 ? '#3a5a3d' : pct >= 70 ? '#8a5b0d' : '#8a3a30';
+        var star = res.is_best ? ' \u2b50' : '';
+        var cov = res.coverage_bp + '/' + res.ref_length + 'bp';
+        h += '<td style="background:' + bg + ';color:' + textColor + ';cursor:pointer;font-size:.85rem" ' +
+             'title="Click to run a full alignment for this pair (persists it)" ' +
+             'onclick="_sgScreenPersistCell(' + fileIdx + ',' + refIdx + ')">' +
+             '<div style="font-weight:600">' + pct.toFixed(1) + '%' + star + '</div>' +
+             '<div style="font-size:.7rem;opacity:.75">' + cov + (res.is_reverse ? ' \u00b7 RC' : '') + '</div>' +
+             '</td>';
+      });
+    }
+    h += '</tr>';
+  });
+  h += '</tbody></table></div>';
+  h += '<div style="margin-top:10px;font-size:.75rem;color:#8a7f72">' +
+       '<span style="display:inline-block;width:12px;height:12px;background:#d5e7d5;vertical-align:middle;margin-right:4px"></span> \u226595% ' +
+       '<span style="display:inline-block;width:12px;height:12px;background:#f2e6c8;vertical-align:middle;margin:0 4px 0 12px"></span> 70\u201395% ' +
+       '<span style="display:inline-block;width:12px;height:12px;background:#f0dcd8;vertical-align:middle;margin:0 4px 0 12px"></span> <70% \u00b7 ' +
+       '\u2b50 = best score per row' +
+       '</div>';
+  SG._lastScreenData = data;   // stash for the click-to-persist handler
+  out.innerHTML = h;
+}
+// Click a matrix cell → send just THAT (file, ref) pair to /sanger/align
+// and navigate into the resulting batch. Uses stashed FileList + ref info
+// from the last screen run.
+window._sgScreenPersistCell = async function(fileIdx, refIdx) {
+  var files = SG._lastScreenFiles;
+  var data = SG._lastScreenData;
+  if (!files || !data) { toast('Screen data lost \u2014 re-run screen', true); return; }
+  var fileRow = data.files[fileIdx];
+  var refInfo = data.refs[refIdx];
+  if (!fileRow || !refInfo) return;
+  // Find the file blob matching fileRow.file (by name).
+  var fileBlob = null;
+  for (var i = 0; i < files.length; i++) {
+    if (files[i].name === fileRow.file) { fileBlob = files[i]; break; }
+  }
+  if (!fileBlob) { toast('File no longer available \u2014 re-upload', true); return; }
+  var trimVal = document.getElementById('sg-scr-trim');
+  var fd = new FormData();
+  fd.append('ab1', fileBlob);
+  fd.append('ref_source', refInfo.source);
+  fd.append('ref_id', String(refInfo.id));
+  fd.append('trim_qual', trimVal ? trimVal.value : '20');
+  fd.append('name', fileRow.file.replace(/\.ab1$|\.abi$/i, '') + ' vs ' + refInfo.name);
+  toast('Running full alignment\u2026');
+  try {
+    var resp = await fetch('/api/sanger/align', { method: 'POST', body: fd });
+    if (!resp.ok) throw new Error((await resp.json().catch(function(){return{};})).detail || 'Failed');
+    var res = await resp.json();
+    SG.batchId = res.batch_id;
+    sgOpenBatch(res.batch_id);
+  } catch (err) {
+    toast(err.message, true);
+  }
+};
+
+/* ── COMPARE VIEW: two stored/pasted sequences, ephemeral ─────────── */
+async function renderCompare(el) {
+  try {
+    var refData = await api('GET', '/api/sanger/references');
+    SG.refs = refData.items || [];
+  } catch (e) { SG.refs = []; }
+  if (!SG._cmpQuerySide) SG._cmpQuerySide = { mode: 'inventory' };  // 'inventory' | 'paste'
+  if (!SG._cmpRefSide)   SG._cmpRefSide   = { mode: 'inventory' };
+
+  var h = '<div style="max-width:960px;margin:0 auto">';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">';
+  h += '<button class="sg-btn-ghost" onclick="sgNav(\'list\')">← Back</button>';
+  h += '<div class="sg-section-hdr">compare two sequences</div></div>';
+  h += sgModeTabs('compare');
+
+  h += '<div style="color:#8a7f72;font-size:.85rem;margin-bottom:14px">' +
+       'Align any two sequences (from your inventory or pasted). No AB1 needed. ' +
+       'Result is shown once and not stored.' +
+       '</div>';
+
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">';
+  h += _sgCmpSideHtml('Query',     'q', SG._cmpQuerySide);
+  h += _sgCmpSideHtml('Reference', 'r', SG._cmpRefSide);
+  h += '</div>';
+
+  h += '<button class="sg-btn-pri" style="margin-top:24px;width:100%" onclick="sgRunCompare()" id="sg-cmp-btn">Compare</button>';
+  h += '<div id="sg-cmp-status" style="margin-top:12px;color:#8a7f72;font-size:.85rem"></div>';
+  h += '<div id="sg-cmp-results" style="margin-top:20px"></div>';
+  h += '</div>';
+  el.innerHTML = sgStyles() + h;
+}
+function _sgCmpSideHtml(title, sidePrefix, sideState) {
+  var h = '<div style="border:1px solid #d5cec0;border-radius:6px;padding:14px;background:#faf8f4">';
+  h += '<div class="sg-label" style="margin-top:0">' + esc(title) + '</div>';
+  h += '<div class="sg-tabs" style="margin-bottom:10px">';
+  h += '<button class="sg-tab' + (sideState.mode === 'inventory' ? ' active' : '') +
+       '" onclick="_sgCmpSetMode(\'' + sidePrefix + '\',\'inventory\')">From inventory</button>';
+  h += '<button class="sg-tab' + (sideState.mode === 'paste' ? ' active' : '') +
+       '" onclick="_sgCmpSetMode(\'' + sidePrefix + '\',\'paste\')">Paste sequence</button>';
+  h += '</div>';
+  if (sideState.mode === 'inventory') {
+    h += '<select id="sg-cmp-' + sidePrefix + '-sel" class="sg-input"><option value="">Select\u2026</option>';
+    var groups = {};
+    SG.refs.forEach(function(r) { if (!groups[r.label]) groups[r.label] = []; groups[r.label].push(r); });
+    Object.keys(groups).forEach(function(label) {
+      h += '<optgroup label="' + esc(label) + 's">';
+      groups[label].forEach(function(r) {
+        var meta = r.meta ? ' \u00b7 ' + r.meta : '';
+        h += '<option value="' + r.type + ':' + r.id + '">' + esc(r.name) + esc(meta) + '</option>';
+      });
+      h += '</optgroup>';
+    });
+    h += '</select>';
+    if (!SG.refs.length) h += '<div style="color:#8a7f72;font-size:.85rem;margin-top:4px">No items with .gb files found.</div>';
+  } else {
+    h += '<textarea id="sg-cmp-' + sidePrefix + '-txt" class="sg-input" rows="6" placeholder="Paste raw DNA / FASTA / GenBank" style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.78rem"></textarea>';
+  }
+  h += '</div>';
+  return h;
+}
+window._sgCmpSetMode = function(side, mode) {
+  var state = (side === 'q') ? SG._cmpQuerySide : SG._cmpRefSide;
+  state.mode = mode;
+  renderCompare(document.getElementById('content'));
+};
+async function sgRunCompare() {
+  var btn = document.getElementById('sg-cmp-btn');
+  var status = document.getElementById('sg-cmp-status');
+  var body = { query_source: '', ref_source: '' };
+  // Query side
+  if (SG._cmpQuerySide.mode === 'inventory') {
+    var qs = document.getElementById('sg-cmp-q-sel');
+    if (!qs || !qs.value) { toast('Select a query', true); return; }
+    var qp = qs.value.split(':');
+    body.query_source = qp[0]; body.query_id = qp[1];
+  } else {
+    var qt = (document.getElementById('sg-cmp-q-txt') || {}).value || '';
+    if (!qt.trim()) { toast('Paste a query sequence', true); return; }
+    body.query_source = qt.trim().startsWith('LOCUS') ? 'genbank' :
+                        qt.trim().startsWith('>') ? 'fasta' : 'raw';
+    body.query_text = qt.trim();
+  }
+  // Ref side
+  if (SG._cmpRefSide.mode === 'inventory') {
+    var rs = document.getElementById('sg-cmp-r-sel');
+    if (!rs || !rs.value) { toast('Select a reference', true); return; }
+    var rp = rs.value.split(':');
+    body.ref_source = rp[0]; body.ref_id = rp[1];
+  } else {
+    var rt = (document.getElementById('sg-cmp-r-txt') || {}).value || '';
+    if (!rt.trim()) { toast('Paste a reference sequence', true); return; }
+    body.ref_source = rt.trim().startsWith('LOCUS') ? 'genbank' :
+                      rt.trim().startsWith('>') ? 'fasta' : 'raw';
+    body.ref_text = rt.trim();
+  }
+
+  btn.disabled = true; btn.textContent = 'Comparing\u2026';
+  status.textContent = 'Aligning\u2026';
+  try {
+    var resp = await api('POST', '/api/sanger/compare', body);
+    sgRenderCompareResults(resp);
+    status.textContent = '';
+  } catch (e) {
+    toast((e && e.message) || 'Compare failed', true);
+    status.textContent = '';
+  }
+  btn.disabled = false; btn.textContent = 'Compare';
+}
+function sgRenderCompareResults(data) {
+  var out = document.getElementById('sg-cmp-results');
+  if (!out) return;
+  var h = '<div style="background:#faf8f4;border:1px solid #d5cec0;border-radius:6px;padding:16px">';
+  h += '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">';
+  h += '<div><strong>' + esc(data.query_name) + '</strong> <span style="color:#8a7f72;font-size:.82rem">(' + data.query_length + ' bp)</span> ' +
+       '<span style="color:#8a7f72">vs</span> <strong>' + esc(data.ref_name) + '</strong> ' +
+       '<span style="color:#8a7f72;font-size:.82rem">(' + data.ref_length + ' bp' + (data.ref_is_circular ? ', circular' : '') + ')</span></div>';
+  h += '<div>' + (data.is_reverse ? '<span style="color:#c9a84c;font-weight:600">reverse-complement match</span>' : '') + '</div>';
+  h += '</div>';
+
+  data.pieces.forEach(function(p, i) {
+    var partLabel = data.pieces.length > 1 ? ' (part ' + (i + 1) + '/' + data.pieces.length + ')' : '';
+    h += '<div style="margin-top:' + (i === 0 ? '0' : '18px') + ';padding-top:' + (i === 0 ? '0' : '12px') + ';' +
+         (i > 0 ? 'border-top:1px dashed #d5cec0;' : '') + '">';
+    h += '<div style="display:flex;gap:16px;font-size:.82rem;color:#4a4139;margin-bottom:8px">';
+    h += 'identity: ' + identityBadge(p.identity_pct) + ' \u00b7 ';
+    h += 'ref ' + p.ref_start + '\u2013' + p.ref_end + ' \u00b7 query ' + p.query_start + '\u2013' + p.query_end + ' \u00b7 ';
+    h += p.num_mismatches + ' mm, ' + p.num_gaps + ' gaps' + partLabel;
+    h += '</div>';
+    h += _sgCompareAlignmentBlock(p);
+    h += '</div>';
+  });
+
+  h += '</div>';
+  out.innerHTML = h;
+}
+// BLAST-style alignment block: 60 cols per row, ref/match/query stacked.
+function _sgCompareAlignmentBlock(piece) {
+  var ref = piece.aligned_ref || '';
+  var qry = piece.aligned_query || '';
+  var W = 60;
+  var out = '<pre style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.78rem;background:#fff;border:1px solid #ece7dd;padding:10px;overflow-x:auto;line-height:1.3;margin:0">';
+  var refPos = piece.ref_start || 0;
+  var qryPos = piece.query_start || 0;
+  for (var i = 0; i < ref.length; i += W) {
+    var refChunk = ref.substr(i, W);
+    var qryChunk = qry.substr(i, W);
+    var matchLine = '';
+    for (var j = 0; j < refChunk.length; j++) {
+      matchLine += (refChunk[j].toUpperCase() === qryChunk[j].toUpperCase() && refChunk[j] !== '-') ? '|' : ' ';
+    }
+    var refNoGap = refChunk.replace(/-/g, '').length;
+    var qryNoGap = qryChunk.replace(/-/g, '').length;
+    out += 'ref   ' + String(refPos + 1).padStart(6) + '  ' + esc(refChunk) + '  ' + (refPos + refNoGap) + '\n';
+    out += '                ' + esc(matchLine) + '\n';
+    out += 'query ' + String(qryPos + 1).padStart(6) + '  ' + esc(qryChunk) + '  ' + (qryPos + qryNoGap) + '\n\n';
+    refPos += refNoGap;
+    qryPos += qryNoGap;
+  }
+  out += '</pre>';
+  return out;
+}
+
 
 /* ── open batch / load data ──────────────────────────────── */
 async function sgOpenBatch(bid) {

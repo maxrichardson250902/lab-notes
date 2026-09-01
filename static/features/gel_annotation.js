@@ -37,6 +37,7 @@ var G = {
   /* Index of a placed mark the user wants to re-place (strict-top-down workflow):
      null = next click places next-in-list, integer = next click replaces that mark's y. */
   markReplaceIdx: null,
+  expectedReplaceIdx: null,   // click-then-click re-place index for expectedMarks
   /* Ladder manager modal state */
   showLadderMgr: false,
   ladderEdit: null,           // null | { id?, slug?, name, kind, sizes:[int], image_file?, _imgFile?:File, _clearImage?:bool }
@@ -73,6 +74,12 @@ var G = {
      source image dims change. Keyed by "<rotation>|<srcW>|<srcH>". */
   _rotCanvas: null,
   _rotCanvasKey: '',
+
+  /* Layout panel: whether the pad-settings popover is open. Panel edits
+     global S.settings values directly via /api/settings PUT — no per-gel
+     state. Live-repaint on input; save (debounced) on release. */
+  layoutPanelOpen: false,
+  _layoutSaveTimer: null,
 };
 
 /* ── helpers ── */
@@ -211,9 +218,22 @@ function gelDispNtoViewNY(dn) {
    fractions so gelDrawOnCtx can compute the content rect regardless
    of what canvas it's rendering to (screen or export).                 */
 function gelPadFor(viewW, viewH) {
-  var padL = Math.round(gelClamp(viewW * 0.06, 30, 60));
-  var padR = 8;
-  var padT = Math.round(gelClamp(viewH * 0.10, 34, 90));
+  // Pad percentages come from user settings (see settings/router.py
+  // defaults gel_pad_left_pct=6, gel_pad_top_pct=10, gel_pad_right_pct=6).
+  // Fallback to defaults if settings haven't loaded yet (first boot / offline).
+  var settings = (typeof S !== 'undefined' && S.settings) ? S.settings : {};
+  var leftPct  = (typeof settings.gel_pad_left_pct  === 'number') ? settings.gel_pad_left_pct  : 6;
+  var rightPct = (typeof settings.gel_pad_right_pct === 'number') ? settings.gel_pad_right_pct : 6;
+  var topPct   = (typeof settings.gel_pad_top_pct   === 'number') ? settings.gel_pad_top_pct   : 10;
+  // Min-clamp only, so at very small images the pad is still legible
+  // (avoids 5px zones for tiny thumbnails). No max-clamp — user asked
+  // for canvas space control, and clamping down would fight that.
+  var padL = Math.max(0, Math.round(viewW * leftPct / 100));
+  if (leftPct > 0) padL = Math.max(padL, 20);
+  var padR = Math.max(0, Math.round(viewW * rightPct / 100));
+  if (rightPct > 0) padR = Math.max(padR, 20);
+  var padT = Math.max(0, Math.round(viewH * topPct / 100));
+  if (topPct > 0) padT = Math.max(padT, 24);
   var padB = 8;
   var totalW = viewW + padL + padR;
   var totalH = viewH + padT + padB;
@@ -221,7 +241,6 @@ function gelPadFor(viewW, viewH) {
     padL: padL, padR: padR, padT: padT, padB: padB,
     viewW: viewW, viewH: viewH,
     canvasW: totalW, canvasH: totalH,
-    // fractions (used by gelDrawOnCtx which only sees final canvas dims)
     fLeft: padL / totalW,
     fRight: padR / totalW,
     fTop: padT / totalH,
@@ -327,6 +346,7 @@ async function gelLoadGel(id) {
   var ann = d.annotations;
   if (typeof ann === 'string') { try { ann = JSON.parse(ann); } catch (e) { ann = {}; } }
   G.annotations = ann && ann.ladderMarks ? ann : { ladderMarks: [] };
+  if (!G.annotations.expectedMarks) G.annotations.expectedMarks = [];
   // Restore label orientation from the annotations blob if the gel
   // was previously saved with a non-default value; otherwise fall
   // back to horizontal.
@@ -373,6 +393,7 @@ async function gelSave() {
   // Mirror straighten + crop into the annotations blob (same pattern as
   // labelOrientation) so they round-trip through save/load.
   if (!G.annotations) G.annotations = { ladderMarks: [] };
+  if (!G.annotations.expectedMarks) G.annotations.expectedMarks = [];
   G.annotations.rotation = G.rotation || 0;
   G.annotations.crop = G.crop || null;
   await api('PUT', '/api/gels/' + G.gel.id, {
@@ -425,6 +446,96 @@ function gelExport() {
 // get their highlight so editing works even in "clean" mode.
 function gelToggleGuides(on) {
   G.showGuides = !!on;
+  gelDrawOverlay();
+}
+
+/* ── layout panel (canvas pad settings) ──
+   Slider inputs edit S.settings.gel_pad_{top,left}_pct in-memory for
+   instant repaint; a debounced PUT persists to the backend so a rapid
+   slider drag doesn't fire 60 requests. Values apply GLOBALLY (all
+   gels use the same pad) — per-gel override deliberately deferred. */
+function gelToggleLayoutPanel() {
+  G.layoutPanelOpen = !G.layoutPanelOpen;
+  gelRenderFull();
+}
+function gelSetPad(which, value) {
+  var v = parseFloat(value);
+  if (isNaN(v)) return;
+  if (!S.settings) S.settings = {};
+  // 'top' → gel_pad_top_pct alone. 'side' → left + right in lockstep
+  // (the layout slider treats horizontal padding as symmetric so the
+  // user can size ladder-mark space and expected-mark space with one
+  // control). 'left' / 'right' still work if a future UI wants
+  // asymmetric direct-editing.
+  var payload = {};
+  if (which === 'top') {
+    S.settings.gel_pad_top_pct = v;
+    payload.gel_pad_top_pct = v;
+  } else if (which === 'left') {
+    S.settings.gel_pad_left_pct = v;
+    payload.gel_pad_left_pct = v;
+  } else if (which === 'right') {
+    S.settings.gel_pad_right_pct = v;
+    payload.gel_pad_right_pct = v;
+  } else if (which === 'side') {
+    S.settings.gel_pad_left_pct = v;
+    S.settings.gel_pad_right_pct = v;
+    payload.gel_pad_left_pct = v;
+    payload.gel_pad_right_pct = v;
+  } else {
+    return;
+  }
+  // Live update: recompute pads → repaint bg + overlay. Invalidating
+  // the rotated cache is NOT needed (pad doesn't touch the rotated
+  // pre-render), but paintBg has to re-run to resize the bg canvas.
+  gelReflowCanvases();
+  // Update the number readout beside the slider without re-rendering
+  // the whole toolbar (which would blow away the input's focus).
+  var out = document.getElementById('gel-pad-' + which + '-out');
+  if (out) out.textContent = v + '%';
+  // Debounced save so a slider drag doesn't hammer the API.
+  clearTimeout(G._layoutSaveTimer);
+  G._layoutSaveTimer = setTimeout(function() {
+    api('PUT', '/api/settings', { settings: payload }).catch(function() {
+      toast('Could not save pad setting', true);
+    });
+  }, 400);
+}
+function gelResetPad() {
+  if (!S.settings) S.settings = {};
+  S.settings.gel_pad_top_pct = 10;
+  S.settings.gel_pad_left_pct = 6;
+  S.settings.gel_pad_right_pct = 6;
+  gelReflowCanvases();
+  api('PUT', '/api/settings', { settings: {
+    gel_pad_top_pct: 10, gel_pad_left_pct: 6, gel_pad_right_pct: 6
+  } }).catch(function() { toast('Could not save pad reset', true); });
+  gelRenderFull();
+}
+// Rebuild bg canvas + overlay canvas after any change that alters the
+// content/pad geometry (pad settings, crop, rotation apply). Cheap; no
+// full DOM rebuild, no init re-run.
+function gelReflowCanvases() {
+  var img = document.getElementById('gelImg');
+  var bg = document.getElementById('gelBgCanvas');
+  var overlay = document.getElementById('gelCanvas');
+  if (!img || !bg || !overlay || !img.naturalWidth) return;
+  var rc = gelGetRotatedCanvas();
+  var view = gelViewRect();
+  if (!rc || !view) return;
+  var pad = gelPadFor(view.w, view.h);
+  G._padF = pad;
+  bg.width = pad.canvasW;
+  bg.height = pad.canvasH;
+  var bctx = bg.getContext('2d');
+  bctx.fillStyle = '#faf8f4';
+  bctx.fillRect(0, 0, bg.width, bg.height);
+  bctx.drawImage(rc, view.x, view.y, view.w, view.h,
+                     pad.padL, pad.padT, view.w, view.h);
+  overlay.width = bg.clientWidth;
+  overlay.height = bg.clientHeight;
+  G.imgW = bg.clientWidth;
+  G.imgH = bg.clientHeight;
   gelDrawOverlay();
 }
 
@@ -767,6 +878,53 @@ function gelDrawOnCtx(ctx, w, h, opts) {
     });
   }
 
+  /* ── Expected-size marks (right side) ─────────────────────────────
+     Mirror of the ladder-marks flow but on the RIGHT. Same tick +
+     label style, distinguished visually by a different accent colour
+     (teal/blue) so ladder and expected marks are easy to tell apart
+     at a glance. Full-width dashed rule when guides are on; short
+     solid tick from content's right edge when guides are off. Size
+     labels sit in the RIGHT PAD ZONE, left-aligned so their left
+     edge lands just after the tick line at cr.left + cr.w. */
+  if (G.annotations.expectedMarks && G.annotations.expectedMarks.length) {
+    var padRightPx = (typeof G._padF !== 'undefined' && G._padF) ? (canvasW * G._padF.fRight) : 0;
+    G.annotations.expectedMarks.forEach(function(m, i) {
+      var dispNYe = gelViewNYtoDispN(m.y);
+      if (dispNYe === null) return;
+      var y = cr.top + dispNYe * cr.h;
+      var isSelected = G.expectedReplaceIdx === i;
+      ctx.save();
+      if (G.showGuides !== false || isSelected) {
+        ctx.strokeStyle = isSelected ? '#5b7a5e' : 'rgba(72, 145, 168, 0.75)';
+        ctx.lineWidth = isSelected ? 2 : 1;
+        if (G.showGuides === false) {
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          // Short tick coming inward from the right edge of the content
+          ctx.moveTo(cr.left + cr.w, y);
+          ctx.lineTo(cr.left + cr.w - Math.min(24, cr.w * 0.05), y);
+        } else {
+          ctx.setLineDash(isSelected ? [] : [3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(cr.left, y);
+          ctx.lineTo(cr.left + cr.w, y);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.font = smallFont + 'px "SF Mono", Monaco, Consolas, monospace';
+      ctx.fillStyle = isSelected ? '#5b7a5e' : '#4891a8';
+      if (padRightPx > 8) {
+        ctx.textAlign = 'left';
+        ctx.fillText(String(m.size), cr.left + cr.w + 4, y - 3);
+      } else {
+        ctx.textAlign = 'right';
+        ctx.fillText(String(m.size), cr.left + cr.w - 4, y - 3);
+      }
+      ctx.restore();
+    });
+  }
+
   /* ── live-preview overlays (screen only, never in exports) ── */
   if (opts.forExport) return;
 
@@ -954,6 +1112,33 @@ function gelInitCanvas() {
       G.lanes.sort(function(a, b) { return a.x_position - b.x_position; });
       var newPos = gelDispNtoViewNX(nx);
       G.selIdx = G.lanes.findIndex(function(l) { return l.x_position === newPos; });
+      G.dirty = true;
+      gelDrawOverlay();
+      gelRenderLaneEditor();
+    } else if (G.mode === 'expected') {
+      /* Place an EXPECTED-size marker. These render on the RIGHT side
+         of the gel — the right pad zone shows them as ticks + labels,
+         matching the ladder-mark UX but for theoretical (predicted)
+         band positions rather than empirical (ladder) ones. Any click
+         in the content area sets the y for a new mark; a size prompt
+         supplies the label. Same store-y semantics as ladderMarks:
+         normalised in rotated-frame coords so crop changes survive. */
+      if (!G.annotations.expectedMarks) G.annotations.expectedMarks = [];
+      var storeYe = gelDispNtoViewNY(ny);
+      if (G.expectedReplaceIdx !== null && G.expectedReplaceIdx !== undefined &&
+          G.annotations.expectedMarks[G.expectedReplaceIdx]) {
+        G.annotations.expectedMarks[G.expectedReplaceIdx].y = storeYe;
+        G.annotations.expectedMarks.sort(function(a, b) { return a.y - b.y; });
+        G.expectedReplaceIdx = null;
+      } else {
+        // Prompt for size. Cancel or empty → don't add.
+        var sizeInput = prompt('Expected size at this position (e.g. "1200 bp" or "70 kDa"):');
+        if (sizeInput === null) return;
+        var trimmed = String(sizeInput).trim();
+        if (!trimmed) return;
+        G.annotations.expectedMarks.push({ y: storeYe, size: trimmed });
+        G.annotations.expectedMarks.sort(function(a, b) { return a.y - b.y; });
+      }
       G.dirty = true;
       gelDrawOverlay();
       gelRenderLaneEditor();
@@ -1339,6 +1524,7 @@ function gelRenderLadderPanel() {
   html += '</select>';
   html += '<button class="gel-btn-sm" onclick="gelSetMode(\x27ladder\x27)" style="' + (G.mode === 'ladder' ? 'background:#5b7a5e;color:#fff' : '') + '">Place bands</button>';
   html += '<button class="gel-btn-sm" onclick="gelSetMode(\x27lane\x27)" style="' + (G.mode === 'lane' ? 'background:#5b7a5e;color:#fff' : '') + '">Place lanes</button>';
+  html += '<button class="gel-btn-sm" onclick="gelSetMode(\x27expected\x27)" style="' + (G.mode === 'expected' ? 'background:#4891a8;color:#fff' : '') + '" title="Click in the gel to add an expected-size marker on the right">Expected sizes</button>';
   html += '</div>';
 
   /* Reference image toggle — only if the active ladder has one */
@@ -1391,6 +1577,38 @@ function gelRenderLadderPanel() {
   }
   html += '</div>';
 
+  /* Expected-size marks list — same shape as the ladder marks list but
+     for the right-side theoretical markers. Distinguishing feature:
+     teal accent (matches the on-canvas tick colour) so you can tell
+     the two lists apart at a glance. */
+  if (G.annotations.expectedMarks && G.annotations.expectedMarks.length) {
+    html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #ece7dd">';
+    html += '<div class="gel-sc" style="margin-bottom:6px">Expected sizes</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;align-items:center">';
+    G.annotations.expectedMarks.forEach(function(m, i) {
+      var isRe = G.expectedReplaceIdx === i;
+      var bg = isRe ? '#5b7a5e' : '#e6eef1';
+      var fg = isRe ? '#fff' : '#2f5866';
+      html += '<span class="gel-tag" style="background:' + bg + ';color:' + fg + ';cursor:pointer" ' +
+              'onclick="gelSelectExpectedForReplace(' + i + ')" ' +
+              'title="Click then click on the gel to re-place">' + esc(String(m.size));
+      html += ' <span onclick="event.stopPropagation();gelRemoveExpectedMark(' + i + ')" ' +
+              'style="cursor:pointer;margin-left:2px">&times;</span></span>';
+    });
+    html += '</div>';
+    if (G.expectedReplaceIdx !== null && G.expectedReplaceIdx !== undefined) {
+      html += '<div style="font-size:.75rem;color:#5b7a5e;margin-bottom:6px">' +
+              'Click on the gel to re-place the selected mark. ' +
+              '<a onclick="gelCancelExpectedReplace()" style="cursor:pointer;text-decoration:underline">Cancel</a></div>';
+    }
+    html += '<button class="gel-btn-sm gel-btn-danger" onclick="gelClearExpectedMarks()" style="font-size:.75rem">Clear expected marks</button>';
+    html += '</div>';
+  } else if (G.mode === 'expected') {
+    html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #ece7dd;color:#8a7f72;font-size:.8rem">' +
+            'Click on the gel where you expect a band; you\'ll be asked for its size.' +
+            '</div>';
+  }
+
   /* Modal markup (rendered into the same panel so visibility flips with state) */
   if (G.showLadderMgr) html += gelRenderLadderMgrModal();
 
@@ -1407,6 +1625,33 @@ function gelSelectMarkForReplace(i) {
 function gelCancelReplace() {
   G.markReplaceIdx = null;
   gelRenderLadderPanel();
+}
+function gelSelectExpectedForReplace(i) {
+  G.expectedReplaceIdx = (G.expectedReplaceIdx === i) ? null : i;
+  // Force expected mode so the next click goes to the right handler.
+  if (G.expectedReplaceIdx !== null) G.mode = 'expected';
+  gelRenderLadderPanel();
+  gelDrawOverlay();
+}
+function gelCancelExpectedReplace() {
+  G.expectedReplaceIdx = null;
+  gelRenderLadderPanel();
+}
+function gelRemoveExpectedMark(i) {
+  if (!G.annotations.expectedMarks) return;
+  G.annotations.expectedMarks.splice(i, 1);
+  G.expectedReplaceIdx = null;
+  G.dirty = true;
+  gelRenderLadderPanel();
+  gelDrawOverlay();
+}
+function gelClearExpectedMarks() {
+  if (!confirm('Clear all expected-size marks?')) return;
+  G.annotations.expectedMarks = [];
+  G.expectedReplaceIdx = null;
+  G.dirty = true;
+  gelRenderLadderPanel();
+  gelDrawOverlay();
 }
 function gelToggleLadderRefImage() {
   G.ladderRefImageOpen = !G.ladderRefImageOpen;
@@ -1834,6 +2079,10 @@ function gelRenderFull() {
     html += '<label class="gel-btn-sm" style="display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none">' +
       '<input type="checkbox" ' + (G.showGuides !== false ? 'checked' : '') + ' onchange="gelToggleGuides(this.checked)" style="margin:0"/>' +
       'Guides</label>';
+    // Layout toggle — opens the pad-settings popover below the toolbar
+    // so the user can dial canvas margins in when labels overflow.
+    html += '<button class="gel-btn-sm' + (G.layoutPanelOpen ? ' gel-btn-active' : '') +
+            '" onclick="gelToggleLayoutPanel()" title="Adjust canvas padding (space around image for labels)">Layout</button>';
     // Label orientation dropdown — how well labels tilt above the lanes.
     // Diagonal fits classic gel-photo look; vertical helps when lanes
     // are very narrow and names would still clip in diagonal.
@@ -1900,7 +2149,41 @@ function gelRenderFull() {
     html += '<button class="gel-btn-sm gel-btn-danger" onclick="gelDelete(' + G.gel.id + ')" title="Delete gel">&times;</button>';
     html += '</div></div>';
 
-    /* canvas area
+    /* Layout / canvas pad settings panel — only rendered when open.
+       Sliders live-update S.settings, repaint immediately, and PUT to
+       /api/settings debounced. Values are global (apply to every gel). */
+    if (G.layoutPanelOpen) {
+      var topPct  = (S.settings && typeof S.settings.gel_pad_top_pct   === 'number') ? S.settings.gel_pad_top_pct   : 10;
+      var leftPct = (S.settings && typeof S.settings.gel_pad_left_pct  === 'number') ? S.settings.gel_pad_left_pct  : 6;
+      var rightPct= (S.settings && typeof S.settings.gel_pad_right_pct === 'number') ? S.settings.gel_pad_right_pct : 6;
+      // Slider represents "side padding" scaled symmetrically. If the
+      // user has manually set left != right via a direct settings PUT,
+      // we show the AVERAGE and moving the slider snaps them back into
+      // lockstep. Advanced users who want asymmetric padding can PUT
+      // gel_pad_left_pct / gel_pad_right_pct directly.
+      var sidePct = Math.round((leftPct + rightPct) / 2);
+      html += '<div class="gel-layout-panel">';
+      html += '<div style="font-size:.72rem;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Canvas padding <span style="text-transform:none;font-weight:400;color:#8a7f72;letter-spacing:0"> — space around image for labels. Applies to all gels.</span></div>';
+      html += '<div style="display:grid;grid-template-columns:130px 1fr 48px;gap:10px;align-items:center;row-gap:6px">';
+      // Top pad
+      html += '<label for="gel-pad-top" style="font-size:.82rem;color:#4a4139">Top (lane labels)</label>';
+      html += '<input id="gel-pad-top" type="range" min="0" max="50" step="1" value="' + topPct +
+              '" oninput="gelSetPad(\'top\',this.value)" style="width:100%">';
+      html += '<span id="gel-pad-top-out" style="font-size:.75rem;color:#8a7f72;text-align:right">' + topPct + '%</span>';
+      // Side pad — controls left and right in lockstep
+      html += '<label for="gel-pad-side" style="font-size:.82rem;color:#4a4139">Sides (ladder / expected)</label>';
+      html += '<input id="gel-pad-side" type="range" min="0" max="30" step="1" value="' + sidePct +
+              '" oninput="gelSetPad(\'side\',this.value)" style="width:100%">';
+      html += '<span id="gel-pad-side-out" style="font-size:.75rem;color:#8a7f72;text-align:right">' + sidePct + '%</span>';
+      html += '</div>';
+      html += '<div style="margin-top:10px;display:flex;gap:6px;justify-content:flex-end">';
+      html += '<button class="gel-btn-sm" onclick="gelResetPad()">Reset defaults</button>';
+      html += '<button class="gel-btn-sm" onclick="gelToggleLayoutPanel()">Close</button>';
+      html += '</div>';
+      html += '</div>';
+    }
+
+    /* canvas area.
        The <img> is a hidden loader only — its onload event drives the
        bg-canvas paint (via gelInitCanvas → resize → paintBg). The bg
        canvas holds the rotated+cropped image; the overlay canvas holds
@@ -1969,6 +2252,10 @@ function gelInjectStyles() {
        and draws the image inset by the pad amounts (see gelPadFor). */
     '.gel-bg-canvas { display:block; max-width:100%; max-height:50vh; width:auto; height:auto; user-select:none; }',
     '.gel-canvas { position:absolute; top:0; left:0; width:100%; height:100%; cursor:crosshair; }',
+    /* Layout / canvas-pad settings panel — sits between toolbar and
+       canvas area. Only rendered when G.layoutPanelOpen. */
+    '.gel-layout-panel { padding:12px 14px; background:#faf8f4; border-bottom:1px solid #e8e2d8; }',
+    '.gel-btn-active { background:#e8e2d8; border-color:#a89e8e; }',
     '.gel-controls { display:flex; gap:16px; padding:12px 14px; border-top:1px solid #d5cec0; background:#faf8f4; max-height:280px; overflow-y:auto; flex-wrap:wrap; }',
     '.gel-controls-left { flex:1; min-width:260px; }',
     '.gel-controls-right { flex:2; min-width:320px; }',

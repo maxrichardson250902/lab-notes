@@ -2801,7 +2801,12 @@ async function renderWorkflow(el) {
   */
   html += '<div class="wf-doc-layout">' +
     '<div class="wf-doc-main">' +
-      '<div id="wf-doc" data-placeholder="Start typing your day\u2019s notes \u2014 a timestamp will appear on every new line. Tab inserts a table. Paste / drop / + Image for images. Select a block + use the Groups menu to tag it."></div>' +
+      '<div class="wf-doc-tabs">' +
+        '<div class="wf-doc-tab' + (_wfActiveTab === 'workflow' ? ' active' : '') + '" onclick="_wfSwitchTab(\'workflow\')">Workflow</div>' +
+        '<div class="wf-doc-tab' + (_wfActiveTab === 'planning' ? ' active' : '') + '" onclick="_wfSwitchTab(\'planning\')">Planning</div>' +
+        '<div class="wf-doc-tab' + (_wfActiveTab === 'analysis' ? ' active' : '') + '" onclick="_wfSwitchTab(\'analysis\')">Analysis</div>' +
+      '</div>' +
+      '<div id="wf-doc" data-placeholder="' + _wfDocPlaceholderFor(_wfActiveTab) + '"></div>' +
       '<div class="wf-doc-toolbar">' +
         '<button class="wf-tool-btn" onclick="_wfDocApi.cmd(\'bold\')" title="Bold"><strong>B</strong></button>' +
         '<button class="wf-tool-btn" onclick="_wfDocApi.cmd(\'italic\')" title="Italic"><em>I</em></button>' +
@@ -2818,9 +2823,12 @@ async function renderWorkflow(el) {
         '<div style="flex:1"></div>' +
         '<div id="wf-doc-saved" style="font-size:11px;color:#8a7f72">\u00a0</div>' +
       '</div>' +
+      /* Protocol picker — visible on Workflow (run) and Planning (plan)
+         tabs, hidden on Analysis. Different button per tab so the same
+         DOM slot flips role. */
       '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">' +
         '<div id="wf-proto-picker-wrap">' +
-          '<button class="btn" style="color:#5b7a5e;font-size:12px" onclick="wfShowProtoPicker()">&#9654; Run a protocol</button>' +
+          _wfProtoPickerButton(_wfActiveTab) +
         '</div>' +
       '</div>' +
     '</div>' +
@@ -2994,6 +3002,26 @@ function _wfInjectDocStyles() {
 
     /* ── Read mode (scrolling book of past days) ─────────────────────────── */
     '.wf-read-nav { align-items:center; }',
+    /* Three-tab bar — same look in write and read modes. Sits above the
+       editor / read-book. Underline on active tab, subtle hover. */
+    '.wf-doc-tabs { display:flex; gap:0; border-bottom:1px solid #d5cec0; margin-bottom:12px; }',
+    '.wf-doc-tab { padding:8px 18px; cursor:pointer; color:#8a7f72; border-bottom:2px solid transparent; font-size:13px; font-weight:600; user-select:none; transition:color .12s, border-color .12s; }',
+    '.wf-doc-tab:hover { color:#4a4139; }',
+    '.wf-doc-tab.active { color:#4a4139; border-bottom-color:#5b7a5e; }',
+    '.wf-read-tabs { margin-top:8px; }',
+    /* Planned-protocol block — inserted by wf_plan.js into the Planning
+       tab editor. Renders as a card so it stands out from surrounding
+       prose. Non-editable (contenteditable=false) inside; user can still
+       delete the whole block from outside. */
+    '.wf-plan-block { border:1px solid #d5cec0; border-left:4px solid #5b7aa0; background:#f4f2ec; border-radius:5px; padding:10px 14px; margin:10px 0; }',
+    '.wf-plan-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px; color:#4a4139; }',
+    '.wf-plan-head strong { color:#4a4139; }',
+    '.wf-plan-meta { width:100%; border-collapse:collapse; font-size:13px; margin:0; }',
+    '.wf-plan-meta th { text-align:left; font-weight:600; color:#8a7f72; padding:3px 12px 3px 0; width:35%; white-space:nowrap; vertical-align:top; border:none; background:transparent; }',
+    '.wf-plan-meta td { padding:3px 0; color:#4a4139; border:none; }',
+    '.wf-plan-tbl { border-collapse:collapse; font-size:12px; margin:4px 0 0 0; width:auto; }',
+    '.wf-plan-tbl th, .wf-plan-tbl td { border:1px solid #d5cec0; padding:3px 8px; text-align:left; color:#4a4139; background:#faf8f4; }',
+    '.wf-plan-tbl th { background:#e8e2d8; font-weight:600; color:#8a7f72; font-size:11px; }',
     '.wf-read-book { max-width:820px; margin:12px auto; }',
     '.wf-read-day { background:var(--surface,#faf8f4); border:1px solid var(--border,#d5cec0); border-radius:6px; padding:14px 18px; margin-bottom:16px; }',
     '.wf-read-day-h { display:flex; align-items:baseline; gap:10px; margin-bottom:10px; padding-bottom:8px; border-bottom:1px solid #ece7dd; }',
@@ -3049,14 +3077,82 @@ function _wfInjectDocStyles() {
 
 var _wfDocSaveTimer = null;
 var _wfCurrentBlock = null;
+
+/* ── Three-tab day document ──────────────────────────────────────────────
+   The single-editor pane hosts one of three tabs at a time: 'workflow'
+   (protocol run notes, the original content column), 'planning' (things
+   to run today, populated via "+ Plan a protocol"), and 'analysis'
+   (results write-up). Backend stores each in its own column on
+   day_documents. Client keeps all three cached in _wfTabContent to
+   avoid re-fetching on tab switch; force-saves the active tab before
+   swapping. Tab choice is NOT persisted across page loads — always
+   defaults to 'workflow'.                                              */
+var _wfActiveTab = 'workflow';
+var _wfTabContent = { workflow: '', planning: '', analysis: '' };
+var _wfTabsForRead = 'workflow';   // Read-mode's independent tab state
 async function _wfLoadDoc() {
   try {
     var data = await api('GET', '/api/workflow/' + _workflowDate + '/document');
+    // Cache all three tabs so switching is instant.
+    _wfTabContent = {
+      workflow: data.content || '',
+      planning: data.planning_content || '',
+      analysis: data.analysis_content || ''
+    };
     if (window._wfDocApi) {
-      window._wfDocApi.setHtml(data.content || '');
+      window._wfDocApi.setHtml(_wfTabContent[_wfActiveTab] || '');
       _wfRefreshSidebar();
     }
   } catch(e) {}
+}
+
+// Tab bar per-tab UX: swap the visible editor content, force-save the
+// current tab first so nothing is lost. Called on click of a tab pill.
+async function _wfSwitchTab(nextTab) {
+  if (nextTab === _wfActiveTab) return;
+  if (!(nextTab in _wfTabContent)) return;
+  // Save current tab first (await) — the editor is a single instance
+  // we're about to overwrite. Cached copy stays in sync.
+  if (window._wfDocApi) {
+    var html = window._wfDocApi.getHtml();
+    _wfTabContent[_wfActiveTab] = html;
+    // Fire-and-forget; if network is slow we don't want to block the tap.
+    _wfSaveDoc(html, _wfActiveTab).catch(function(){});
+  }
+  _wfActiveTab = nextTab;
+  var docEl = document.getElementById('wf-doc');
+  if (docEl) docEl.setAttribute('data-placeholder', _wfDocPlaceholderFor(nextTab));
+  if (window._wfDocApi) window._wfDocApi.setHtml(_wfTabContent[nextTab] || '');
+  // Re-render just the tab pills (highlight moves) and the protocol
+  // picker button (Run vs Plan vs hidden). Cheap; no full renderWorkflow.
+  document.querySelectorAll('.wf-doc-tab').forEach(function(el, i) {
+    var name = ['workflow','planning','analysis'][i];
+    el.classList.toggle('active', name === nextTab);
+  });
+  var pickerWrap = document.getElementById('wf-proto-picker-wrap');
+  if (pickerWrap) pickerWrap.innerHTML = _wfProtoPickerButton(nextTab);
+  _wfRefreshSidebar();
+}
+window._wfSwitchTab = _wfSwitchTab;
+
+function _wfProtoPickerButton(tab) {
+  if (tab === 'workflow') {
+    return '<button class="btn" style="color:#5b7a5e;font-size:12px" onclick="wfShowProtoPicker()">&#9654; Run a protocol</button>';
+  }
+  if (tab === 'planning') {
+    return '<button class="btn" style="color:#5b7aa0;font-size:12px" onclick="wfShowPlanPicker()">&#128203; Plan a protocol</button>';
+  }
+  return '';   // Analysis tab has no protocol affordance
+}
+
+function _wfDocPlaceholderFor(tab) {
+  if (tab === 'planning') {
+    return 'What are you planning to do? Use "Plan a protocol" to insert a filled-in metadata block for the experiment.';
+  }
+  if (tab === 'analysis') {
+    return 'Notes on results — attach gels, images, and text. Same tools as Workflow.';
+  }
+  return 'Start typing your day\u2019s notes \u2014 a timestamp will appear on every new line. Tab inserts a table. Paste / drop / + Image for images. Select a block + use the Groups menu to tag it.';
 }
 function _wfDocDebouncedSave() {
   if (_wfDocSaveTimer) clearTimeout(_wfDocSaveTimer);
@@ -3067,18 +3163,24 @@ function _wfDocDebouncedSave() {
     if (window._wfDocApi) _wfSaveDoc(window._wfDocApi.getHtml());
   }, delay);
 }
-async function _wfSaveDoc(html) {
+async function _wfSaveDoc(html, tabOverride) {
   if (!window._wfDocApi) return;
+  // tabOverride lets _wfSwitchTab save the OUTGOING tab even after it's
+  // flipped _wfActiveTab. Everything else uses the current active tab.
+  var tab = tabOverride || _wfActiveTab;
   var saveEl = document.getElementById('wf-doc-saved');
   if (saveEl) saveEl.textContent = 'Saving\u2026';
   try {
     var resp = await fetch('/api/workflow/' + _workflowDate + '/document', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: html }),
+      body: JSON.stringify({ content: html, tab: tab }),
     });
     if (!resp.ok) throw new Error(resp.statusText);
-    window._wfDocApi.markClean();
+    // Refresh cache with what we just saved so a subsequent tab-swap
+    // doesn't overwrite fresh content with a stale copy.
+    _wfTabContent[tab] = html;
+    if (tab === _wfActiveTab) window._wfDocApi.markClean();
     if (saveEl) saveEl.textContent = 'Saved \u00b7 ' + new Date().toLocaleTimeString();
   } catch(e) {
     if (saveEl) saveEl.textContent = 'Save failed';
@@ -4155,6 +4257,14 @@ async function _wfRenderReadMode(el) {
     '<button class="btn" onclick="_wfPrintPdf()" title="Print this 30-day window to PDF (save from your browser\'s print dialog)" style="margin-left:6px">&#128424; Print PDF</button>' +
     '</div>';
 
+  // Read-mode tab bar — matches write mode. Independent state
+  // (_wfTabsForRead) so switching tabs in read doesn't affect write.
+  html += '<div class="wf-doc-tabs wf-read-tabs">' +
+    '<div class="wf-doc-tab' + (_wfTabsForRead === 'workflow' ? ' active' : '') + '" onclick="_wfSwitchReadTab(\'workflow\')">Workflow</div>' +
+    '<div class="wf-doc-tab' + (_wfTabsForRead === 'planning' ? ' active' : '') + '" onclick="_wfSwitchReadTab(\'planning\')">Planning</div>' +
+    '<div class="wf-doc-tab' + (_wfTabsForRead === 'analysis' ? ' active' : '') + '" onclick="_wfSwitchReadTab(\'analysis\')">Analysis</div>' +
+    '</div>';
+
   html += '<div id="wf-read-status" style="font-size:12px;color:#8a7f72;margin:6px 2px">Loading&hellip;</div>';
   html += '<div id="wf-read-book" class="wf-read-book"></div>';
 
@@ -4163,7 +4273,8 @@ async function _wfRenderReadMode(el) {
 
   var resp;
   try {
-    resp = await api('GET', '/api/workflow/documents/range?end=' + encodeURIComponent(end) + '&days=' + days);
+    resp = await api('GET', '/api/workflow/documents/range?end=' + encodeURIComponent(end) +
+                     '&days=' + days + '&tab=' + encodeURIComponent(_wfTabsForRead));
   } catch (ex) {
     document.getElementById('wf-read-status').textContent = 'Failed to load: ' + (ex.message || ex);
     return;
@@ -4171,12 +4282,13 @@ async function _wfRenderReadMode(el) {
 
   var docs = resp.documents || [];
   var status = document.getElementById('wf-read-status');
+  var tabLabel = _wfTabsForRead.charAt(0).toUpperCase() + _wfTabsForRead.slice(1);
   if (docs.length === 0) {
-    status.innerHTML = 'No content in this 30-day window (' + esc(start) + ' &ndash; ' + esc(end) + '). ' +
-      'Try an earlier window with the Older button.';
+    status.innerHTML = 'No ' + tabLabel.toLowerCase() + ' content in this 30-day window (' + esc(start) + ' &ndash; ' + esc(end) + '). ' +
+      'Try an earlier window with the Older button, or switch tabs.';
     return;
   }
-  status.innerHTML = docs.length + ' day' + (docs.length === 1 ? '' : 's') + ' with content &middot; window ' + esc(start) + ' &ndash; ' + esc(end);
+  status.innerHTML = docs.length + ' day' + (docs.length === 1 ? '' : 's') + ' with ' + tabLabel.toLowerCase() + ' content &middot; window ' + esc(start) + ' &ndash; ' + esc(end);
 
   var book = document.getElementById('wf-read-book');
   var pages = docs.map(function(d) {
@@ -4194,6 +4306,16 @@ async function _wfRenderReadMode(el) {
   });
   book.innerHTML = pages.join('');
 }
+
+// Read-mode tab switch: re-render by calling the same function again.
+// Cheaper than a full renderWorkflow since it only re-fetches one range.
+function _wfSwitchReadTab(nextTab) {
+  if (nextTab === _wfTabsForRead) return;
+  _wfTabsForRead = nextTab;
+  var el = document.getElementById('content');
+  if (el) _wfRenderReadMode(el);
+}
+window._wfSwitchReadTab = _wfSwitchReadTab;
 
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -5080,6 +5202,7 @@ function _panelBody(p) {
   h+='<button class="btn" onclick="protoEdit('+p.id+')">&#9998; Edit</button>';
   h+='<button class="btn" onclick="protoImportFromClaude('+p.id+')" title="Paste Claude&#39;s formatted output to overwrite steps + tables">&#128228; Import from Claude</button>';
   h+='<button class="btn" onclick="protoClone('+p.id+')">&#128464; Clone</button>';
+  h+='<button class="btn" onclick="protoDownloadPdf('+p.id+')" title="Download this protocol as a printable PDF">&#128196; PDF</button>';
   h+='<button class="btn" style="color:#c0392b" onclick="protoDelete('+p.id+')">&#128465; Delete</button>';
   h+='</div></div>';
   // steps
@@ -5313,6 +5436,20 @@ async function protoDelete(pid) {
 async function protoClone(pid) {
   try{var d=await api('POST','/api/protocols/'+pid+'/clone');await loadView();protoOpenPanel(d.id);toast('Cloned — editing copy');}
   catch(e){toast('Clone failed: '+e.message,true);}
+}
+
+// Trigger a browser download of the protocol PDF. The endpoint sets
+// Content-Disposition: attachment so the browser will save rather than
+// open. Using a hidden anchor + click keeps the current view intact —
+// no navigation, no new tab. window.location=... would work too but
+// some browsers show a "download started" confirmation which is noisy.
+function protoDownloadPdf(pid) {
+  var a = document.createElement('a');
+  a.href = '/api/protocols/' + pid + '/pdf';
+  a.download = '';   // let the server-provided filename win
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 
 // ── Import formatted Claude output into an existing protocol ─────────────────
@@ -9913,6 +10050,7 @@ var G = {
   /* Index of a placed mark the user wants to re-place (strict-top-down workflow):
      null = next click places next-in-list, integer = next click replaces that mark's y. */
   markReplaceIdx: null,
+  expectedReplaceIdx: null,   // click-then-click re-place index for expectedMarks
   /* Ladder manager modal state */
   showLadderMgr: false,
   ladderEdit: null,           // null | { id?, slug?, name, kind, sizes:[int], image_file?, _imgFile?:File, _clearImage?:bool }
@@ -10094,19 +10232,21 @@ function gelDispNtoViewNY(dn) {
    of what canvas it's rendering to (screen or export).                 */
 function gelPadFor(viewW, viewH) {
   // Pad percentages come from user settings (see settings/router.py
-  // defaults gel_pad_left_pct=6, gel_pad_top_pct=10). Fallback to
-  // defaults if settings haven't loaded yet (first boot / offline).
+  // defaults gel_pad_left_pct=6, gel_pad_top_pct=10, gel_pad_right_pct=6).
+  // Fallback to defaults if settings haven't loaded yet (first boot / offline).
   var settings = (typeof S !== 'undefined' && S.settings) ? S.settings : {};
-  var leftPct = (typeof settings.gel_pad_left_pct === 'number') ? settings.gel_pad_left_pct : 6;
-  var topPct  = (typeof settings.gel_pad_top_pct  === 'number') ? settings.gel_pad_top_pct  : 10;
+  var leftPct  = (typeof settings.gel_pad_left_pct  === 'number') ? settings.gel_pad_left_pct  : 6;
+  var rightPct = (typeof settings.gel_pad_right_pct === 'number') ? settings.gel_pad_right_pct : 6;
+  var topPct   = (typeof settings.gel_pad_top_pct   === 'number') ? settings.gel_pad_top_pct   : 10;
   // Min-clamp only, so at very small images the pad is still legible
   // (avoids 5px zones for tiny thumbnails). No max-clamp — user asked
   // for canvas space control, and clamping down would fight that.
   var padL = Math.max(0, Math.round(viewW * leftPct / 100));
   if (leftPct > 0) padL = Math.max(padL, 20);
+  var padR = Math.max(0, Math.round(viewW * rightPct / 100));
+  if (rightPct > 0) padR = Math.max(padR, 20);
   var padT = Math.max(0, Math.round(viewH * topPct / 100));
   if (topPct > 0) padT = Math.max(padT, 24);
-  var padR = 8;
   var padB = 8;
   var totalW = viewW + padL + padR;
   var totalH = viewH + padT + padB;
@@ -10219,6 +10359,7 @@ async function gelLoadGel(id) {
   var ann = d.annotations;
   if (typeof ann === 'string') { try { ann = JSON.parse(ann); } catch (e) { ann = {}; } }
   G.annotations = ann && ann.ladderMarks ? ann : { ladderMarks: [] };
+  if (!G.annotations.expectedMarks) G.annotations.expectedMarks = [];
   // Restore label orientation from the annotations blob if the gel
   // was previously saved with a non-default value; otherwise fall
   // back to horizontal.
@@ -10265,6 +10406,7 @@ async function gelSave() {
   // Mirror straighten + crop into the annotations blob (same pattern as
   // labelOrientation) so they round-trip through save/load.
   if (!G.annotations) G.annotations = { ladderMarks: [] };
+  if (!G.annotations.expectedMarks) G.annotations.expectedMarks = [];
   G.annotations.rotation = G.rotation || 0;
   G.annotations.crop = G.crop || null;
   await api('PUT', '/api/gels/' + G.gel.id, {
@@ -10333,8 +10475,29 @@ function gelSetPad(which, value) {
   var v = parseFloat(value);
   if (isNaN(v)) return;
   if (!S.settings) S.settings = {};
-  var key = which === 'top' ? 'gel_pad_top_pct' : 'gel_pad_left_pct';
-  S.settings[key] = v;
+  // 'top' → gel_pad_top_pct alone. 'side' → left + right in lockstep
+  // (the layout slider treats horizontal padding as symmetric so the
+  // user can size ladder-mark space and expected-mark space with one
+  // control). 'left' / 'right' still work if a future UI wants
+  // asymmetric direct-editing.
+  var payload = {};
+  if (which === 'top') {
+    S.settings.gel_pad_top_pct = v;
+    payload.gel_pad_top_pct = v;
+  } else if (which === 'left') {
+    S.settings.gel_pad_left_pct = v;
+    payload.gel_pad_left_pct = v;
+  } else if (which === 'right') {
+    S.settings.gel_pad_right_pct = v;
+    payload.gel_pad_right_pct = v;
+  } else if (which === 'side') {
+    S.settings.gel_pad_left_pct = v;
+    S.settings.gel_pad_right_pct = v;
+    payload.gel_pad_left_pct = v;
+    payload.gel_pad_right_pct = v;
+  } else {
+    return;
+  }
   // Live update: recompute pads → repaint bg + overlay. Invalidating
   // the rotated cache is NOT needed (pad doesn't touch the rotated
   // pre-render), but paintBg has to re-run to resize the bg canvas.
@@ -10346,7 +10509,7 @@ function gelSetPad(which, value) {
   // Debounced save so a slider drag doesn't hammer the API.
   clearTimeout(G._layoutSaveTimer);
   G._layoutSaveTimer = setTimeout(function() {
-    api('PUT', '/api/settings', { key: key, value: v }).catch(function() {
+    api('PUT', '/api/settings', { settings: payload }).catch(function() {
       toast('Could not save pad setting', true);
     });
   }, 400);
@@ -10355,11 +10518,12 @@ function gelResetPad() {
   if (!S.settings) S.settings = {};
   S.settings.gel_pad_top_pct = 10;
   S.settings.gel_pad_left_pct = 6;
+  S.settings.gel_pad_right_pct = 6;
   gelReflowCanvases();
-  // Fire-and-forget save of both defaults in one bulk update.
-  api('PUT', '/api/settings', { settings: { gel_pad_top_pct: 10, gel_pad_left_pct: 6 } })
-    .catch(function() { toast('Could not save pad reset', true); });
-  gelRenderFull();  // rebuild toolbar to reflect the reset values in slider positions
+  api('PUT', '/api/settings', { settings: {
+    gel_pad_top_pct: 10, gel_pad_left_pct: 6, gel_pad_right_pct: 6
+  } }).catch(function() { toast('Could not save pad reset', true); });
+  gelRenderFull();
 }
 // Rebuild bg canvas + overlay canvas after any change that alters the
 // content/pad geometry (pad settings, crop, rotation apply). Cheap; no
@@ -10727,6 +10891,53 @@ function gelDrawOnCtx(ctx, w, h, opts) {
     });
   }
 
+  /* ── Expected-size marks (right side) ─────────────────────────────
+     Mirror of the ladder-marks flow but on the RIGHT. Same tick +
+     label style, distinguished visually by a different accent colour
+     (teal/blue) so ladder and expected marks are easy to tell apart
+     at a glance. Full-width dashed rule when guides are on; short
+     solid tick from content's right edge when guides are off. Size
+     labels sit in the RIGHT PAD ZONE, left-aligned so their left
+     edge lands just after the tick line at cr.left + cr.w. */
+  if (G.annotations.expectedMarks && G.annotations.expectedMarks.length) {
+    var padRightPx = (typeof G._padF !== 'undefined' && G._padF) ? (canvasW * G._padF.fRight) : 0;
+    G.annotations.expectedMarks.forEach(function(m, i) {
+      var dispNYe = gelViewNYtoDispN(m.y);
+      if (dispNYe === null) return;
+      var y = cr.top + dispNYe * cr.h;
+      var isSelected = G.expectedReplaceIdx === i;
+      ctx.save();
+      if (G.showGuides !== false || isSelected) {
+        ctx.strokeStyle = isSelected ? '#5b7a5e' : 'rgba(72, 145, 168, 0.75)';
+        ctx.lineWidth = isSelected ? 2 : 1;
+        if (G.showGuides === false) {
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          // Short tick coming inward from the right edge of the content
+          ctx.moveTo(cr.left + cr.w, y);
+          ctx.lineTo(cr.left + cr.w - Math.min(24, cr.w * 0.05), y);
+        } else {
+          ctx.setLineDash(isSelected ? [] : [3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(cr.left, y);
+          ctx.lineTo(cr.left + cr.w, y);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.font = smallFont + 'px "SF Mono", Monaco, Consolas, monospace';
+      ctx.fillStyle = isSelected ? '#5b7a5e' : '#4891a8';
+      if (padRightPx > 8) {
+        ctx.textAlign = 'left';
+        ctx.fillText(String(m.size), cr.left + cr.w + 4, y - 3);
+      } else {
+        ctx.textAlign = 'right';
+        ctx.fillText(String(m.size), cr.left + cr.w - 4, y - 3);
+      }
+      ctx.restore();
+    });
+  }
+
   /* ── live-preview overlays (screen only, never in exports) ── */
   if (opts.forExport) return;
 
@@ -10914,6 +11125,33 @@ function gelInitCanvas() {
       G.lanes.sort(function(a, b) { return a.x_position - b.x_position; });
       var newPos = gelDispNtoViewNX(nx);
       G.selIdx = G.lanes.findIndex(function(l) { return l.x_position === newPos; });
+      G.dirty = true;
+      gelDrawOverlay();
+      gelRenderLaneEditor();
+    } else if (G.mode === 'expected') {
+      /* Place an EXPECTED-size marker. These render on the RIGHT side
+         of the gel — the right pad zone shows them as ticks + labels,
+         matching the ladder-mark UX but for theoretical (predicted)
+         band positions rather than empirical (ladder) ones. Any click
+         in the content area sets the y for a new mark; a size prompt
+         supplies the label. Same store-y semantics as ladderMarks:
+         normalised in rotated-frame coords so crop changes survive. */
+      if (!G.annotations.expectedMarks) G.annotations.expectedMarks = [];
+      var storeYe = gelDispNtoViewNY(ny);
+      if (G.expectedReplaceIdx !== null && G.expectedReplaceIdx !== undefined &&
+          G.annotations.expectedMarks[G.expectedReplaceIdx]) {
+        G.annotations.expectedMarks[G.expectedReplaceIdx].y = storeYe;
+        G.annotations.expectedMarks.sort(function(a, b) { return a.y - b.y; });
+        G.expectedReplaceIdx = null;
+      } else {
+        // Prompt for size. Cancel or empty → don't add.
+        var sizeInput = prompt('Expected size at this position (e.g. "1200 bp" or "70 kDa"):');
+        if (sizeInput === null) return;
+        var trimmed = String(sizeInput).trim();
+        if (!trimmed) return;
+        G.annotations.expectedMarks.push({ y: storeYe, size: trimmed });
+        G.annotations.expectedMarks.sort(function(a, b) { return a.y - b.y; });
+      }
       G.dirty = true;
       gelDrawOverlay();
       gelRenderLaneEditor();
@@ -11299,6 +11537,7 @@ function gelRenderLadderPanel() {
   html += '</select>';
   html += '<button class="gel-btn-sm" onclick="gelSetMode(\x27ladder\x27)" style="' + (G.mode === 'ladder' ? 'background:#5b7a5e;color:#fff' : '') + '">Place bands</button>';
   html += '<button class="gel-btn-sm" onclick="gelSetMode(\x27lane\x27)" style="' + (G.mode === 'lane' ? 'background:#5b7a5e;color:#fff' : '') + '">Place lanes</button>';
+  html += '<button class="gel-btn-sm" onclick="gelSetMode(\x27expected\x27)" style="' + (G.mode === 'expected' ? 'background:#4891a8;color:#fff' : '') + '" title="Click in the gel to add an expected-size marker on the right">Expected sizes</button>';
   html += '</div>';
 
   /* Reference image toggle — only if the active ladder has one */
@@ -11351,6 +11590,38 @@ function gelRenderLadderPanel() {
   }
   html += '</div>';
 
+  /* Expected-size marks list — same shape as the ladder marks list but
+     for the right-side theoretical markers. Distinguishing feature:
+     teal accent (matches the on-canvas tick colour) so you can tell
+     the two lists apart at a glance. */
+  if (G.annotations.expectedMarks && G.annotations.expectedMarks.length) {
+    html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #ece7dd">';
+    html += '<div class="gel-sc" style="margin-bottom:6px">Expected sizes</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;align-items:center">';
+    G.annotations.expectedMarks.forEach(function(m, i) {
+      var isRe = G.expectedReplaceIdx === i;
+      var bg = isRe ? '#5b7a5e' : '#e6eef1';
+      var fg = isRe ? '#fff' : '#2f5866';
+      html += '<span class="gel-tag" style="background:' + bg + ';color:' + fg + ';cursor:pointer" ' +
+              'onclick="gelSelectExpectedForReplace(' + i + ')" ' +
+              'title="Click then click on the gel to re-place">' + esc(String(m.size));
+      html += ' <span onclick="event.stopPropagation();gelRemoveExpectedMark(' + i + ')" ' +
+              'style="cursor:pointer;margin-left:2px">&times;</span></span>';
+    });
+    html += '</div>';
+    if (G.expectedReplaceIdx !== null && G.expectedReplaceIdx !== undefined) {
+      html += '<div style="font-size:.75rem;color:#5b7a5e;margin-bottom:6px">' +
+              'Click on the gel to re-place the selected mark. ' +
+              '<a onclick="gelCancelExpectedReplace()" style="cursor:pointer;text-decoration:underline">Cancel</a></div>';
+    }
+    html += '<button class="gel-btn-sm gel-btn-danger" onclick="gelClearExpectedMarks()" style="font-size:.75rem">Clear expected marks</button>';
+    html += '</div>';
+  } else if (G.mode === 'expected') {
+    html += '<div style="margin-top:10px;padding-top:8px;border-top:1px solid #ece7dd;color:#8a7f72;font-size:.8rem">' +
+            'Click on the gel where you expect a band; you\'ll be asked for its size.' +
+            '</div>';
+  }
+
   /* Modal markup (rendered into the same panel so visibility flips with state) */
   if (G.showLadderMgr) html += gelRenderLadderMgrModal();
 
@@ -11367,6 +11638,33 @@ function gelSelectMarkForReplace(i) {
 function gelCancelReplace() {
   G.markReplaceIdx = null;
   gelRenderLadderPanel();
+}
+function gelSelectExpectedForReplace(i) {
+  G.expectedReplaceIdx = (G.expectedReplaceIdx === i) ? null : i;
+  // Force expected mode so the next click goes to the right handler.
+  if (G.expectedReplaceIdx !== null) G.mode = 'expected';
+  gelRenderLadderPanel();
+  gelDrawOverlay();
+}
+function gelCancelExpectedReplace() {
+  G.expectedReplaceIdx = null;
+  gelRenderLadderPanel();
+}
+function gelRemoveExpectedMark(i) {
+  if (!G.annotations.expectedMarks) return;
+  G.annotations.expectedMarks.splice(i, 1);
+  G.expectedReplaceIdx = null;
+  G.dirty = true;
+  gelRenderLadderPanel();
+  gelDrawOverlay();
+}
+function gelClearExpectedMarks() {
+  if (!confirm('Clear all expected-size marks?')) return;
+  G.annotations.expectedMarks = [];
+  G.expectedReplaceIdx = null;
+  G.dirty = true;
+  gelRenderLadderPanel();
+  gelDrawOverlay();
 }
 function gelToggleLadderRefImage() {
   G.ladderRefImageOpen = !G.ladderRefImageOpen;
@@ -11868,21 +12166,28 @@ function gelRenderFull() {
        Sliders live-update S.settings, repaint immediately, and PUT to
        /api/settings debounced. Values are global (apply to every gel). */
     if (G.layoutPanelOpen) {
-      var topPct  = (S.settings && typeof S.settings.gel_pad_top_pct  === 'number') ? S.settings.gel_pad_top_pct  : 10;
-      var leftPct = (S.settings && typeof S.settings.gel_pad_left_pct === 'number') ? S.settings.gel_pad_left_pct : 6;
+      var topPct  = (S.settings && typeof S.settings.gel_pad_top_pct   === 'number') ? S.settings.gel_pad_top_pct   : 10;
+      var leftPct = (S.settings && typeof S.settings.gel_pad_left_pct  === 'number') ? S.settings.gel_pad_left_pct  : 6;
+      var rightPct= (S.settings && typeof S.settings.gel_pad_right_pct === 'number') ? S.settings.gel_pad_right_pct : 6;
+      // Slider represents "side padding" scaled symmetrically. If the
+      // user has manually set left != right via a direct settings PUT,
+      // we show the AVERAGE and moving the slider snaps them back into
+      // lockstep. Advanced users who want asymmetric padding can PUT
+      // gel_pad_left_pct / gel_pad_right_pct directly.
+      var sidePct = Math.round((leftPct + rightPct) / 2);
       html += '<div class="gel-layout-panel">';
       html += '<div style="font-size:.72rem;font-weight:600;color:#8a7f72;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Canvas padding <span style="text-transform:none;font-weight:400;color:#8a7f72;letter-spacing:0"> — space around image for labels. Applies to all gels.</span></div>';
-      html += '<div style="display:grid;grid-template-columns:110px 1fr 48px;gap:10px;align-items:center;row-gap:6px">';
+      html += '<div style="display:grid;grid-template-columns:130px 1fr 48px;gap:10px;align-items:center;row-gap:6px">';
       // Top pad
-      html += '<label for="gel-pad-top" style="font-size:.82rem;color:#4a4139">Top (labels)</label>';
+      html += '<label for="gel-pad-top" style="font-size:.82rem;color:#4a4139">Top (lane labels)</label>';
       html += '<input id="gel-pad-top" type="range" min="0" max="50" step="1" value="' + topPct +
               '" oninput="gelSetPad(\'top\',this.value)" style="width:100%">';
       html += '<span id="gel-pad-top-out" style="font-size:.75rem;color:#8a7f72;text-align:right">' + topPct + '%</span>';
-      // Left pad
-      html += '<label for="gel-pad-left" style="font-size:.82rem;color:#4a4139">Left (ladder sizes)</label>';
-      html += '<input id="gel-pad-left" type="range" min="0" max="30" step="1" value="' + leftPct +
-              '" oninput="gelSetPad(\'left\',this.value)" style="width:100%">';
-      html += '<span id="gel-pad-left-out" style="font-size:.75rem;color:#8a7f72;text-align:right">' + leftPct + '%</span>';
+      // Side pad — controls left and right in lockstep
+      html += '<label for="gel-pad-side" style="font-size:.82rem;color:#4a4139">Sides (ladder / expected)</label>';
+      html += '<input id="gel-pad-side" type="range" min="0" max="30" step="1" value="' + sidePct +
+              '" oninput="gelSetPad(\'side\',this.value)" style="width:100%">';
+      html += '<span id="gel-pad-side-out" style="font-size:.75rem;color:#8a7f72;text-align:right">' + sidePct + '%</span>';
       html += '</div>';
       html += '<div style="margin-top:10px;display:flex;gap:6px;justify-content:flex-end">';
       html += '<button class="gel-btn-sm" onclick="gelResetPad()">Reset defaults</button>';
@@ -21335,9 +21640,29 @@ async function renderSanger(el) {
     SG._preselectRef = pendingSg;  // { type: 'plasmid'|'kitpart'|..., id: N }
   }
 
-  if (SG.view === 'new')    return renderNew(el);
-  if (SG.view === 'viewer') return renderViewer(el);
+  if (SG.view === 'new')     return renderNew(el);
+  if (SG.view === 'screen')  return renderScreen(el);
+  if (SG.view === 'compare') return renderCompare(el);
+  if (SG.view === 'viewer')  return renderViewer(el);
   return renderList(el);
+}
+
+/* ── Shared mode-tabs helper (used by renderNew / renderScreen / renderCompare)
+   Lets the user swap between the three "new alignment" workflows in one click.
+   All three share this bar so navigating between them is natural.        */
+function sgModeTabs(currentMode) {
+  var modes = [
+    ['single',  'Single alignment',  'new'],
+    ['screen',  'Screen refs',       'screen'],
+    ['compare', 'Compare sequences', 'compare'],
+  ];
+  var h = '<div class="sg-tabs" style="margin-bottom:18px">';
+  modes.forEach(function(m) {
+    var active = (currentMode === m[0]) ? ' active' : '';
+    h += '<button class="sg-tab' + active + '" onclick="sgNav(\'' + m[2] + '\')">' + m[1] + '</button>';
+  });
+  h += '</div>';
+  return h;
 }
 
 /* ── LIST VIEW ───────────────────────────────────────────── */
@@ -21398,9 +21723,10 @@ async function renderNew(el) {
   } catch(e) { SG.refs = []; }
 
   var h = '<div style="max-width:720px;margin:0 auto">';
-  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:24px">';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">';
   h += '<button class="sg-btn-ghost" onclick="sgNav(\'list\')">← Back</button>';
   h += '<div class="sg-section-hdr">new alignment</div></div>';
+  h += sgModeTabs('single');
 
   h += '<label class="sg-label">Name <span style="font-variant:normal;text-transform:none;letter-spacing:0;color:#b0a89a">(optional)</span></label>';
   h += '<input type="text" id="sg-name" class="sg-input" placeholder="e.g. Colony 1 fwd">';
@@ -21559,6 +21885,414 @@ async function sgRunAlign() {
     sgOpenBatch(res.batch_id);
   } catch(e) { toast(e.message,true); btn.disabled=false; btn.textContent='Align'; status.textContent=''; }
 }
+
+/* ── SCREEN VIEW: multi-file × multi-ref ephemeral matrix ────────────
+   Purpose: "did the sequencing lab mix up my tubes?" — try each read
+   against a set of candidate references and see where the identity
+   spikes. Results are NOT persisted. Clicking a matrix cell fires a
+   normal /sanger/align for that (file, ref) pair, which becomes a
+   real alignment record.                                              */
+async function renderScreen(el) {
+  try {
+    var refData = await api('GET', '/api/sanger/references');
+    SG.refs = refData.items || [];
+  } catch (e) { SG.refs = []; }
+  if (!SG._screenSelectedRefs) SG._screenSelectedRefs = {};   // {"plasmids:5": true, ...}
+  if (!SG._screenFilter) SG._screenFilter = '';
+
+  var h = '<div style="max-width:960px;margin:0 auto">';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">';
+  h += '<button class="sg-btn-ghost" onclick="sgNav(\'list\')">← Back</button>';
+  h += '<div class="sg-section-hdr">screen against multiple refs</div></div>';
+  h += sgModeTabs('screen');
+
+  h += '<div style="color:#8a7f72;font-size:.85rem;margin-bottom:14px">' +
+       'Upload the AB1 file(s) you\u2019re not sure about, tick the refs to test them against. ' +
+       'Each pair gets scored; nothing is stored unless you click a result to persist it.' +
+       '</div>';
+
+  h += '<label class="sg-label">AB1 files</label>';
+  h += '<div id="sg-scr-drop" class="sg-drop" onclick="document.getElementById(\'sg-scr-input\').click()">';
+  h += '<div id="sg-scr-label">Drop .ab1 file(s) here or click to browse</div>';
+  h += '<input type="file" id="sg-scr-input" accept=".ab1,.abi" multiple style="display:none"></div>';
+  h += '<div id="sg-scr-file-list" style="margin-top:6px"></div>';
+
+  h += '<label class="sg-label" style="margin-top:16px">References to try</label>';
+  h += '<div style="display:flex;gap:8px;margin-bottom:6px">';
+  h += '<input type="text" class="sg-input" id="sg-scr-filter" placeholder="Filter by name\u2026" oninput="_sgScreenFilter(this.value)" style="flex:1">';
+  h += '<button class="sg-btn-ghost" onclick="_sgScreenSelectAll(true)">Select all</button>';
+  h += '<button class="sg-btn-ghost" onclick="_sgScreenSelectAll(false)">Clear</button>';
+  h += '</div>';
+  h += '<div id="sg-scr-refs" style="border:1px solid #d5cec0;border-radius:4px;background:#faf8f4;max-height:280px;overflow-y:auto;padding:6px 10px">';
+  h += _sgScreenRefListHtml();
+  h += '</div>';
+  h += '<div id="sg-scr-count" style="font-size:.75rem;color:#8a7f72;margin-top:4px">' + _sgScreenCountText() + '</div>';
+
+  h += '<label class="sg-label" style="margin-top:16px">Quality trim</label>';
+  h += '<div style="display:flex;align-items:center;gap:12px">';
+  h += '<input type="range" id="sg-scr-trim" min="0" max="40" value="20" style="flex:1;accent-color:#5b7a5e" oninput="document.getElementById(\'sg-scr-trim-val\').textContent=this.value===\'0\'?\'Off\':\'Q\'+this.value">';
+  h += '<span id="sg-scr-trim-val" style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.82rem;color:#4a4139;min-width:36px">Q20</span>';
+  h += '</div>';
+
+  h += '<button class="sg-btn-pri" style="margin-top:24px;width:100%" onclick="sgRunScreen()" id="sg-scr-btn">Screen</button>';
+  h += '<div id="sg-scr-status" style="margin-top:12px;color:#8a7f72;font-size:.85rem"></div>';
+  h += '<div id="sg-scr-results" style="margin-top:20px"></div>';
+  h += '</div>';
+  el.innerHTML = sgStyles() + h;
+
+  setTimeout(function() {
+    var inp = document.getElementById('sg-scr-input');
+    var drop = document.getElementById('sg-scr-drop');
+    if (inp) inp.onchange = function() { _sgScrUpdateFiles(); };
+    if (drop) {
+      drop.ondragover = function(e) { e.preventDefault(); drop.style.borderColor = '#5b7a5e'; };
+      drop.ondragleave = function() { drop.style.borderColor = '#d5cec0'; };
+      drop.ondrop = function(e) { e.preventDefault(); inp.files = e.dataTransfer.files; _sgScrUpdateFiles(); };
+    }
+  }, 50);
+}
+function _sgScrUpdateFiles() {
+  var inp = document.getElementById('sg-scr-input');
+  var list = document.getElementById('sg-scr-file-list');
+  var label = document.getElementById('sg-scr-label');
+  var drop = document.getElementById('sg-scr-drop');
+  if (!inp || !list) return;
+  var f = inp.files;
+  if (!f.length) { list.innerHTML = ''; label.textContent = 'Drop .ab1 file(s) here or click to browse'; drop.style.borderColor = '#d5cec0'; return; }
+  drop.style.borderColor = '#5b7a5e';
+  if (f.length === 1) { label.textContent = f[0].name; list.innerHTML = ''; return; }
+  label.textContent = f.length + ' files selected';
+  var names = [];
+  for (var i = 0; i < f.length; i++) names.push(esc(f[i].name));
+  list.innerHTML = '<div style="font-size:.75rem;color:#8a7f72">' + names.join(', ') + '</div>';
+}
+// Ref list — one checkbox row per inventory item, filtered by search.
+// Keys like "plasmids:5" match the SG.refs.type prefix used in
+// renderNew's dropdown. We reuse SG.refs (already fetched) so the same
+// items appear in both flows.
+function _sgScreenRefListHtml() {
+  var filt = (SG._screenFilter || '').toLowerCase();
+  var items = SG.refs.filter(function(r) {
+    if (!filt) return true;
+    return (r.name || '').toLowerCase().indexOf(filt) >= 0 ||
+           (r.meta || '').toLowerCase().indexOf(filt) >= 0;
+  });
+  if (!items.length) return '<div style="color:#8a7f72;padding:6px 0">No references match.</div>';
+  var h = '';
+  items.forEach(function(r) {
+    var key = r.type + ':' + r.id;
+    var checked = SG._screenSelectedRefs[key] ? 'checked' : '';
+    var meta = r.meta ? ' <span style="color:#8a7f72;font-size:.75rem">\u00b7 ' + esc(r.meta) + '</span>' : '';
+    h += '<label style="display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer;font-size:.82rem">';
+    h += '<input type="checkbox" ' + checked + ' onchange="_sgScreenToggleRef(\'' + key + '\', this.checked)">';
+    h += '<span style="color:#8a7f72;font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.7rem;min-width:60px">' + esc(r.label) + '</span>';
+    h += '<span>' + esc(r.name) + meta + '</span>';
+    h += '</label>';
+  });
+  return h;
+}
+function _sgScreenCountText() {
+  var n = Object.keys(SG._screenSelectedRefs).filter(function(k) { return SG._screenSelectedRefs[k]; }).length;
+  return n ? (n + ' reference' + (n === 1 ? '' : 's') + ' selected') : 'No references selected';
+}
+window._sgScreenFilter = function(v) {
+  SG._screenFilter = v;
+  var list = document.getElementById('sg-scr-refs');
+  if (list) list.innerHTML = _sgScreenRefListHtml();
+};
+window._sgScreenToggleRef = function(key, on) {
+  SG._screenSelectedRefs[key] = !!on;
+  var c = document.getElementById('sg-scr-count');
+  if (c) c.textContent = _sgScreenCountText();
+};
+window._sgScreenSelectAll = function(on) {
+  var filt = (SG._screenFilter || '').toLowerCase();
+  SG.refs.forEach(function(r) {
+    if (!filt || (r.name || '').toLowerCase().indexOf(filt) >= 0 ||
+                 (r.meta || '').toLowerCase().indexOf(filt) >= 0) {
+      SG._screenSelectedRefs[r.type + ':' + r.id] = !!on;
+    }
+  });
+  var list = document.getElementById('sg-scr-refs');
+  if (list) list.innerHTML = _sgScreenRefListHtml();
+  var c = document.getElementById('sg-scr-count');
+  if (c) c.textContent = _sgScreenCountText();
+};
+async function sgRunScreen() {
+  var btn = document.getElementById('sg-scr-btn');
+  var status = document.getElementById('sg-scr-status');
+  var inp = document.getElementById('sg-scr-input');
+  if (!inp || !inp.files.length) { toast('Upload at least one AB1 file', true); return; }
+  var refKeys = Object.keys(SG._screenSelectedRefs).filter(function(k) { return SG._screenSelectedRefs[k]; });
+  if (!refKeys.length) { toast('Select at least one reference', true); return; }
+
+  var refs = refKeys.map(function(k) {
+    var p = k.split(':');
+    return { source: p[0], id: p[1] };
+  });
+  var fd = new FormData();
+  for (var i = 0; i < inp.files.length; i++) fd.append('ab1', inp.files[i]);
+  fd.append('refs', JSON.stringify(refs));
+  var trimVal = document.getElementById('sg-scr-trim');
+  fd.append('trim_qual', trimVal ? trimVal.value : '20');
+
+  btn.disabled = true; btn.textContent = 'Screening\u2026';
+  status.textContent = 'Aligning ' + inp.files.length + ' file(s) \u00d7 ' + refs.length + ' ref(s) \u2014 this may take a moment\u2026';
+  try {
+    var resp = await fetch('/api/sanger/screen', { method: 'POST', body: fd });
+    if (!resp.ok) { var e = await resp.json().catch(function(){return{detail:resp.statusText};}); throw new Error(e.detail || 'Failed'); }
+    var data = await resp.json();
+    SG._lastScreenFiles = inp.files;   // stash so click-to-persist can re-send
+    sgRenderScreenResults(data);
+    status.textContent = 'Done \u00b7 click a cell to keep that pair as a full alignment';
+  } catch (err) {
+    toast(err.message, true);
+    status.textContent = '';
+  }
+  btn.disabled = false; btn.textContent = 'Screen';
+}
+function sgRenderScreenResults(data) {
+  var out = document.getElementById('sg-scr-results');
+  if (!out) return;
+  if (!data.files || !data.files.length) { out.innerHTML = '<div style="color:#c25a4a">No results.</div>'; return; }
+  var refs = data.refs || [];
+  var h = '<div class="sg-table-wrap"><table class="sg-table sg-screen-table"><thead><tr>';
+  h += '<th>File</th>';
+  refs.forEach(function(r) {
+    h += '<th title="' + esc(r.name) + ' (' + r.length + ' bp)" style="min-width:120px;max-width:200px">' + esc(r.name) + '</th>';
+  });
+  h += '</tr></thead><tbody>';
+  data.files.forEach(function(f, fileIdx) {
+    h += '<tr>';
+    var label = esc(f.file) + '<div style="font-size:.7rem;color:#8a7f72">' + (f.query_length || 0) + ' bp</div>';
+    if (f.error) label += '<div style="color:#c25a4a;font-size:.7rem">' + esc(f.error) + '</div>';
+    h += '<td style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.82rem">' + label + '</td>';
+    if (f.error) {
+      refs.forEach(function() { h += '<td style="color:#c0b8b0">\u2014</td>'; });
+    } else {
+      (f.results || []).forEach(function(res, refIdx) {
+        var pct = res.identity_pct || 0;
+        var bg = pct >= 95 ? '#d5e7d5' : pct >= 70 ? '#f2e6c8' : '#f0dcd8';
+        var textColor = pct >= 95 ? '#3a5a3d' : pct >= 70 ? '#8a5b0d' : '#8a3a30';
+        var star = res.is_best ? ' \u2b50' : '';
+        var cov = res.coverage_bp + '/' + res.ref_length + 'bp';
+        h += '<td style="background:' + bg + ';color:' + textColor + ';cursor:pointer;font-size:.85rem" ' +
+             'title="Click to run a full alignment for this pair (persists it)" ' +
+             'onclick="_sgScreenPersistCell(' + fileIdx + ',' + refIdx + ')">' +
+             '<div style="font-weight:600">' + pct.toFixed(1) + '%' + star + '</div>' +
+             '<div style="font-size:.7rem;opacity:.75">' + cov + (res.is_reverse ? ' \u00b7 RC' : '') + '</div>' +
+             '</td>';
+      });
+    }
+    h += '</tr>';
+  });
+  h += '</tbody></table></div>';
+  h += '<div style="margin-top:10px;font-size:.75rem;color:#8a7f72">' +
+       '<span style="display:inline-block;width:12px;height:12px;background:#d5e7d5;vertical-align:middle;margin-right:4px"></span> \u226595% ' +
+       '<span style="display:inline-block;width:12px;height:12px;background:#f2e6c8;vertical-align:middle;margin:0 4px 0 12px"></span> 70\u201395% ' +
+       '<span style="display:inline-block;width:12px;height:12px;background:#f0dcd8;vertical-align:middle;margin:0 4px 0 12px"></span> <70% \u00b7 ' +
+       '\u2b50 = best score per row' +
+       '</div>';
+  SG._lastScreenData = data;   // stash for the click-to-persist handler
+  out.innerHTML = h;
+}
+// Click a matrix cell → send just THAT (file, ref) pair to /sanger/align
+// and navigate into the resulting batch. Uses stashed FileList + ref info
+// from the last screen run.
+window._sgScreenPersistCell = async function(fileIdx, refIdx) {
+  var files = SG._lastScreenFiles;
+  var data = SG._lastScreenData;
+  if (!files || !data) { toast('Screen data lost \u2014 re-run screen', true); return; }
+  var fileRow = data.files[fileIdx];
+  var refInfo = data.refs[refIdx];
+  if (!fileRow || !refInfo) return;
+  // Find the file blob matching fileRow.file (by name).
+  var fileBlob = null;
+  for (var i = 0; i < files.length; i++) {
+    if (files[i].name === fileRow.file) { fileBlob = files[i]; break; }
+  }
+  if (!fileBlob) { toast('File no longer available \u2014 re-upload', true); return; }
+  var trimVal = document.getElementById('sg-scr-trim');
+  var fd = new FormData();
+  fd.append('ab1', fileBlob);
+  fd.append('ref_source', refInfo.source);
+  fd.append('ref_id', String(refInfo.id));
+  fd.append('trim_qual', trimVal ? trimVal.value : '20');
+  fd.append('name', fileRow.file.replace(/\.ab1$|\.abi$/i, '') + ' vs ' + refInfo.name);
+  toast('Running full alignment\u2026');
+  try {
+    var resp = await fetch('/api/sanger/align', { method: 'POST', body: fd });
+    if (!resp.ok) throw new Error((await resp.json().catch(function(){return{};})).detail || 'Failed');
+    var res = await resp.json();
+    SG.batchId = res.batch_id;
+    sgOpenBatch(res.batch_id);
+  } catch (err) {
+    toast(err.message, true);
+  }
+};
+
+/* ── COMPARE VIEW: two stored/pasted sequences, ephemeral ─────────── */
+async function renderCompare(el) {
+  try {
+    var refData = await api('GET', '/api/sanger/references');
+    SG.refs = refData.items || [];
+  } catch (e) { SG.refs = []; }
+  if (!SG._cmpQuerySide) SG._cmpQuerySide = { mode: 'inventory' };  // 'inventory' | 'paste'
+  if (!SG._cmpRefSide)   SG._cmpRefSide   = { mode: 'inventory' };
+
+  var h = '<div style="max-width:960px;margin:0 auto">';
+  h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">';
+  h += '<button class="sg-btn-ghost" onclick="sgNav(\'list\')">← Back</button>';
+  h += '<div class="sg-section-hdr">compare two sequences</div></div>';
+  h += sgModeTabs('compare');
+
+  h += '<div style="color:#8a7f72;font-size:.85rem;margin-bottom:14px">' +
+       'Align any two sequences (from your inventory or pasted). No AB1 needed. ' +
+       'Result is shown once and not stored.' +
+       '</div>';
+
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">';
+  h += _sgCmpSideHtml('Query',     'q', SG._cmpQuerySide);
+  h += _sgCmpSideHtml('Reference', 'r', SG._cmpRefSide);
+  h += '</div>';
+
+  h += '<button class="sg-btn-pri" style="margin-top:24px;width:100%" onclick="sgRunCompare()" id="sg-cmp-btn">Compare</button>';
+  h += '<div id="sg-cmp-status" style="margin-top:12px;color:#8a7f72;font-size:.85rem"></div>';
+  h += '<div id="sg-cmp-results" style="margin-top:20px"></div>';
+  h += '</div>';
+  el.innerHTML = sgStyles() + h;
+}
+function _sgCmpSideHtml(title, sidePrefix, sideState) {
+  var h = '<div style="border:1px solid #d5cec0;border-radius:6px;padding:14px;background:#faf8f4">';
+  h += '<div class="sg-label" style="margin-top:0">' + esc(title) + '</div>';
+  h += '<div class="sg-tabs" style="margin-bottom:10px">';
+  h += '<button class="sg-tab' + (sideState.mode === 'inventory' ? ' active' : '') +
+       '" onclick="_sgCmpSetMode(\'' + sidePrefix + '\',\'inventory\')">From inventory</button>';
+  h += '<button class="sg-tab' + (sideState.mode === 'paste' ? ' active' : '') +
+       '" onclick="_sgCmpSetMode(\'' + sidePrefix + '\',\'paste\')">Paste sequence</button>';
+  h += '</div>';
+  if (sideState.mode === 'inventory') {
+    h += '<select id="sg-cmp-' + sidePrefix + '-sel" class="sg-input"><option value="">Select\u2026</option>';
+    var groups = {};
+    SG.refs.forEach(function(r) { if (!groups[r.label]) groups[r.label] = []; groups[r.label].push(r); });
+    Object.keys(groups).forEach(function(label) {
+      h += '<optgroup label="' + esc(label) + 's">';
+      groups[label].forEach(function(r) {
+        var meta = r.meta ? ' \u00b7 ' + r.meta : '';
+        h += '<option value="' + r.type + ':' + r.id + '">' + esc(r.name) + esc(meta) + '</option>';
+      });
+      h += '</optgroup>';
+    });
+    h += '</select>';
+    if (!SG.refs.length) h += '<div style="color:#8a7f72;font-size:.85rem;margin-top:4px">No items with .gb files found.</div>';
+  } else {
+    h += '<textarea id="sg-cmp-' + sidePrefix + '-txt" class="sg-input" rows="6" placeholder="Paste raw DNA / FASTA / GenBank" style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.78rem"></textarea>';
+  }
+  h += '</div>';
+  return h;
+}
+window._sgCmpSetMode = function(side, mode) {
+  var state = (side === 'q') ? SG._cmpQuerySide : SG._cmpRefSide;
+  state.mode = mode;
+  renderCompare(document.getElementById('content'));
+};
+async function sgRunCompare() {
+  var btn = document.getElementById('sg-cmp-btn');
+  var status = document.getElementById('sg-cmp-status');
+  var body = { query_source: '', ref_source: '' };
+  // Query side
+  if (SG._cmpQuerySide.mode === 'inventory') {
+    var qs = document.getElementById('sg-cmp-q-sel');
+    if (!qs || !qs.value) { toast('Select a query', true); return; }
+    var qp = qs.value.split(':');
+    body.query_source = qp[0]; body.query_id = qp[1];
+  } else {
+    var qt = (document.getElementById('sg-cmp-q-txt') || {}).value || '';
+    if (!qt.trim()) { toast('Paste a query sequence', true); return; }
+    body.query_source = qt.trim().startsWith('LOCUS') ? 'genbank' :
+                        qt.trim().startsWith('>') ? 'fasta' : 'raw';
+    body.query_text = qt.trim();
+  }
+  // Ref side
+  if (SG._cmpRefSide.mode === 'inventory') {
+    var rs = document.getElementById('sg-cmp-r-sel');
+    if (!rs || !rs.value) { toast('Select a reference', true); return; }
+    var rp = rs.value.split(':');
+    body.ref_source = rp[0]; body.ref_id = rp[1];
+  } else {
+    var rt = (document.getElementById('sg-cmp-r-txt') || {}).value || '';
+    if (!rt.trim()) { toast('Paste a reference sequence', true); return; }
+    body.ref_source = rt.trim().startsWith('LOCUS') ? 'genbank' :
+                      rt.trim().startsWith('>') ? 'fasta' : 'raw';
+    body.ref_text = rt.trim();
+  }
+
+  btn.disabled = true; btn.textContent = 'Comparing\u2026';
+  status.textContent = 'Aligning\u2026';
+  try {
+    var resp = await api('POST', '/api/sanger/compare', body);
+    sgRenderCompareResults(resp);
+    status.textContent = '';
+  } catch (e) {
+    toast((e && e.message) || 'Compare failed', true);
+    status.textContent = '';
+  }
+  btn.disabled = false; btn.textContent = 'Compare';
+}
+function sgRenderCompareResults(data) {
+  var out = document.getElementById('sg-cmp-results');
+  if (!out) return;
+  var h = '<div style="background:#faf8f4;border:1px solid #d5cec0;border-radius:6px;padding:16px">';
+  h += '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">';
+  h += '<div><strong>' + esc(data.query_name) + '</strong> <span style="color:#8a7f72;font-size:.82rem">(' + data.query_length + ' bp)</span> ' +
+       '<span style="color:#8a7f72">vs</span> <strong>' + esc(data.ref_name) + '</strong> ' +
+       '<span style="color:#8a7f72;font-size:.82rem">(' + data.ref_length + ' bp' + (data.ref_is_circular ? ', circular' : '') + ')</span></div>';
+  h += '<div>' + (data.is_reverse ? '<span style="color:#c9a84c;font-weight:600">reverse-complement match</span>' : '') + '</div>';
+  h += '</div>';
+
+  data.pieces.forEach(function(p, i) {
+    var partLabel = data.pieces.length > 1 ? ' (part ' + (i + 1) + '/' + data.pieces.length + ')' : '';
+    h += '<div style="margin-top:' + (i === 0 ? '0' : '18px') + ';padding-top:' + (i === 0 ? '0' : '12px') + ';' +
+         (i > 0 ? 'border-top:1px dashed #d5cec0;' : '') + '">';
+    h += '<div style="display:flex;gap:16px;font-size:.82rem;color:#4a4139;margin-bottom:8px">';
+    h += 'identity: ' + identityBadge(p.identity_pct) + ' \u00b7 ';
+    h += 'ref ' + p.ref_start + '\u2013' + p.ref_end + ' \u00b7 query ' + p.query_start + '\u2013' + p.query_end + ' \u00b7 ';
+    h += p.num_mismatches + ' mm, ' + p.num_gaps + ' gaps' + partLabel;
+    h += '</div>';
+    h += _sgCompareAlignmentBlock(p);
+    h += '</div>';
+  });
+
+  h += '</div>';
+  out.innerHTML = h;
+}
+// BLAST-style alignment block: 60 cols per row, ref/match/query stacked.
+function _sgCompareAlignmentBlock(piece) {
+  var ref = piece.aligned_ref || '';
+  var qry = piece.aligned_query || '';
+  var W = 60;
+  var out = '<pre style="font-family:\'SF Mono\',Monaco,Consolas,monospace;font-size:.78rem;background:#fff;border:1px solid #ece7dd;padding:10px;overflow-x:auto;line-height:1.3;margin:0">';
+  var refPos = piece.ref_start || 0;
+  var qryPos = piece.query_start || 0;
+  for (var i = 0; i < ref.length; i += W) {
+    var refChunk = ref.substr(i, W);
+    var qryChunk = qry.substr(i, W);
+    var matchLine = '';
+    for (var j = 0; j < refChunk.length; j++) {
+      matchLine += (refChunk[j].toUpperCase() === qryChunk[j].toUpperCase() && refChunk[j] !== '-') ? '|' : ' ';
+    }
+    var refNoGap = refChunk.replace(/-/g, '').length;
+    var qryNoGap = qryChunk.replace(/-/g, '').length;
+    out += 'ref   ' + String(refPos + 1).padStart(6) + '  ' + esc(refChunk) + '  ' + (refPos + refNoGap) + '\n';
+    out += '                ' + esc(matchLine) + '\n';
+    out += 'query ' + String(qryPos + 1).padStart(6) + '  ' + esc(qryChunk) + '  ' + (qryPos + qryNoGap) + '\n\n';
+    refPos += refNoGap;
+    qryPos += qryNoGap;
+  }
+  out += '</pre>';
+  return out;
+}
+
 
 /* ── open batch / load data ──────────────────────────────── */
 async function sgOpenBatch(bid) {

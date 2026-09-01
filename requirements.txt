@@ -8,3 +8,4 @@ biopython
 smbprotocol
 python-docx
 primer3-py
+reportlab

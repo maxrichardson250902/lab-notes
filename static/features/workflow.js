@@ -437,7 +437,12 @@ async function renderWorkflow(el) {
   */
   html += '<div class="wf-doc-layout">' +
     '<div class="wf-doc-main">' +
-      '<div id="wf-doc" data-placeholder="Start typing your day\u2019s notes \u2014 a timestamp will appear on every new line. Tab inserts a table. Paste / drop / + Image for images. Select a block + use the Groups menu to tag it."></div>' +
+      '<div class="wf-doc-tabs">' +
+        '<div class="wf-doc-tab' + (_wfActiveTab === 'workflow' ? ' active' : '') + '" onclick="_wfSwitchTab(\'workflow\')">Workflow</div>' +
+        '<div class="wf-doc-tab' + (_wfActiveTab === 'planning' ? ' active' : '') + '" onclick="_wfSwitchTab(\'planning\')">Planning</div>' +
+        '<div class="wf-doc-tab' + (_wfActiveTab === 'analysis' ? ' active' : '') + '" onclick="_wfSwitchTab(\'analysis\')">Analysis</div>' +
+      '</div>' +
+      '<div id="wf-doc" data-placeholder="' + _wfDocPlaceholderFor(_wfActiveTab) + '"></div>' +
       '<div class="wf-doc-toolbar">' +
         '<button class="wf-tool-btn" onclick="_wfDocApi.cmd(\'bold\')" title="Bold"><strong>B</strong></button>' +
         '<button class="wf-tool-btn" onclick="_wfDocApi.cmd(\'italic\')" title="Italic"><em>I</em></button>' +
@@ -454,9 +459,12 @@ async function renderWorkflow(el) {
         '<div style="flex:1"></div>' +
         '<div id="wf-doc-saved" style="font-size:11px;color:#8a7f72">\u00a0</div>' +
       '</div>' +
+      /* Protocol picker — visible on Workflow (run) and Planning (plan)
+         tabs, hidden on Analysis. Different button per tab so the same
+         DOM slot flips role. */
       '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">' +
         '<div id="wf-proto-picker-wrap">' +
-          '<button class="btn" style="color:#5b7a5e;font-size:12px" onclick="wfShowProtoPicker()">&#9654; Run a protocol</button>' +
+          _wfProtoPickerButton(_wfActiveTab) +
         '</div>' +
       '</div>' +
     '</div>' +
@@ -630,6 +638,26 @@ function _wfInjectDocStyles() {
 
     /* ── Read mode (scrolling book of past days) ─────────────────────────── */
     '.wf-read-nav { align-items:center; }',
+    /* Three-tab bar — same look in write and read modes. Sits above the
+       editor / read-book. Underline on active tab, subtle hover. */
+    '.wf-doc-tabs { display:flex; gap:0; border-bottom:1px solid #d5cec0; margin-bottom:12px; }',
+    '.wf-doc-tab { padding:8px 18px; cursor:pointer; color:#8a7f72; border-bottom:2px solid transparent; font-size:13px; font-weight:600; user-select:none; transition:color .12s, border-color .12s; }',
+    '.wf-doc-tab:hover { color:#4a4139; }',
+    '.wf-doc-tab.active { color:#4a4139; border-bottom-color:#5b7a5e; }',
+    '.wf-read-tabs { margin-top:8px; }',
+    /* Planned-protocol block — inserted by wf_plan.js into the Planning
+       tab editor. Renders as a card so it stands out from surrounding
+       prose. Non-editable (contenteditable=false) inside; user can still
+       delete the whole block from outside. */
+    '.wf-plan-block { border:1px solid #d5cec0; border-left:4px solid #5b7aa0; background:#f4f2ec; border-radius:5px; padding:10px 14px; margin:10px 0; }',
+    '.wf-plan-head { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px; color:#4a4139; }',
+    '.wf-plan-head strong { color:#4a4139; }',
+    '.wf-plan-meta { width:100%; border-collapse:collapse; font-size:13px; margin:0; }',
+    '.wf-plan-meta th { text-align:left; font-weight:600; color:#8a7f72; padding:3px 12px 3px 0; width:35%; white-space:nowrap; vertical-align:top; border:none; background:transparent; }',
+    '.wf-plan-meta td { padding:3px 0; color:#4a4139; border:none; }',
+    '.wf-plan-tbl { border-collapse:collapse; font-size:12px; margin:4px 0 0 0; width:auto; }',
+    '.wf-plan-tbl th, .wf-plan-tbl td { border:1px solid #d5cec0; padding:3px 8px; text-align:left; color:#4a4139; background:#faf8f4; }',
+    '.wf-plan-tbl th { background:#e8e2d8; font-weight:600; color:#8a7f72; font-size:11px; }',
     '.wf-read-book { max-width:820px; margin:12px auto; }',
     '.wf-read-day { background:var(--surface,#faf8f4); border:1px solid var(--border,#d5cec0); border-radius:6px; padding:14px 18px; margin-bottom:16px; }',
     '.wf-read-day-h { display:flex; align-items:baseline; gap:10px; margin-bottom:10px; padding-bottom:8px; border-bottom:1px solid #ece7dd; }',
@@ -685,14 +713,82 @@ function _wfInjectDocStyles() {
 
 var _wfDocSaveTimer = null;
 var _wfCurrentBlock = null;
+
+/* ── Three-tab day document ──────────────────────────────────────────────
+   The single-editor pane hosts one of three tabs at a time: 'workflow'
+   (protocol run notes, the original content column), 'planning' (things
+   to run today, populated via "+ Plan a protocol"), and 'analysis'
+   (results write-up). Backend stores each in its own column on
+   day_documents. Client keeps all three cached in _wfTabContent to
+   avoid re-fetching on tab switch; force-saves the active tab before
+   swapping. Tab choice is NOT persisted across page loads — always
+   defaults to 'workflow'.                                              */
+var _wfActiveTab = 'workflow';
+var _wfTabContent = { workflow: '', planning: '', analysis: '' };
+var _wfTabsForRead = 'workflow';   // Read-mode's independent tab state
 async function _wfLoadDoc() {
   try {
     var data = await api('GET', '/api/workflow/' + _workflowDate + '/document');
+    // Cache all three tabs so switching is instant.
+    _wfTabContent = {
+      workflow: data.content || '',
+      planning: data.planning_content || '',
+      analysis: data.analysis_content || ''
+    };
     if (window._wfDocApi) {
-      window._wfDocApi.setHtml(data.content || '');
+      window._wfDocApi.setHtml(_wfTabContent[_wfActiveTab] || '');
       _wfRefreshSidebar();
     }
   } catch(e) {}
+}
+
+// Tab bar per-tab UX: swap the visible editor content, force-save the
+// current tab first so nothing is lost. Called on click of a tab pill.
+async function _wfSwitchTab(nextTab) {
+  if (nextTab === _wfActiveTab) return;
+  if (!(nextTab in _wfTabContent)) return;
+  // Save current tab first (await) — the editor is a single instance
+  // we're about to overwrite. Cached copy stays in sync.
+  if (window._wfDocApi) {
+    var html = window._wfDocApi.getHtml();
+    _wfTabContent[_wfActiveTab] = html;
+    // Fire-and-forget; if network is slow we don't want to block the tap.
+    _wfSaveDoc(html, _wfActiveTab).catch(function(){});
+  }
+  _wfActiveTab = nextTab;
+  var docEl = document.getElementById('wf-doc');
+  if (docEl) docEl.setAttribute('data-placeholder', _wfDocPlaceholderFor(nextTab));
+  if (window._wfDocApi) window._wfDocApi.setHtml(_wfTabContent[nextTab] || '');
+  // Re-render just the tab pills (highlight moves) and the protocol
+  // picker button (Run vs Plan vs hidden). Cheap; no full renderWorkflow.
+  document.querySelectorAll('.wf-doc-tab').forEach(function(el, i) {
+    var name = ['workflow','planning','analysis'][i];
+    el.classList.toggle('active', name === nextTab);
+  });
+  var pickerWrap = document.getElementById('wf-proto-picker-wrap');
+  if (pickerWrap) pickerWrap.innerHTML = _wfProtoPickerButton(nextTab);
+  _wfRefreshSidebar();
+}
+window._wfSwitchTab = _wfSwitchTab;
+
+function _wfProtoPickerButton(tab) {
+  if (tab === 'workflow') {
+    return '<button class="btn" style="color:#5b7a5e;font-size:12px" onclick="wfShowProtoPicker()">&#9654; Run a protocol</button>';
+  }
+  if (tab === 'planning') {
+    return '<button class="btn" style="color:#5b7aa0;font-size:12px" onclick="wfShowPlanPicker()">&#128203; Plan a protocol</button>';
+  }
+  return '';   // Analysis tab has no protocol affordance
+}
+
+function _wfDocPlaceholderFor(tab) {
+  if (tab === 'planning') {
+    return 'What are you planning to do? Use "Plan a protocol" to insert a filled-in metadata block for the experiment.';
+  }
+  if (tab === 'analysis') {
+    return 'Notes on results — attach gels, images, and text. Same tools as Workflow.';
+  }
+  return 'Start typing your day\u2019s notes \u2014 a timestamp will appear on every new line. Tab inserts a table. Paste / drop / + Image for images. Select a block + use the Groups menu to tag it.';
 }
 function _wfDocDebouncedSave() {
   if (_wfDocSaveTimer) clearTimeout(_wfDocSaveTimer);
@@ -703,18 +799,24 @@ function _wfDocDebouncedSave() {
     if (window._wfDocApi) _wfSaveDoc(window._wfDocApi.getHtml());
   }, delay);
 }
-async function _wfSaveDoc(html) {
+async function _wfSaveDoc(html, tabOverride) {
   if (!window._wfDocApi) return;
+  // tabOverride lets _wfSwitchTab save the OUTGOING tab even after it's
+  // flipped _wfActiveTab. Everything else uses the current active tab.
+  var tab = tabOverride || _wfActiveTab;
   var saveEl = document.getElementById('wf-doc-saved');
   if (saveEl) saveEl.textContent = 'Saving\u2026';
   try {
     var resp = await fetch('/api/workflow/' + _workflowDate + '/document', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: html }),
+      body: JSON.stringify({ content: html, tab: tab }),
     });
     if (!resp.ok) throw new Error(resp.statusText);
-    window._wfDocApi.markClean();
+    // Refresh cache with what we just saved so a subsequent tab-swap
+    // doesn't overwrite fresh content with a stale copy.
+    _wfTabContent[tab] = html;
+    if (tab === _wfActiveTab) window._wfDocApi.markClean();
     if (saveEl) saveEl.textContent = 'Saved \u00b7 ' + new Date().toLocaleTimeString();
   } catch(e) {
     if (saveEl) saveEl.textContent = 'Save failed';
@@ -1791,6 +1893,14 @@ async function _wfRenderReadMode(el) {
     '<button class="btn" onclick="_wfPrintPdf()" title="Print this 30-day window to PDF (save from your browser\'s print dialog)" style="margin-left:6px">&#128424; Print PDF</button>' +
     '</div>';
 
+  // Read-mode tab bar — matches write mode. Independent state
+  // (_wfTabsForRead) so switching tabs in read doesn't affect write.
+  html += '<div class="wf-doc-tabs wf-read-tabs">' +
+    '<div class="wf-doc-tab' + (_wfTabsForRead === 'workflow' ? ' active' : '') + '" onclick="_wfSwitchReadTab(\'workflow\')">Workflow</div>' +
+    '<div class="wf-doc-tab' + (_wfTabsForRead === 'planning' ? ' active' : '') + '" onclick="_wfSwitchReadTab(\'planning\')">Planning</div>' +
+    '<div class="wf-doc-tab' + (_wfTabsForRead === 'analysis' ? ' active' : '') + '" onclick="_wfSwitchReadTab(\'analysis\')">Analysis</div>' +
+    '</div>';
+
   html += '<div id="wf-read-status" style="font-size:12px;color:#8a7f72;margin:6px 2px">Loading&hellip;</div>';
   html += '<div id="wf-read-book" class="wf-read-book"></div>';
 
@@ -1799,7 +1909,8 @@ async function _wfRenderReadMode(el) {
 
   var resp;
   try {
-    resp = await api('GET', '/api/workflow/documents/range?end=' + encodeURIComponent(end) + '&days=' + days);
+    resp = await api('GET', '/api/workflow/documents/range?end=' + encodeURIComponent(end) +
+                     '&days=' + days + '&tab=' + encodeURIComponent(_wfTabsForRead));
   } catch (ex) {
     document.getElementById('wf-read-status').textContent = 'Failed to load: ' + (ex.message || ex);
     return;
@@ -1807,12 +1918,13 @@ async function _wfRenderReadMode(el) {
 
   var docs = resp.documents || [];
   var status = document.getElementById('wf-read-status');
+  var tabLabel = _wfTabsForRead.charAt(0).toUpperCase() + _wfTabsForRead.slice(1);
   if (docs.length === 0) {
-    status.innerHTML = 'No content in this 30-day window (' + esc(start) + ' &ndash; ' + esc(end) + '). ' +
-      'Try an earlier window with the Older button.';
+    status.innerHTML = 'No ' + tabLabel.toLowerCase() + ' content in this 30-day window (' + esc(start) + ' &ndash; ' + esc(end) + '). ' +
+      'Try an earlier window with the Older button, or switch tabs.';
     return;
   }
-  status.innerHTML = docs.length + ' day' + (docs.length === 1 ? '' : 's') + ' with content &middot; window ' + esc(start) + ' &ndash; ' + esc(end);
+  status.innerHTML = docs.length + ' day' + (docs.length === 1 ? '' : 's') + ' with ' + tabLabel.toLowerCase() + ' content &middot; window ' + esc(start) + ' &ndash; ' + esc(end);
 
   var book = document.getElementById('wf-read-book');
   var pages = docs.map(function(d) {
@@ -1830,6 +1942,16 @@ async function _wfRenderReadMode(el) {
   });
   book.innerHTML = pages.join('');
 }
+
+// Read-mode tab switch: re-render by calling the same function again.
+// Cheaper than a full renderWorkflow since it only re-fetches one range.
+function _wfSwitchReadTab(nextTab) {
+  if (nextTab === _wfTabsForRead) return;
+  _wfTabsForRead = nextTab;
+  var el = document.getElementById('content');
+  if (el) _wfRenderReadMode(el);
+}
+window._wfSwitchReadTab = _wfSwitchReadTab;
 
 
 /* ══════════════════════════════════════════════════════════════════════════

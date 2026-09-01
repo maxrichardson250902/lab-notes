@@ -236,11 +236,30 @@ keep the format: one line per feature, short scope description.*
 ### Views
 
 - **Notebook** — dashboard: today's entries, reminders, scratch pending, quick add
-- **Workflow (Daily Workflow)** — contenteditable day doc; time-chip
-  auto-insert (idle-based, `wf_chip_idle_minutes` setting, default 5);
-  project tagging via `data-groups` on blocks; Read mode; Redact mode;
-  Process Day AI summarisation; **gel picker inserts a block-level
-  full-image embed**: `<a class="wf-gel-link" data-gel-id="…" href="/api/gel_images/latest/{id}">`
+- **Workflow (Daily Workflow)** — **three-tab day document** per date
+  (Workflow / Planning / Analysis), each stored in its own column on
+  `day_documents` (`content`, `planning_content`, `analysis_content`).
+  Same rich editor in each tab (via `wfEditorAttach`); tab-switch is
+  a single-editor swap: force-save outgoing tab, load cached content
+  for incoming (`_wfSwitchTab` in `workflow.js`). Tab choice is NOT
+  persisted across page loads (defaults to Workflow). Read-mode has
+  its own independent tab state (`_wfTabsForRead`), re-fetches the
+  range with `?tab=` on each switch. Backend PUT accepts optional
+  `tab` field (`workflow` | `planning` | `analysis`, default
+  `workflow` for backward compat); range endpoint accepts `?tab=`.
+  Calendar dots (`dates-with-content`) show a day as populated if
+  ANY tab has content. **Planning tab** has "+ Plan a protocol"
+  button (Workflow has "Run a protocol", Analysis has neither) —
+  opens a modal that lists protocols, renders that protocol's
+  `metadata_schema` as a fillable form (scalars + editable tables
+  with add/delete row), and inserts a `wf-plan-block` HTML card into
+  the Planning editor at caret (see `static/features/wf_plan.js`;
+  fresh renderer, doesn't reuse scratch's `_spRenderMetaPanel`).
+  Contenteditable day doc; time-chip auto-insert (idle-based,
+  `wf_chip_idle_minutes` setting, default 5); project tagging via
+  `data-groups` on blocks; Read mode; Redact mode; Process Day AI
+  summarisation; **gel picker inserts a block-level full-image embed**:
+  `<a class="wf-gel-link" data-gel-id="…" href="/api/gel_images/latest/{id}">`
   wrapping `<img class="wf-gel-thumb" src="/api/gel_images/latest/{id}">`
   and a `<span>` caption. The `/latest/{gel_id}` endpoint (registered
   BEFORE the generic `/gel_images/{filename}` route in
@@ -320,8 +339,42 @@ keep the format: one line per feature, short scope description.*
   by project (Predictions view was removed)
 - **Papers** — reference library, attach to protocols / reminders /
   entries
-- **Circuits, Sanger, DNAmanager, Dilution, Tm calc, Import, Backup,
-  Settings** — various utilities
+- **Sanger Sequencing** — AB1 upload + alignment against a reference
+  (inventory item, .gb paste, or .fasta paste). Three top-level modes
+  in the "new alignment" area, all sharing a `sgModeTabs()` bar:
+  **Single alignment** (existing flow, `renderNew`/`sgRunAlign`,
+  persistent), **Screen refs** (multi-file × multi-ref matrix,
+  `renderScreen`/`sgRunScreen`, ephemeral — click a matrix cell to
+  materialise that one (file, ref) pair as a persisted alignment via
+  `/sanger/align`), and **Compare sequences** (any two stored/pasted
+  sequences, `renderCompare`/`sgRunCompare`, ephemeral, BLAST-style
+  alignment block via `_sgCompareAlignmentBlock`, no chromatogram).
+  Backend endpoints: `/sanger/align` (persistent), `/sanger/screen`
+  (POST multipart with `ab1` files + `refs` JSON array of {source,
+  id?, text?}, returns per-file × per-ref matrix, in-memory AB1
+  parsing, no DB writes), `/sanger/compare` (POST JSON with
+  query_source/id/text + ref_source/id/text, returns single
+  alignment result with pieces, no DB writes). Circular refs align
+  against a doubled reference so origin-spanning reads get one
+  contiguous hit, then split into two pieces via `_split_wrap_alignment`.
+  **Auto-rotation** (in `align_ab1`): if any read in a batch wraps the
+  source .gb's linearization break, backend picks a rotation offset
+  putting new position 0 in the midpoint of the largest
+  read-uncovered arc (`_pick_rotation_offset`), rotates both the
+  reference sequence AND its annotations by that offset
+  (`_rotate_ref_and_annos` — features that would span the new origin
+  are split into two annotation rows sharing the label), then
+  re-aligns all reads against the rotated ref. The rotated bytes are
+  what gets stored in `sanger_batches.ref_sequence` +
+  `ref_annotations`; the offset is persisted in
+  `sanger_batches.rotation_offset` (0 = no rotation) and returned in
+  both the `/sanger/align` and `/sanger/batch/{id}` responses so future
+  UI could translate back to source-.gb coords in tooltips.
+  Auto-rotation only fires from `/sanger/align`; `/sanger/screen` and
+  `/sanger/compare` don't rotate (they use the ref as-supplied).
+  Non-wrapping alignments and linear refs never trigger rotation.
+- **Circuits, DNAmanager, Dilution, Tm calc, Import, Backup, Settings**
+  — various utilities
 
 ### Schema highlights
 

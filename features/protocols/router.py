@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
-import json, re
+import json, re, uuid
 
 from core.database import register_table, register_seed, ensure_column, get_db
 
@@ -58,6 +58,25 @@ register_seed(lambda conn: ensure_column(conn, "protocols",
 # steps_json / recipe_json.
 register_seed(lambda conn: ensure_column(conn, "active_runs",
                                          "metadata_values", "TEXT DEFAULT NULL"))
+
+# Linked-runs group id. When two or more runs share the same
+# linked_group_id, changes to steps_json / recipe_json / scaling /
+# scale_factor made to any one propagate to all siblings via the PUT
+# handler. metadata_values does NOT propagate — that's the whole point
+# (two colony PCRs with different primers, same physical wetwork).
+# NULL = standalone run. Set via POST /active-runs/{id}/duplicate-linked;
+# cleared to null via PUT with linked_group_id="".
+register_seed(lambda conn: ensure_column(conn, "active_runs",
+                                         "linked_group_id", "TEXT DEFAULT NULL"))
+
+# Protocol pre-flight warnings: JSON array of short strings the user
+# needs reminding of every time this protocol is opened. Displayed as
+# a persistent banner at the top of a run in the scratch view. Not
+# dismissable per-run — the whole point is "check this every time".
+# Shape: ["make sure primers don't add overhang", "anneal to matching bit only"]
+# Empty array = no warnings; banner hidden.
+register_seed(lambda conn: ensure_column(conn, "protocols",
+                                         "warnings", "TEXT NOT NULL DEFAULT '[]'"))
 
 register_table("protocol_runs", """CREATE TABLE IF NOT EXISTS protocol_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -230,6 +249,9 @@ class UpdateProtocol(BaseModel):
     # JSON string. Frontend sends it pre-serialised so we don't need to
     # dict-validate here (schema shape is a client-side concern).
     metadata_schema: Optional[str] = None
+    # List of short reminder strings shown as a banner when the protocol
+    # is opened as a run in scratch. Empty list clears the warnings.
+    warnings: Optional[List[str]] = None
 
 class ActiveRunCreate(BaseModel):
     run_id:       str
@@ -252,6 +274,11 @@ class ActiveRunUpdate(BaseModel):
     # protocol's metadata_schema — scalars for scalar fields, list of
     # row-dicts for table fields.
     metadata_values: Optional[str] = None
+    # Group id for linked runs. Pass "" (empty string) to unlink this
+    # run from its group. Passing a value only sets the id on THIS
+    # run — the propagation logic (steps/recipe/scaling) reads whatever
+    # linked_group_id is currently set post-write.
+    linked_group_id: Optional[str] = None
 
 class SaveRun(BaseModel):
     protocol_id: int
@@ -357,12 +384,54 @@ def update_active_run(run_id: str, body: ActiveRunUpdate):
         if body.scaling         is not None: r["scaling"]         = 1 if body.scaling else 0
         if body.scale_factor    is not None: r["scale_factor"]    = body.scale_factor
         if body.metadata_values is not None: r["metadata_values"] = body.metadata_values
+        # Empty string on linked_group_id = unlink. None = leave as-is.
+        if body.linked_group_id is not None:
+            r["linked_group_id"] = body.linked_group_id or None
         conn.execute("""UPDATE active_runs SET
-            steps_json=?, recipe_json=?, scaling=?, scale_factor=?, metadata_values=?, updated_at=?
+            steps_json=?, recipe_json=?, scaling=?, scale_factor=?,
+            metadata_values=?, linked_group_id=?, updated_at=?
             WHERE run_id=?""",
             (r["steps_json"], r["recipe_json"], r["scaling"],
-             r["scale_factor"], r.get("metadata_values"), now, run_id))
+             r["scale_factor"], r.get("metadata_values"),
+             r.get("linked_group_id"), now, run_id))
         conn.commit()
+
+        # ── Propagation to linked siblings ──────────────────────────
+        # If this run is in a linked group, propagate the "shared"
+        # fields (steps/recipe/scaling — NOT metadata_values) to every
+        # other run in the group. Fields the client didn't send are
+        # left unchanged on the siblings (only overwrite what changed).
+        # metadata_values is deliberately excluded — that's the whole
+        # point of linked runs (same wetwork, different samples).
+        gid = r.get("linked_group_id")
+        if gid:
+            sibling_rows = conn.execute(
+                "SELECT run_id FROM active_runs WHERE linked_group_id=? AND run_id != ?",
+                (gid, run_id)
+            ).fetchall()
+            if sibling_rows:
+                # Build the SET clause dynamically based on what actually
+                # changed on this write, so a metadata-only save doesn't
+                # trigger a spurious steps propagation.
+                sets = []
+                vals = []
+                if body.steps_json   is not None:
+                    sets.append("steps_json=?");   vals.append(body.steps_json)
+                if body.recipe_json  is not None:
+                    sets.append("recipe_json=?");  vals.append(body.recipe_json)
+                if body.scaling      is not None:
+                    sets.append("scaling=?");      vals.append(1 if body.scaling else 0)
+                if body.scale_factor is not None:
+                    sets.append("scale_factor=?"); vals.append(body.scale_factor)
+                if sets:
+                    sets.append("updated_at=?"); vals.append(now)
+                    sibling_ids = [s["run_id"] for s in sibling_rows]
+                    placeholders = ",".join("?" * len(sibling_ids))
+                    conn.execute(
+                        f"UPDATE active_runs SET {', '.join(sets)} WHERE run_id IN ({placeholders})",
+                        vals + sibling_ids
+                    )
+                    conn.commit()
     return {"run_id": run_id}
 
 @router.delete("/active-runs/{run_id}")
@@ -371,6 +440,55 @@ def delete_active_run(run_id: str):
         conn.execute("DELETE FROM active_runs WHERE run_id=?", (run_id,))
         conn.commit()
     return {"deleted": run_id}
+
+
+@router.post("/active-runs/{run_id}/duplicate-linked")
+def duplicate_active_run_linked(run_id: str):
+    """Create a linked-sibling run: same protocol, same current step
+    progress, same recipe scaling, EMPTY metadata_values. Both runs
+    (source + new) share a linked_group_id — future writes to shared
+    fields (steps/recipe/scaling) on either run propagate to both.
+
+    Use case: user is running two colony PCRs together in the same
+    thermocycler. Ticking off "add master mix" in one should tick it
+    in both, but each has its own primer names / sample list."""
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        src = conn.execute(
+            "SELECT * FROM active_runs WHERE run_id=?", (run_id,)).fetchone()
+        if not src:
+            raise HTTPException(404, "Source run not found")
+        src = dict(src)
+
+        # If source has no group id yet, mint one and set it on source too.
+        # The new run then joins that group. This is the common case —
+        # user clicks "duplicate as linked" on a standalone run.
+        gid = src.get("linked_group_id")
+        if not gid:
+            gid = "lg_" + uuid.uuid4().hex[:12]
+            conn.execute(
+                "UPDATE active_runs SET linked_group_id=?, updated_at=? WHERE run_id=?",
+                (gid, now, run_id))
+
+        new_run_id = src["run_id"] + "_dup_" + uuid.uuid4().hex[:6]
+        conn.execute("""INSERT INTO active_runs
+            (run_id, protocol_id, protocol_json, steps_json, recipe_json,
+             group_name, subgroup, scaling, scale_factor, metadata_values,
+             linked_group_id, started_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (new_run_id, src["protocol_id"], src["protocol_json"],
+             src["steps_json"], src["recipe_json"],
+             src.get("group_name") or "", src.get("subgroup") or "",
+             src.get("scaling", 0), src.get("scale_factor", 1.0),
+             # Fresh metadata — this is the whole point of "linked but
+             # different samples". Client re-seeds defaults from the
+             # protocol's metadata_schema on load.
+             None,
+             gid, now, now))
+        conn.commit()
+        new_row = conn.execute(
+            "SELECT * FROM active_runs WHERE run_id=?", (new_run_id,)).fetchone()
+    return {"new_run_id": new_run_id, "linked_group_id": gid, "run": dict(new_row)}
 
 
 # ── Daily check-in support ──────────────────────────────────────────────────
@@ -589,11 +707,17 @@ async def update_protocol(protocol_id: int, body: UpdateProtocol):
         if body.tags   is not None: p["tags"]   = json.dumps(body.tags)
         if body.auto_complete is not None: p["auto_complete"] = body.auto_complete
         if body.metadata_schema is not None: p["metadata_schema"] = body.metadata_schema
+        if body.warnings is not None:
+            # Coerce to list of non-empty stripped strings so trailing blank
+            # rows from the editor don't render as empty banner items.
+            clean = [str(w).strip() for w in body.warnings if str(w).strip()]
+            p["warnings"] = json.dumps(clean)
         p["updated"] = datetime.utcnow().isoformat()
         conn.execute(
-            "UPDATE protocols SET title=?,notes=?,steps=?,recipe=?,tags=?,auto_complete=?,metadata_schema=?,updated=? WHERE id=?",
+            "UPDATE protocols SET title=?,notes=?,steps=?,recipe=?,tags=?,auto_complete=?,metadata_schema=?,warnings=?,updated=? WHERE id=?",
             (p["title"], p["notes"], p["steps"], p["recipe"], p["tags"],
              p.get("auto_complete", "manual"), p.get("metadata_schema"),
+             p.get("warnings", "[]"),
              p["updated"], protocol_id))
         conn.commit()
     return p
@@ -861,3 +985,242 @@ def list_metadata_presets():
     populate the 'Load from preset ▼' dropdown in the protocol edit view.
     Presets are starter schemas — user adopts one then edits fields."""
     return {"presets": METADATA_PRESETS}
+
+
+# ── PDF export ─────────────────────────────────────────────────────────────
+# `GET /protocols/{id}/pdf` returns a bench-printable PDF of the protocol.
+# Contents in order: title + created date + tags, notes (if any),
+# warnings banner (if any), metadata schema (fields with defaults; table
+# fields as sub-tables), recipe (each recipe_json entry as its own
+# named table), steps (numbered). Uses reportlab's Platypus flowables
+# so wrapping and page-breaks are handled by the layout engine.
+
+def _build_protocol_pdf(protocol: dict) -> bytes:
+    """Render a protocol as a printable PDF. Returns the bytes."""
+    # Local imports so a missing reportlab install doesn't crash module
+    # load for the rest of the protocols endpoints.
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        KeepTogether, PageBreak,
+    )
+    from reportlab.lib.enums import TA_LEFT
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=18 * mm, rightMargin=18 * mm,
+        topMargin=16 * mm, bottomMargin=16 * mm,
+        title=protocol.get("title", "Protocol"),
+    )
+    ss = getSampleStyleSheet()
+    # Compact styles tuned for a lab-notebook feel — dense but readable.
+    styles = {
+        "title": ParagraphStyle("title", parent=ss["Title"], fontSize=18,
+                                leading=22, spaceAfter=4, alignment=TA_LEFT),
+        "meta":  ParagraphStyle("meta",  parent=ss["Normal"], fontSize=8,
+                                textColor=colors.HexColor("#8a7f72"), spaceAfter=10),
+        "h2":    ParagraphStyle("h2",    parent=ss["Heading2"], fontSize=12,
+                                spaceBefore=10, spaceAfter=4,
+                                textColor=colors.HexColor("#4a4139")),
+        "body":  ParagraphStyle("body",  parent=ss["Normal"], fontSize=10,
+                                leading=14),
+        "warn":  ParagraphStyle("warn",  parent=ss["Normal"], fontSize=10,
+                                leading=14, textColor=colors.HexColor("#7a4a10")),
+        "notes": ParagraphStyle("notes", parent=ss["Normal"], fontSize=10,
+                                leading=14, fontName="Helvetica-Oblique",
+                                textColor=colors.HexColor("#5a5148")),
+        "step":  ParagraphStyle("step",  parent=ss["Normal"], fontSize=10,
+                                leading=14, leftIndent=16, bulletIndent=0),
+    }
+
+    def esc(s):
+        # reportlab paragraphs use minimal HTML; escape angle-brackets and &
+        # so raw protocol text doesn't accidentally parse as markup.
+        return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    story = []
+    # ── Title + meta line ────────────────────────────────────────
+    story.append(Paragraph(esc(protocol.get("title") or "Protocol"), styles["title"]))
+    meta_parts = []
+    if protocol.get("created"):
+        meta_parts.append("Created " + protocol["created"][:10])
+    if protocol.get("source_type") and protocol.get("url"):
+        meta_parts.append(f'Source: <a href="{esc(protocol["url"])}">{esc(protocol["url"])}</a>')
+    try:
+        tags = json.loads(protocol.get("tags") or "[]")
+    except Exception:
+        tags = []
+    if tags:
+        meta_parts.append("Tags: " + ", ".join(esc(t) for t in tags))
+    if meta_parts:
+        story.append(Paragraph(" · ".join(meta_parts), styles["meta"]))
+
+    # ── Notes (freeform, may be multi-paragraph) ─────────────────
+    notes = (protocol.get("notes") or "").strip()
+    if notes:
+        story.append(Paragraph("Notes", styles["h2"]))
+        for para in notes.split("\n\n"):
+            if para.strip():
+                story.append(Paragraph(esc(para).replace("\n", "<br/>"), styles["notes"]))
+
+    # ── Pre-flight warnings ──────────────────────────────────────
+    try:
+        warnings = json.loads(protocol.get("warnings") or "[]")
+    except Exception:
+        warnings = []
+    if warnings:
+        # Warnings boxed in amber so they stand out on the printed page.
+        rows = [[Paragraph("⚠ " + esc(w), styles["warn"])] for w in warnings]
+        tbl = Table(rows, colWidths=[doc.width])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",  (0, 0), (-1, -1), colors.HexColor("#faf1de")),
+            ("BOX",         (0, 0), (-1, -1), 0.75, colors.HexColor("#d5b070")),
+            ("INNERGRID",   (0, 0), (-1, -1), 0.25, colors.HexColor("#e2c890")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING",(0, 0), (-1, -1), 8),
+            ("TOPPADDING",  (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 4),
+        ]))
+        story.append(Paragraph("Pre-flight warnings", styles["h2"]))
+        story.append(tbl)
+        story.append(Spacer(1, 6))
+
+    # ── Metadata schema ──────────────────────────────────────────
+    try:
+        schema = json.loads(protocol.get("metadata_schema") or "null")
+    except Exception:
+        schema = None
+    if schema and schema.get("fields"):
+        story.append(Paragraph("Metadata to fill in", styles["h2"]))
+        scalar_rows = []
+        table_fields = []
+        for f in schema["fields"]:
+            if f.get("type") == "table":
+                table_fields.append(f)
+            else:
+                default = str(f.get("default", "") or "")
+                scalar_rows.append([
+                    Paragraph("<b>" + esc(f.get("label") or f.get("id")) + "</b>", styles["body"]),
+                    Paragraph(esc(f.get("type") or "text") + (f" · default: {esc(default)}" if default else ""), styles["body"]),
+                ])
+        if scalar_rows:
+            t = Table(scalar_rows, colWidths=[doc.width * 0.4, doc.width * 0.6])
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f5f0e5")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d5cec0")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 6))
+        for tf in table_fields:
+            story.append(Paragraph(
+                "<i>Table:</i> <b>" + esc(tf.get("label") or tf.get("id")) + "</b>",
+                styles["body"]))
+            cols = tf.get("columns") or []
+            if cols:
+                header = [Paragraph("<b>" + esc(c.get("label") or c.get("id")) + "</b>", styles["body"])
+                          for c in cols]
+                # One blank row so the printed page shows an empty grid to fill in
+                blank = [Paragraph("", styles["body"]) for _ in cols]
+                t = Table([header, blank, blank, blank], colWidths=[doc.width / len(cols)] * len(cols))
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f5f0e5")),
+                    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#a89f8f")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ]))
+                story.append(t)
+                story.append(Spacer(1, 6))
+
+    # ── Recipe (one Table per named recipe entry) ────────────────
+    try:
+        recipe = json.loads(protocol.get("recipe") or "null")
+    except Exception:
+        recipe = None
+    if recipe:
+        story.append(Paragraph("Recipe", styles["h2"]))
+        # Legacy shape: {name, columns, rows}. Newer shape: list of those.
+        recipe_list = recipe if isinstance(recipe, list) else [recipe]
+        for rec in recipe_list:
+            if not isinstance(rec, dict): continue
+            cols = rec.get("columns") or []
+            rows = rec.get("rows") or []
+            if not cols: continue
+            name = rec.get("name") or "Reagents"
+            story.append(Paragraph("<b>" + esc(name) + "</b>", styles["body"]))
+            data = [
+                [Paragraph("<b>" + esc(c) + "</b>", styles["body"]) for c in cols]
+            ]
+            for row in rows:
+                data.append([Paragraph(esc(row[i] if i < len(row) else ""), styles["body"])
+                             for i in range(len(cols))])
+            t = Table(data, colWidths=[doc.width / len(cols)] * len(cols), repeatRows=1)
+            t.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f5f0e5")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d5cec0")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 6))
+
+    # ── Steps ────────────────────────────────────────────────────
+    try:
+        steps = json.loads(protocol.get("steps") or "[]")
+    except Exception:
+        steps = []
+    if steps:
+        story.append(Paragraph("Steps", styles["h2"]))
+        for i, s in enumerate(steps):
+            text = s.get("text", "") if isinstance(s, dict) else str(s)
+            # Bulleted list would need a ListFlowable; simpler to prefix
+            # each step with its number as part of the paragraph.
+            story.append(Paragraph(
+                "<b>" + str(i + 1) + ".</b> " + esc(text).replace("\n", "<br/>"),
+                styles["step"]))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+@router.get("/protocols/{protocol_id}/pdf")
+def download_protocol_pdf(protocol_id: int):
+    from fastapi.responses import Response
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM protocols WHERE id=?", (protocol_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Protocol not found")
+    protocol = dict(row)
+    try:
+        pdf_bytes = _build_protocol_pdf(protocol)
+    except ImportError:
+        raise HTTPException(
+            500,
+            "reportlab is not installed. Add 'reportlab' to requirements.txt "
+            "and rebuild the container."
+        )
+    # Clean up filename — avoid slashes, quotes, and control chars.
+    safe_title = "".join(c if c.isalnum() or c in "-_. " else "_"
+                         for c in (protocol.get("title") or f"protocol_{protocol_id}"))
+    safe_title = safe_title.strip().replace(" ", "_") or f"protocol_{protocol_id}"
+    filename = f"{safe_title}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

@@ -70,6 +70,21 @@ DEFAULTS = {
     # Fraction of app_daily_budget_usd this app is allowed to consume per day.
     # 0.15 = 15%. When reached, LLM calls fall back to the local 3090.
     "app_budget_fraction": 0.15,
+    # ── Gel annotation canvas padding ─────────────────────────────────────
+    # How much blank space the gel canvas leaves around the image so lane
+    # labels (top) and ladder size labels (left) don't sit on top of the
+    # bands. Expressed as PERCENT of the current view (rotated+cropped)
+    # dimensions — the actual pixel amount scales with the image so long
+    # names get more room on a big image. Applied by gelPadFor.
+    # gel_pad_top_pct   — above the image, for lane labels
+    # gel_pad_left_pct  — left of the image, for ladder size labels
+    # gel_pad_right_pct — right of the image, for expected-size markers.
+    #   Kept in lockstep with left by the layout slider by default, but
+    #   the two are separate settings so advanced users can override
+    #   asymmetrically via a direct settings PUT.
+    "gel_pad_top_pct": 10,
+    "gel_pad_left_pct": 6,
+    "gel_pad_right_pct": 6,
 }
 
 
@@ -167,6 +182,15 @@ def update_settings(body: SettingsUpdate):
             # we don't validate against the view registry here because it's a
             # frontend concept.
             v = str(v)
+        elif k in ("gel_pad_top_pct", "gel_pad_left_pct", "gel_pad_right_pct"):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            # 0..50 for top (long diagonal labels), 0..30 for left/right
+            # (size labels rarely need more than a few chars of room).
+            hi = 50 if k == "gel_pad_top_pct" else 30
+            v = max(0.0, min(v, hi))
         config[k] = v
     _write_config(config)
     return config

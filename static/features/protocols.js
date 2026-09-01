@@ -716,6 +716,7 @@ function _panelBody(p) {
   h+='<button class="btn" onclick="protoEdit('+p.id+')">&#9998; Edit</button>';
   h+='<button class="btn" onclick="protoImportFromClaude('+p.id+')" title="Paste Claude&#39;s formatted output to overwrite steps + tables">&#128228; Import from Claude</button>';
   h+='<button class="btn" onclick="protoClone('+p.id+')">&#128464; Clone</button>';
+  h+='<button class="btn" onclick="protoDownloadPdf('+p.id+')" title="Download this protocol as a printable PDF">&#128196; PDF</button>';
   h+='<button class="btn" style="color:#c0392b" onclick="protoDelete('+p.id+')">&#128465; Delete</button>';
   h+='</div></div>';
   // steps
@@ -951,6 +952,20 @@ async function protoClone(pid) {
   catch(e){toast('Clone failed: '+e.message,true);}
 }
 
+// Trigger a browser download of the protocol PDF. The endpoint sets
+// Content-Disposition: attachment so the browser will save rather than
+// open. Using a hidden anchor + click keeps the current view intact —
+// no navigation, no new tab. window.location=... would work too but
+// some browsers show a "download started" confirmation which is noisy.
+function protoDownloadPdf(pid) {
+  var a = document.createElement('a');
+  a.href = '/api/protocols/' + pid + '/pdf';
+  a.download = '';   // let the server-provided filename win
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
 // ── Import formatted Claude output into an existing protocol ─────────────────
 function protoImportFromClaude(pid) {
   var div = document.createElement('div');
@@ -1101,10 +1116,15 @@ function protoEdit(pid) {
   // Seed schema too. Falls back to {fields:[]} for a blank protocol.
   var mschema = {fields: []};
   try { if (p.metadata_schema) { var parsed_s = JSON.parse(p.metadata_schema); if (parsed_s && Array.isArray(parsed_s.fields)) mschema = parsed_s; } } catch(e) {}
+  // Warnings — JSON array of strings shown as banner on every run.
+  // Seed as a plain array so the editor doesn't have to re-parse.
+  var warnings = [];
+  try { if (p.warnings) { var w = JSON.parse(p.warnings); if (Array.isArray(w)) warnings = w.filter(function(s){return typeof s==='string';}); } } catch(e) {}
   _editState[pid]={
     title:p.title,
     steps:steps.map(function(s){return{text:s.text,note:s.note||''};}),
-    metadata_schema: mschema
+    metadata_schema: mschema,
+    warnings: warnings
   };
   if(!_editState[pid].steps.length) _editState[pid].steps=[{text:'',note:''}];
   var h='<div class="proto-edit-mode-banner">&#9998; <strong>Editing mode</strong> — drag steps to reorder, edit inline</div>';
@@ -1126,6 +1146,18 @@ function protoEdit(pid) {
        '<button class="btn" onclick="_msAddField('+pid+',\'table\')">+ Table</button>' +
      '</div></div>' +
      '<div id="ms-body-'+pid+'">'+_msRenderBody(pid)+'</div>' +
+     '</div>';
+  // ── Pre-flight warnings ──────────────────────────────────────────────
+  // Short reminder strings shown as a persistent banner at the top of
+  // a run in the scratch view. One-liner things you catch yourself
+  // forgetting every time ("check primers don't add overhang", etc).
+  h+='<div class="recipe-section" style="margin-top:16px" id="pw-section-'+pid+'">' +
+     '<div class="recipe-section-head"><span>Pre-flight warnings</span>' +
+     '<div style="display:flex;gap:6px;align-items:center">' +
+       '<span style="font-size:11px;color:#8a7f72">banner on every run</span>' +
+       '<button class="btn" onclick="_pwAddWarning('+pid+')">+ Warning</button>' +
+     '</div></div>' +
+     '<div id="pw-body-'+pid+'">'+_pwRenderBody(pid)+'</div>' +
      '</div>';
   // auto-complete setting
   h+='<div style="margin-top:16px;display:flex;align-items:center;gap:10px"><span style="font-size:12px;font-weight:600;color:#8a7f72">Auto-complete runs:</span>'+_acDropdownHTML('pe-ac-'+pid, p.auto_complete||'manual')+'</div>';
@@ -1333,6 +1365,59 @@ function protoEditLinkStep(pid,afterIdx){_showLinkPicker(function(linkPid,title)
 function _attachEditStepListeners(pid){var c=document.getElementById('pe-steps-'+pid);if(!c)return;c.querySelectorAll('input[data-editpid]').forEach(function(inp){inp.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();protoEditAddStep(parseInt(inp.dataset.editpid),parseInt(inp.dataset.editidx));}});});}
 function _refreshEditSteps(pid){var c=document.getElementById('pe-steps-'+pid);if(!c)return;c.innerHTML=_buildEditStepsHTML(pid);_attachEditStepListeners(pid);}
 
+// ── Pre-flight warnings editor helpers ────────────────────────────────
+// State lives on _editState[pid].warnings as a plain string[]. The
+// section body renders one input per warning + a remove button. Adding
+// / removing rebuilds only the body div. On save, protoSaveEdit sends
+// the array in the PUT body.
+function _pwRenderBody(pid) {
+  var es = _editState[pid];
+  if (!es) return '';
+  var warnings = es.warnings || [];
+  if (!warnings.length) {
+    return '<div style="font-size:12px;color:#8a7f72;padding:8px 0">No warnings. Add one for things you want to double-check every time you run this protocol.</div>';
+  }
+  var h = '';
+  warnings.forEach(function(w, i) {
+    h += '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+         '<span style="color:#e8a735;font-size:14px;line-height:1">&#9888;</span>' +
+         '<input type="text" value="' + esc(w) +
+         '" oninput="_pwSetWarning(' + pid + ',' + i + ',this.value)"' +
+         ' style="flex:1;padding:6px 8px;font-size:13px;border:1px solid #d5cec0;border-radius:3px;background:#fff;color:#4a4139"/>' +
+         '<button class="btn" onclick="_pwRemoveWarning(' + pid + ',' + i + ')" title="Remove">&times;</button>' +
+         '</div>';
+  });
+  return h;
+}
+function _pwAddWarning(pid) {
+  var es = _editState[pid]; if (!es) return;
+  if (!es.warnings) es.warnings = [];
+  es.warnings.push('');
+  _pwRefresh(pid);
+  // Focus the new input so the user can just type.
+  setTimeout(function() {
+    var body = document.getElementById('pw-body-' + pid);
+    if (!body) return;
+    var inputs = body.querySelectorAll('input[type="text"]');
+    if (inputs.length) inputs[inputs.length - 1].focus();
+  }, 20);
+}
+function _pwSetWarning(pid, i, val) {
+  var es = _editState[pid]; if (!es || !es.warnings) return;
+  es.warnings[i] = val;
+  // No re-render — the input already shows the value. Blank rows are
+  // stripped server-side in the PUT handler.
+}
+function _pwRemoveWarning(pid, i) {
+  var es = _editState[pid]; if (!es || !es.warnings) return;
+  es.warnings.splice(i, 1);
+  _pwRefresh(pid);
+}
+function _pwRefresh(pid) {
+  var body = document.getElementById('pw-body-' + pid);
+  if (body) body.innerHTML = _pwRenderBody(pid);
+}
+
 async function protoSaveEdit(pid) {
   var es=_editState[pid]; if(!es)return;
   var steps=es.steps.filter(function(s){return s.text.trim();});
@@ -1348,9 +1433,12 @@ async function protoSaveEdit(pid) {
               ? es.metadata_schema
               : null;
   var msj = msObj ? JSON.stringify(msObj) : null;
-  await api('PUT','/api/protocols/'+pid,{title:title,steps:sj,recipe:rj,auto_complete:ac,metadata_schema:msj});
+  // Strip blank warnings client-side (server also strips, but this keeps
+  // the local cache honest so the banner doesn't briefly render empties).
+  var warnings = (es.warnings || []).map(function(s){ return (s || '').trim(); }).filter(Boolean);
+  await api('PUT','/api/protocols/'+pid,{title:title,steps:sj,recipe:rj,auto_complete:ac,metadata_schema:msj,warnings:warnings});
   var p=(S.protocols||[]).find(function(x){return x.id===pid;});
-  if(p){p.title=title;p.steps=sj;p.recipe=rj;p.auto_complete=ac;p.metadata_schema=msj;}
+  if(p){p.title=title;p.steps=sj;p.recipe=rj;p.auto_complete=ac;p.metadata_schema=msj;p.warnings=JSON.stringify(warnings);}
   delete _editState[pid];
   if(p){var panel=document.getElementById('pp-'+pid);if(panel){panel.innerHTML=_panelBody(p);protoLoadRunHistory(pid);}}
   _reloadProtocol(pid); _refreshPanelTab(pid); toast('Protocol updated');

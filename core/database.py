@@ -32,11 +32,24 @@ def register_seed(fn):
 def ensure_column(conn, table: str, column: str, decl: str):
     """Idempotently add a column to an existing table. `decl` is the SQL type
     plus any constraints, e.g. "TEXT NOT NULL DEFAULT 'plain'". SQLite doesn't
-    support IF NOT EXISTS on ADD COLUMN, so we introspect PRAGMA table_info."""
+    support IF NOT EXISTS on ADD COLUMN, so we introspect PRAGMA table_info.
+
+    Race-safe against multiple uvicorn workers running init_all_tables
+    concurrently: two workers can both pass the PRAGMA check (column
+    absent), then one wins the ALTER and the other gets
+    "duplicate column name" from SQLite. That's not a failure — the
+    schema is now in the state we wanted — so we swallow specifically
+    that error and re-raise anything else."""
     cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column in cols:
         return
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    except sqlite3.OperationalError as e:
+        # SQLite phrasing: "duplicate column name: <name>"
+        if "duplicate column name" in str(e).lower():
+            return
+        raise
 
 
 def init_all_tables():

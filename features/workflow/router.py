@@ -51,6 +51,17 @@ register_table("day_documents", """CREATE TABLE IF NOT EXISTS day_documents (
     content   TEXT NOT NULL DEFAULT '',
     updated   TEXT NOT NULL)""")
 
+# Three-tab model: `content` is the original protocol-workflow tab (kept
+# name for backward compat — every existing row is workflow content).
+# planning_content and analysis_content added later, both TEXT NOT NULL
+# DEFAULT ''. Empty string means "no content for this tab on this day".
+register_seed(lambda conn: ensure_column(conn, "day_documents",
+                                         "planning_content",
+                                         "TEXT NOT NULL DEFAULT ''"))
+register_seed(lambda conn: ensure_column(conn, "day_documents",
+                                         "analysis_content",
+                                         "TEXT NOT NULL DEFAULT ''"))
+
 # Tracks which dates have been migrated from workflow_entries → day_documents
 # so the migration runs at most once per date.
 register_table("workflow_migration_log", """CREATE TABLE IF NOT EXISTS workflow_migration_log (
@@ -510,11 +521,17 @@ def delete_workflow_entry(entry_id: int):
 def get_document(date: str):
     with get_db() as conn:
         row = conn.execute(
-            "SELECT content, updated FROM day_documents WHERE date=?", (date,)
+            "SELECT content, planning_content, analysis_content, updated "
+            "FROM day_documents WHERE date=?", (date,)
         ).fetchone()
     if not row:
-        return {"date": date, "content": "", "updated": None}
-    return {"date": date, "content": row["content"], "updated": row["updated"]}
+        return {"date": date, "content": "", "planning_content": "",
+                "analysis_content": "", "updated": None}
+    return {"date": date,
+            "content": row["content"],
+            "planning_content": row["planning_content"] or "",
+            "analysis_content": row["analysis_content"] or "",
+            "updated": row["updated"]}
 
 
 # ── Read-mode support: fetch a range of day_documents in one shot ────────────
@@ -525,13 +542,17 @@ def get_document(date: str):
 # that actually have content, so gaps don't create empty page-eating dividers.
 
 @router.get("/workflow/documents/range")
-def get_document_range(end: str, days: int = 30):
+def get_document_range(end: str, days: int = 30, tab: str = "workflow"):
     """Return all day content in the window [end - days + 1, end], newest
     first. Prefers day_documents rows; falls back to synthesising HTML from
     workflow_entries for dates that haven't been migrated yet (either because
     the app hasn't restarted since they were added, or because they were
     added by the legacy addWorkflowNote flow that still writes to
     workflow_entries directly).
+
+    `tab` selects which column (workflow | planning | analysis). Defaults
+    to workflow. Planning / analysis have no synth fallback — they only
+    ever came from day_documents, so no legacy path.
 
     Only dates with actual content are included."""
     try:
@@ -540,36 +561,40 @@ def get_document_range(end: str, days: int = 30):
         raise HTTPException(400, "end must be YYYY-MM-DD")
     if days < 1 or days > 366:
         raise HTTPException(400, "days must be between 1 and 366")
+    col = _TAB_COLUMN.get(tab)
+    if col is None:
+        raise HTTPException(400, f"tab must be one of {list(_TAB_COLUMN)}")
     start_dt = end_dt - timedelta(days=days - 1)
     start_s = start_dt.strftime("%Y-%m-%d")
 
     with get_db() as conn:
         # Pull day_documents rows for the window
         doc_rows = conn.execute(
-            "SELECT date, content, updated FROM day_documents "
-            "WHERE date >= ? AND date <= ? AND content != ''",
+            f"SELECT date, {col} AS content, updated FROM day_documents "
+            f"WHERE date >= ? AND date <= ? AND {col} != ''",
             (start_s, end),
         ).fetchall()
         by_date = {r["date"]: (r["content"], r["updated"]) for r in doc_rows}
 
-        # Also find dates with workflow_entries in the window that DON'T have a
-        # day_document — those need on-the-fly synthesis.
-        we_dates = conn.execute(
-            "SELECT DISTINCT date FROM workflow_entries "
-            "WHERE date >= ? AND date <= ? "
-            "AND date NOT IN (SELECT date FROM day_documents WHERE content != '') "
-            "ORDER BY date DESC",
-            (start_s, end),
-        ).fetchall()
+        # workflow_entries synth fallback only applies to the workflow tab;
+        # planning/analysis are new features with no legacy source data.
+        if tab == "workflow":
+            we_dates = conn.execute(
+                "SELECT DISTINCT date FROM workflow_entries "
+                "WHERE date >= ? AND date <= ? "
+                "AND date NOT IN (SELECT date FROM day_documents WHERE content != '') "
+                "ORDER BY date DESC",
+                (start_s, end),
+            ).fetchall()
 
-        for r in we_dates:
-            date = r["date"]
-            synth = _synth_day_html_from_entries(conn, date)
-            if synth:
-                # Mark synthesised content with `updated=None` so the client
-                # can tell it wasn't loaded from a day_document. (Purely
-                # informational — not used to gate rendering.)
-                by_date[date] = (synth, None)
+            for r in we_dates:
+                date = r["date"]
+                synth = _synth_day_html_from_entries(conn, date)
+                if synth:
+                    # Mark synthesised content with `updated=None` so the client
+                    # can tell it wasn't loaded from a day_document. (Purely
+                    # informational — not used to gate rendering.)
+                    by_date[date] = (synth, None)
 
     documents = [
         {"date": d, "content": c, "updated": u, "source": "day_document" if u else "synth_workflow_entries"}
@@ -595,9 +620,11 @@ def dates_with_content(start: str, end: str):
     except ValueError:
         raise HTTPException(400, "start and end must be YYYY-MM-DD")
     with get_db() as conn:
+        # Any of the three tabs having content counts.
         dd = conn.execute(
             "SELECT date FROM day_documents "
-            "WHERE date >= ? AND date <= ? AND content != ''",
+            "WHERE date >= ? AND date <= ? AND "
+            "(content != '' OR planning_content != '' OR analysis_content != '')",
             (start, end),
         ).fetchall()
         we = conn.execute(
@@ -699,20 +726,40 @@ def blocks_by_group(group: str, limit: int = 200):
 
 class DocumentUpdate(BaseModel):
     content: str
+    # Which tab the content belongs to. Defaults to "workflow" for
+    # backward compat with older frontends (before three-tab UI) that
+    # sent {content} with no tab. Values: workflow | planning | analysis.
+    tab: Optional[str] = "workflow"
+
+
+# Whitelist of tabs → column names in day_documents. Keeps
+# untrusted `tab` values from being spliced directly into SQL.
+_TAB_COLUMN = {
+    "workflow": "content",
+    "planning": "planning_content",
+    "analysis": "analysis_content",
+}
 
 
 @router.put("/workflow/{date}/document")
 def update_document(date: str, body: DocumentUpdate):
     now = datetime.utcnow().isoformat()
     clean = sanitize_html(body.content)
+    tab = body.tab or "workflow"
+    col = _TAB_COLUMN.get(tab)
+    if col is None:
+        raise HTTPException(400, f"tab must be one of {list(_TAB_COLUMN)}")
     with get_db() as conn:
         existing = conn.execute("SELECT 1 FROM day_documents WHERE date=?", (date,)).fetchone()
         if existing:
-            conn.execute("UPDATE day_documents SET content=?, updated=? WHERE date=?",
+            # Column name is from the whitelist above, safe to interpolate.
+            conn.execute(f"UPDATE day_documents SET {col}=?, updated=? WHERE date=?",
                          (clean, now, date))
         else:
-            conn.execute("INSERT INTO day_documents (date, content, updated) VALUES (?,?,?)",
-                         (date, clean, now))
+            # Fresh row — the two other columns default to '' at insert time.
+            conn.execute(
+                f"INSERT INTO day_documents (date, {col}, updated) VALUES (?,?,?)",
+                (date, clean, now))
         # Mark as migrated so a startup re-migration doesn't try to re-fill it.
         conn.execute(
             "INSERT OR IGNORE INTO workflow_migration_log (date, migrated_at) VALUES (?,?)",
