@@ -5772,38 +5772,61 @@ def run_golden_gate_assembly(fragments: list, vector: dict = None,
         is_vector = bool(piece.get("is_vector"))
 
         if is_vector:
-            # Keep the backbone (outside the cuts, wrapping the origin).
-            # The backbone's "left" sticky end (in assembly order) is the one
-            # that ligates to an insert's right_sticky — i.e., the overhang
-            # exposed at the cut_right position.
-            # The backbone's "right" sticky end ligates to an insert's left_sticky
-            # — the overhang exposed at the cut_left position.
-            # In top-strand convention these are simply swapped vs the insert case.
-            left_sticky = seq[right_pos - oh_len:right_pos].upper()  # e.g. AGGT
-            right_sticky = seq[left_pos:left_pos + oh_len].upper()    # e.g. AATG
+            # Determine which region is the backbone: the WRAP-around region
+            # (seq[right_pos:] + seq[:left_pos]) or the BETWEEN-CUTS region
+            # (seq[left_pos:right_pos]). The heuristic is size — the backbone
+            # is the larger of the two, since a real plasmid backbone needs
+            # ~1.5 kb minimum (ori + selection marker) while stuffers are
+            # usually a few hundred bp of dropout (e.g. lacZ).
+            #
+            # Previously this branch ALWAYS kept the wrap as backbone, which
+            # broke on vectors whose BsaI sites point INWARD toward the wrap
+            # (i.e. small stuffer sits at the origin, backbone is the between-
+            # cuts region). Common in real GG destination vectors — e.g. a
+            # pET28-based vector with a ~500 bp stuffer sitting at the origin
+            # produces a 5 kb backbone in the between-cuts region.
+            wrap_bp    = (len(seq) - right_pos) + left_pos
+            between_bp = right_pos - left_pos
 
-            # Backbone body = everything OUTSIDE [left_pos, right_pos), wrapped.
-            # The overhang bases themselves are kept as the sticky ends; the
-            # body (between the overhangs as you walk around the backbone) is:
-            #   seq[right_pos:] + seq[:left_pos]
-            insert_seq = seq[right_pos:] + seq[:left_pos]
+            if between_bp > wrap_bp:
+                # STUFFER = wrap (small), BACKBONE = between-cuts region.
+                # Extract exactly like an insert — keep the between-cuts
+                # region, using the standard insert-style sticky-end assignment.
+                left_sticky = seq[left_pos:left_pos + oh_len].upper()
+                right_sticky = seq[right_pos - oh_len:right_pos].upper()
+                insert_seq = seq[left_pos + oh_len:right_pos - oh_len]
+                insert_anns = _remap_annotations(
+                    piece["annotations"], 0, len(seq),
+                    trim_start=left_pos + oh_len,
+                    trim_end=right_pos - oh_len,
+                    source_name=piece["name"],
+                )
+            else:
+                # STUFFER = between-cuts region (large), BACKBONE = wrap.
+                # Original behaviour: keep everything OUTSIDE [left_pos, right_pos),
+                # wrapping the origin. Sticky-end assignment is swapped vs the
+                # insert case because we're describing the OPPOSITE ends of the
+                # cuts (the ones that stay with the backbone).
+                left_sticky = seq[right_pos - oh_len:right_pos].upper()
+                right_sticky = seq[left_pos:left_pos + oh_len].upper()
+                insert_seq = seq[right_pos:] + seq[:left_pos]
 
-            # Remap annotations across the wrap. Two source regions concatenate
-            # into the new piece:
-            #   source [right_pos, len(seq))  →  product [0, len(seq) - right_pos)
-            #   source [0, left_pos)          →  product [len(seq) - right_pos, ...)
-            tail_anns = _remap_annotations(
-                piece["annotations"], 0, len(seq),
-                trim_start=right_pos, trim_end=len(seq),
-                source_name=piece["name"],
-            )
-            head_offset = len(seq) - right_pos
-            head_anns = _remap_annotations(
-                piece["annotations"], head_offset, len(seq),
-                trim_start=0, trim_end=left_pos,
-                source_name=piece["name"],
-            )
-            insert_anns = tail_anns + head_anns
+                # Remap annotations across the wrap. Two source regions
+                # concatenate into the new piece:
+                #   source [right_pos, len(seq))  →  product [0, len(seq) - right_pos)
+                #   source [0, left_pos)          →  product [len(seq) - right_pos, ...)
+                tail_anns = _remap_annotations(
+                    piece["annotations"], 0, len(seq),
+                    trim_start=right_pos, trim_end=len(seq),
+                    source_name=piece["name"],
+                )
+                head_offset = len(seq) - right_pos
+                head_anns = _remap_annotations(
+                    piece["annotations"], head_offset, len(seq),
+                    trim_start=0, trim_end=left_pos,
+                    source_name=piece["name"],
+                )
+                insert_anns = tail_anns + head_anns
         else:
             # Standard insert: keep the region BETWEEN the cuts.
             left_sticky = seq[left_pos:left_pos + oh_len].upper()

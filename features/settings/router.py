@@ -40,7 +40,7 @@ DEFAULTS = {
     # been idle for at least this long. Prevents spam during active typing
     # while still stamping natural break points. Manual Ctrl+T always
     # inserts regardless of this setting.
-    "wf_chip_idle_minutes": 5,
+    "wf_chip_idle_minutes": 2,
     # ── Archived DNA entries ──────────────────────────────────────────────
     # Show archived DNA entries (plasmids, primers, gblocks, kit parts, parts).
     # When off (default), rows with private=1 are filtered out at both the

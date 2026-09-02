@@ -524,7 +524,59 @@ def _rotate_ref_and_annos(ref_seq, annos, offset, ref_len):
             head_len = ref_len - s
             new_annos.append({**a, "start": s, "end": ref_len})
             new_annos.append({**a, "start": 0, "end": length - head_len})
-    return rotated, new_annos
+
+    # ── Merge adjacent same-feature pieces ────────────────────────
+    # Features that wrap the ORIGINAL origin arrive as multiple parts
+    # from Biopython's CompoundLocation (parse_gb_annotations iterates
+    # feat.location.parts). Each part gets rotated independently; when
+    # the rotation makes them CONTIGUOUS in the new frame, they must
+    # be merged back into one piece — otherwise the frontend renders
+    # them as multiple stripes on different rows (row-placement treats
+    # 'touching' as 'overlapping'), which is the "stretching" the user
+    # is seeing on wrap-spanning annotations.
+    #
+    # Legitimate wraps of the NEW origin are NOT merged: their tail is
+    # at start=0 and head ends at end=ref_len, so head.end == ref_len
+    # ≠ tail.start = 0 (unless ref_len == 0, impossible). Merge only
+    # fires on true adjacency, not on pieces that touch the boundary.
+    return rotated, _merge_adjacent_annos(new_annos)
+
+
+def _merge_adjacent_annos(annos):
+    """Merge annotations that (a) share label, type, strand, and colour,
+    and (b) sit end-to-end (piece[i].end == piece[i+1].start). Preserves
+    input order for unmerged annotations by keying groups on identity."""
+    if not annos:
+        return annos
+    # Group indices by identity signature (label + type + strand + color)
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for idx, a in enumerate(annos):
+        key = (a.get("label", ""), a.get("type", ""),
+               a.get("strand", 0), a.get("color", None))
+        groups[key].append(idx)
+
+    # For each group, sort by start, merge adjacent pieces. Mark merged
+    # pieces so they can be filtered out of the final list. Absorb into
+    # the earliest piece so output order roughly follows input order.
+    absorbed = set()
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        # Sort a copy by (start, end) — we mutate annos[keep] in place
+        # to extend its end, and mark the later pieces absorbed.
+        indices_by_start = sorted(indices, key=lambda i: (annos[i]["start"], annos[i]["end"]))
+        keep = indices_by_start[0]
+        for nxt in indices_by_start[1:]:
+            if annos[nxt]["start"] == annos[keep]["end"]:
+                # Extend the keeper's end and mark nxt absorbed
+                annos[keep] = {**annos[keep], "end": annos[nxt]["end"]}
+                absorbed.add(nxt)
+            else:
+                # Gap — this piece stands alone. Reset keep to nxt for
+                # any further adjacency chain.
+                keep = nxt
+    return [a for idx, a in enumerate(annos) if idx not in absorbed]
 
 
 def do_alignment(query_seq, ref_seq, is_circular=False):

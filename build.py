@@ -12,9 +12,13 @@ STATIC = Path(__file__).parent / "static"
 DEV_HTML = STATIC / "index.dev.html"
 OUT_HTML = STATIC / "index.html"
 
-# Order matters — core first, then features in the order the dev HTML lists them
+# Order matters — core first, then features in the order the dev HTML lists them.
+# Any feature file NOT in this list is silently skipped, even if it exists on
+# disk — the docstring above is misleading (there's no glob). If you add a new
+# feature file under static/features/, ADD ITS NAME TO THIS LIST or clicking
+# the buttons it wires up will silently no-op.
 FEATURE_ORDER = [
-    "notebook", "wf_editor", "workflow",  "protocols", "summaries","pipeline" ,"addform",
+    "notebook", "wf_editor", "workflow", "wf_plan", "protocols", "summaries","pipeline" ,"addform",
      "scratch", "reminders", "hours", "gel_annotation", "timeline",
     "plan_converter","circuits","cloning","sanger", "papers", "dilution","import_data","backup","tm_calc",  "import", "enrichment",
     "settings",

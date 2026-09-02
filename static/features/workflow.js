@@ -79,9 +79,67 @@ function _wfGetActiveProject() {
 function _wfSetActiveProject(name) {
   _wfActiveProject = (name || '').trim();
   try { localStorage.setItem('wf-active-project', _wfActiveProject); } catch (e) {}
-  // Repaint the button label without a full re-render
-  var btn = document.getElementById('wf-active-project-btn');
-  if (btn) btn.innerHTML = _wfActiveProjectBtnLabel();
+  // Repaint the pill in-place without a full re-render.
+  var pill = document.getElementById('wf-project-pill');
+  if (pill) {
+    var parent = pill.parentNode;
+    var wrapper = document.createElement('div');
+    wrapper.innerHTML = _wfProjectStatusPill();
+    parent.replaceChild(wrapper.firstChild, pill);
+  }
+
+  /* Apply the new state to the CURRENT block too, so a mid-block
+     selection retroactively tags whatever you're writing right now
+     (not just the next Enter). Setting to '' clears the tag on the
+     current block; setting to a project applies it. */
+  var sel = window.getSelection();
+  if (sel && sel.anchorNode) {
+    var block = sel.anchorNode.parentNode;
+    while (block && block.id !== 'wf-doc' &&
+           !(block.matches && block.matches('p, div, h3, h4, blockquote'))) {
+      block = block.parentNode;
+    }
+    if (block && block.id !== 'wf-doc') {
+      if (_wfActiveProject) block.setAttribute('data-groups', _wfActiveProject);
+      else block.removeAttribute('data-groups');
+      if (window._wfDocApi) _wfDocDebouncedSave();
+    }
+  }
+}
+
+/* One-click clear from the pill's × button. Doesn't open the picker. */
+function _wfClearActiveProject() {
+  _wfSetActiveProject('');
+}
+
+/* Toolbar status pill — always visible, shows the current tagging
+   state, always toggleable in ≤ 1 click.
+
+   OFF (no project): "🏷 No project ▾" in muted state. Click the whole
+     pill to open the picker.
+   ON  (project set): "🏷 <project> ▾ ×" in active state. Click the
+     label to open the picker (change project); click × to clear.
+
+   Wrapped as one continuous button-group so it reads as a single
+   control. The × is a separate <button> so its click doesn't
+   propagate to the picker-opener. */
+function _wfProjectStatusPill() {
+  var p = _wfGetActiveProject();
+  var active = !!p;
+  var pillClass = 'wf-project-pill' + (active ? ' wf-project-pill-on' : '');
+  var labelHtml = active
+    ? '&#127991; ' + esc(p) + ' &#9662;'
+    : '&#127991; No project &#9662;';
+  var html = '<div id="wf-project-pill" class="' + pillClass + '" role="group">';
+  html += '<button class="wf-project-pill-label" onclick="wfOpenTagPicker()" ' +
+          'title="' + (active ? 'Change project (Ctrl+G)' : 'Set a project to tag new blocks (Ctrl+G)') + '">' +
+          labelHtml + '</button>';
+  if (active) {
+    html += '<button class="wf-project-pill-x" onclick="_wfClearActiveProject()" ' +
+            'title="Clear project — new blocks won\'t be tagged" aria-label="Clear project">&times;</button>';
+  }
+  html += '</div>';
+  return html;
 }
 
 function _wfActiveProjectBtnLabel() {
@@ -455,7 +513,7 @@ async function renderWorkflow(el) {
         '<div class="wf-tool-sep"></div>' +
         '<button class="wf-tool-btn" onclick="wfInsertTimeChip()" title="Insert current time (Ctrl+T)">&#128338; Time</button>' +
         '<div class="wf-tool-sep"></div>' +
-        '<button class="wf-tool-btn wf-tool-btn-primary" onclick="wfOpenTagPicker()" title="Tag the current block (Ctrl+G)">&#127991; Groups\u2026</button>' +
+        _wfProjectStatusPill() +
         '<div style="flex:1"></div>' +
         '<div id="wf-doc-saved" style="font-size:11px;color:#8a7f72">\u00a0</div>' +
       '</div>' +
@@ -555,6 +613,18 @@ function _wfInjectDocStyles() {
     '.wf-run-finish:hover { background:#e8f0e8; }',
     '.wf-doc-toolbar { display:flex; gap:4px; align-items:center; flex-wrap:wrap; padding:6px 0 4px 0; margin-top:4px; border-top:1px solid #ece7dd; }',
     '.wf-tool-btn-primary { background:#5b7a5e !important; color:#fff !important; border-color:#5b7a5e !important; }',
+    // Project status pill — sits in the toolbar; two-part control (label + ×).
+    // Muted/greyed when no project set, solid green when one is active.
+    '.wf-project-pill { display:inline-flex; align-items:stretch; border:1px solid #d5cec0; border-radius:6px; overflow:hidden; background:#faf8f4; }',
+    '.wf-project-pill-label { background:transparent; border:none; padding:5px 10px; font-size:12px; color:#8a7f72; cursor:pointer; font-family:inherit; line-height:1.4; }',
+    '.wf-project-pill-label:hover { background:#f0ebe0; color:#4a4139; }',
+    '.wf-project-pill-x { background:transparent; border:none; border-left:1px solid #d5cec0; padding:0 8px; color:#8a7f72; cursor:pointer; font-size:15px; line-height:1; font-family:inherit; }',
+    '.wf-project-pill-x:hover { background:#faf0ee; color:#c25a4a; }',
+    '.wf-project-pill-on { border-color:#5b7a5e; background:#5b7a5e; }',
+    '.wf-project-pill-on .wf-project-pill-label { color:#fff; font-weight:500; }',
+    '.wf-project-pill-on .wf-project-pill-label:hover { background:rgba(255,255,255,0.12); color:#fff; }',
+    '.wf-project-pill-on .wf-project-pill-x { border-left-color:rgba(255,255,255,0.28); color:rgba(255,255,255,0.85); }',
+    '.wf-project-pill-on .wf-project-pill-x:hover { background:rgba(255,255,255,0.18); color:#fff; }',
     // Stretch the editor down the viewport so there's plenty of room to
     // write without the box feeling cramped on empty days. Viewport-
     // relative so it scales with window size; 260px reserves space for
@@ -829,6 +899,34 @@ async function _wfSaveDoc(html, tabOverride) {
    ({manual: true}). Manual insert bypasses the idle-threshold check
    (auto-insert enforces it separately in _wfDocKeydownExtras Enter path).
    Always fires the time_events log for immediate hours-copy visibility. */
+/* Return the wall-clock timestamp (ms since epoch) of the most-recent
+   .wf-time chip in the current doc, using today's date. Returns 0 if
+   there are no chips yet — the caller treats 0 as "no last chip, first
+   chip always allowed". Chips carry only HH:MM in textContent so we
+   assume they're from today (correct for the current-day session; past
+   days are skipped by the caller anyway via _wfIsTrackingActive). */
+function _wfLastChipTime() {
+  var docEl = document.getElementById('wf-doc');
+  if (!docEl) return 0;
+  var chips = docEl.querySelectorAll('.wf-time');
+  if (!chips.length) return 0;
+  var maxMs = 0;
+  var todayBase = new Date();
+  todayBase.setHours(0, 0, 0, 0);
+  var base = todayBase.getTime();
+  for (var i = 0; i < chips.length; i++) {
+    var t = (chips[i].textContent || '').trim();
+    var m = /^(\d{1,2}):(\d{2})/.exec(t);
+    if (!m) continue;
+    var hh = parseInt(m[1], 10);
+    var mm = parseInt(m[2], 10);
+    if (isNaN(hh) || isNaN(mm) || hh > 23 || mm > 59) continue;
+    var ms = base + (hh * 3600 + mm * 60) * 1000;
+    if (ms > maxMs) maxMs = ms;
+  }
+  return maxMs;
+}
+
 function wfInsertTimeChip(opts) {
   if (!window._wfDocApi) return;
   var now = new Date();
@@ -1036,18 +1134,30 @@ function _wfDocKeydownExtras(e) {
       if (block.querySelector && block.querySelector('.wf-time')) return;
 
       /* ── Idle-threshold check ────────────────────────────────────────
-         Stamp a chip only if the user has been idle at least
-         wf_chip_idle_minutes minutes. Reference point is the user's last
-         content-producing keystroke (_wfLastActivityAt), NOT the max
-         chip time in the doc. This means continuous typing never
-         inserts more chips, and returning after a real break always
-         gets one.
-         typeof S guard because top-level `let S` in core.js doesn't
-         attach to window — same bug class as the DNA archive icon. */
-      var thresholdMin = (typeof S !== 'undefined' && S.settings && S.settings.wf_chip_idle_minutes) || 5;
+         Stamp a chip only if it's been ≥ wf_chip_idle_minutes since
+         the LAST CHIP was inserted anywhere in the doc.
+
+         The previous model compared against _wfLastActivityAt (last
+         keystroke), which bumps on every keypress — so the condition
+         "gap since last keystroke > N min" almost never fires during
+         normal work, no matter how long the session. Users ended up
+         hitting Ctrl+T manually every time.
+
+         New model: chips mark thought boundaries. Every N min of
+         active work, when you naturally Enter to start a new thought,
+         you get a timestamp. Return after a real break (lunch) →
+         last chip is hours ago → next Enter stamps a fresh chip.
+         Continuous flow without Enter deliberately gets no chips
+         (Ctrl+T for that).
+
+         Also skip if we're editing a past day — those chips carry
+         historical times and inserting a "now" chip mid-history is
+         wrong. */
+      if (_wfIsTrackingActive && _wfIsTrackingActive()) return;
+      var thresholdMin = (typeof S !== 'undefined' && S.settings && S.settings.wf_chip_idle_minutes) || 2;
       var now = new Date();
-      var idleMs = now.getTime() - _wfLastActivityAt;
-      if (idleMs < thresholdMin * 60 * 1000) return;
+      var lastChipMs = _wfLastChipTime();
+      if (lastChipMs !== 0 && (now.getTime() - lastChipMs) < thresholdMin * 60 * 1000) return;
 
       var hh = String(now.getHours()).padStart(2, '0');
       var mm = String(now.getMinutes()).padStart(2, '0');
